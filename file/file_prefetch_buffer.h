@@ -353,48 +353,48 @@ class FilePrefetchBuffer {
   }
 
   // Helper functions.
-  bool IsDataBlockInBuffer(uint64_t offset, size_t length, uint32_t index) {
-    return (offset >= bufs_[index].offset_ &&
+  bool IsDataBlockInBuffer(uint64_t offset, size_t length, uint32_t index) { //数据块 在buffer范围内
+    return (offset >= bufs_[index].offset_ /*数据块开始点 >= buffer的开始点 */&&
             offset + length <=
-                bufs_[index].offset_ + bufs_[index].buffer_.CurrentSize());
+                bufs_[index].offset_ + bufs_[index].buffer_.CurrentSize()) /*数据块的结束点 <= buffer的结束点 */;
   }
-  bool IsOffsetInBuffer(uint64_t offset, uint32_t index) {
-    return (offset >= bufs_[index].offset_ &&
-            offset < bufs_[index].offset_ + bufs_[index].buffer_.CurrentSize());
+  bool IsOffsetInBuffer(uint64_t offset, uint32_t index) { //offset 在buffer范围内
+    return (offset >= bufs_[index].offset_ /* 当前的offset >= buffer的offset*/&&
+            offset < bufs_[index].offset_ + bufs_[index].buffer_.CurrentSize())/*offset < buffer的offset + buffer的长度*/;
   }
-  bool DoesBufferContainData(uint32_t index) {
+  bool DoesBufferContainData(uint32_t index) {  //buffer 是否有数据
     return bufs_[index].buffer_.CurrentSize() > 0;
   }
-  bool IsBufferOutdated(uint64_t offset, uint32_t index) {
+  bool IsBufferOutdated(uint64_t offset, uint32_t index) { //buffer是否过时
     return (
-        !bufs_[index].async_read_in_progress_ && DoesBufferContainData(index) &&
-        offset >= bufs_[index].offset_ + bufs_[index].buffer_.CurrentSize());
+        !bufs_[index].async_read_in_progress_ /*未请求*/ && DoesBufferContainData(index) /*有数据*/ &&
+        offset >= bufs_[index].offset_ + bufs_[index].buffer_.CurrentSize()); /*判断offset >= buffer结束点*/
   }
-  bool IsBufferOutdatedWithAsyncProgress(uint64_t offset, uint32_t index) {
-    return (bufs_[index].async_read_in_progress_ &&
-            bufs_[index].io_handle_ != nullptr &&
-            offset >= bufs_[index].offset_ + bufs_[index].async_req_len_);
+  bool IsBufferOutdatedWithAsyncProgress(uint64_t offset, uint32_t index) { //正在请求buffer 是否过时
+    return (bufs_[index].async_read_in_progress_ /*正在请求*/&&
+            bufs_[index].io_handle_ != nullptr /*请求handle非空*/&&
+            offset >= bufs_[index].offset_ + bufs_[index].async_req_len_) /*判断offset >= buffer的请求结束点*/;
   }
-  bool IsOffsetInBufferWithAsyncProgress(uint64_t offset, uint32_t index) {
-    return (bufs_[index].async_read_in_progress_ &&
-            offset >= bufs_[index].offset_ &&
-            offset < bufs_[index].offset_ + bufs_[index].async_req_len_);
+  bool IsOffsetInBufferWithAsyncProgress(uint64_t offset, uint32_t index) { //正在请求buffer 是否有效
+    return (bufs_[index].async_read_in_progress_ /*正在请求*/&&
+            offset >= bufs_[index].offset_/* 当前的offset >= buffer开始点*/ &&
+            offset < bufs_[index].offset_ + bufs_[index].async_req_len_)/*offset < buffer的请求结束点*/;
   }
 
-  bool IsSecondBuffEligibleForPrefetching() {
+  bool IsSecondBuffEligibleForPrefetching() { //buffer2是否需要预取
     uint32_t second = curr_ ^ 1;
-    if (bufs_[second].async_read_in_progress_) {
+    if (bufs_[second].async_read_in_progress_) { //buffer2 正在请求返回 不需要
       return false;
     }
     assert(!bufs_[curr_].async_read_in_progress_);
 
     if (DoesBufferContainData(curr_) && DoesBufferContainData(second) &&
         (bufs_[curr_].offset_ + bufs_[curr_].buffer_.CurrentSize() ==
-         bufs_[second].offset_)) {
+         bufs_[second].offset_)) { //buffer1有数据, 且buffer2 也有数据 buffer1的结束点= buffer2的开始点 返回 不需要
       return false;
     }
-    bufs_[second].buffer_.Clear();
-    return true;
+    bufs_[second].buffer_.Clear(); //清空buffer2
+    return true;  //返回需要
   }
 
   void DestroyAndClearIOHandle(uint32_t index) {

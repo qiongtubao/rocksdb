@@ -1019,16 +1019,16 @@ class PosixFileSystem : public FileSystem {
       return IOStatus::NotSupported("Poll");
     }
 
-    for (size_t i = 0; i < io_handles.size(); i++) {
+    for (size_t i = 0; i < io_handles.size(); i++) { //批量请求
       // The request has been completed in earlier runs.
-      if ((static_cast<Posix_IOHandle*>(io_handles[i]))->is_finished) {
+      if ((static_cast<Posix_IOHandle*>(io_handles[i]))->is_finished) { //完成了的话 跳过
         continue;
       }
       // Loop until IO for io_handles[i] is completed.
-      while (true) {
+      while (true) {    //一直处理请求 直到当前的io_handles[i]完成  可能多处理请求
         // io_uring_wait_cqe.
         struct io_uring_cqe* cqe = nullptr;
-        ssize_t ret = io_uring_wait_cqe(iu, &cqe);
+        ssize_t ret = io_uring_wait_cqe(iu, &cqe); //获得cqe
         if (ret) {
           // abort as it shouldn't be in indeterminate state and there is no
           // good way currently to handle this error.
@@ -1047,9 +1047,9 @@ class PosixFileSystem : public FileSystem {
         static_cast<struct io_uring_cqe*>(cqe)->user_data = 0xd5d5d5d5d5d5d5d5;
 
         FSReadRequest req;
-        req.scratch = posix_handle->scratch;
-        req.offset = posix_handle->offset;
-        req.len = posix_handle->len;
+        req.scratch = posix_handle->scratch;  //数据块
+        req.offset = posix_handle->offset;    //偏移
+        req.len = posix_handle->len;          //长度
 
         size_t finished_len = 0;
         size_t bytes_read = 0;
@@ -1057,16 +1057,16 @@ class PosixFileSystem : public FileSystem {
         UpdateResult(cqe, "", req.len, posix_handle->iov.iov_len,
                      true /*async_read*/, posix_handle->use_direct_io,
                      posix_handle->alignment, finished_len, &req, bytes_read,
-                     read_again);
-        posix_handle->is_finished = true;
-        io_uring_cqe_seen(iu, cqe);
-        posix_handle->cb(req, posix_handle->cb_arg);
+                     read_again); //处理一下数据  转换成req 返回
+        posix_handle->is_finished = true; //标记完成
+        io_uring_cqe_seen(iu, cqe); //标记cqe 处理完
+        posix_handle->cb(req, posix_handle->cb_arg); //函数回调
 
         (void)finished_len;
         (void)bytes_read;
         (void)read_again;
 
-        if (static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
+        if (static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) { //确定处理的对象是io_handles[i]
           break;
         }
       }
@@ -1093,29 +1093,29 @@ class PosixFileSystem : public FileSystem {
       return IOStatus::OK();
     }
 
-    for (size_t i = 0; i < io_handles.size(); i++) {
+    for (size_t i = 0; i < io_handles.size(); i++) { //遍历所有io_handles 并发送cancel请求
       Posix_IOHandle* posix_handle =
           static_cast<Posix_IOHandle*>(io_handles[i]);
-      if (posix_handle->is_finished == true) {
+      if (posix_handle->is_finished == true) { //如果完成了的话就跳过取消逻辑
         continue;
       }
-      assert(posix_handle->iu == iu);
+      assert(posix_handle->iu == iu); //确保是同一个线程
       if (posix_handle->iu != iu) {
         return IOStatus::IOError("");
       }
 
       // Prepare the cancel request.
       struct io_uring_sqe* sqe;
-      sqe = io_uring_get_sqe(iu);
+      sqe = io_uring_get_sqe(iu);//获取提交io对象sqe
 
       // In order to cancel the request, sqe->addr of cancel request should
       // match with the read request submitted which is posix_handle->iov.
-      io_uring_prep_cancel(sqe, &posix_handle->iov, 0);
+      io_uring_prep_cancel(sqe, &posix_handle->iov, 0); //提交取消任务
       // Sets sqe->user_data to posix_handle.
-      io_uring_sqe_set_data(sqe, posix_handle);
+      io_uring_sqe_set_data(sqe, posix_handle);//设置任务data指针 指向posix_handle
 
       // submit the request.
-      ssize_t ret = io_uring_submit(iu);
+      ssize_t ret = io_uring_submit(iu); //提交任务
       if (ret < 0) {
         fprintf(stderr, "io_uring_submit error: %ld\n", long(ret));
         return IOStatus::IOError("io_uring_submit() requested but returned " +
@@ -1124,33 +1124,33 @@ class PosixFileSystem : public FileSystem {
     }
 
     // After submitting the requests, wait for the requests.
-    for (size_t i = 0; i < io_handles.size(); i++) {
-      if ((static_cast<Posix_IOHandle*>(io_handles[i]))->is_finished) {
+    for (size_t i = 0; i < io_handles.size(); i++) {  //遍历任务等待取消任务是否完成
+      if ((static_cast<Posix_IOHandle*>(io_handles[i]))->is_finished) { //跳过
         continue;
       }
 
       while (true) {
         struct io_uring_cqe* cqe = nullptr;
-        ssize_t ret = io_uring_wait_cqe(iu, &cqe);
+        ssize_t ret = io_uring_wait_cqe(iu, &cqe); //等待完成任务cqe
         if (ret) {
           // abort as it shouldn't be in indeterminate state and there is no
           // good way currently to handle this error.
           abort();
         }
-        assert(cqe != nullptr);
+        assert(cqe != nullptr); //不为空
 
         // Returns cqe->user_data.
         Posix_IOHandle* posix_handle =
-            static_cast<Posix_IOHandle*>(io_uring_cqe_get_data(cqe));
-        assert(posix_handle->iu == iu);
-        if (posix_handle->iu != iu) {
+            static_cast<Posix_IOHandle*>(io_uring_cqe_get_data(cqe)); //上下文对象
+        assert(posix_handle->iu == iu);//确保是同一线程
+        if (posix_handle->iu != iu) { 
           return IOStatus::IOError("");
         }
-        posix_handle->req_count++;
+        posix_handle->req_count++; //请求数+1  需要累积收到2个回调
 
         // Reset cqe data to catch any stray reuse of it
         static_cast<struct io_uring_cqe*>(cqe)->user_data = 0xd5d5d5d5d5d5d5d5;
-        io_uring_cqe_seen(iu, cqe);
+        io_uring_cqe_seen(iu, cqe); //标记cqe已完成
 
         // - If the request is cancelled successfully, the original request is
         //   completed with -ECANCELED and the cancel request is completed with
@@ -1164,11 +1164,11 @@ class PosixFileSystem : public FileSystem {
         // Every handle has to wait for 2 requests completion: original one and
         // the cancel request which is tracked by PosixHandle::req_count.
         if (posix_handle->req_count == 2 &&
-            static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
-          posix_handle->is_finished = true;
+            static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) { //取消完成需要2个cqe 一个原始的 一个取消的
+          posix_handle->is_finished = true; //完成
           FSReadRequest req;
           req.status = IOStatus::Aborted();
-          posix_handle->cb(req, posix_handle->cb_arg);
+          posix_handle->cb(req, posix_handle->cb_arg);//回调返回中止事件
 
           break;
         }

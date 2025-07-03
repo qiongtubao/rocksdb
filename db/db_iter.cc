@@ -127,54 +127,54 @@ bool DBIter::ParseKey(ParsedInternalKey* ikey) {
   }
 }
 
-void DBIter::Next() {
-  assert(valid_);
-  assert(status_.ok());
+void DBIter::Next() { //功能: 用于向前移动迭代器到下一个键值对
+  assert(valid_);       //迭代器有效
+  assert(status_.ok()); //迭代器状态ok
 
-  PERF_COUNTER_ADD(iter_next_count, 1);
-  PERF_CPU_TIMER_GUARD(iter_next_cpu_nanos, clock_);
+  PERF_COUNTER_ADD(iter_next_count, 1); //掉用迭代器 次数+1
+  PERF_CPU_TIMER_GUARD(iter_next_cpu_nanos, clock_);  //记录本次next的消耗cpu时间
   // Release temporarily pinned blocks from last operation
-  ReleaseTempPinnedData();
-  ResetBlobValue();
-  ResetValueAndColumns();
-  local_stats_.skip_count_ += num_internal_keys_skipped_;
-  local_stats_.skip_count_--;
-  num_internal_keys_skipped_ = 0;
-  bool ok = true;
-  if (direction_ == kReverse) {
-    is_key_seqnum_zero_ = false;
-    if (!ReverseToForward()) {
-      ok = false;
+  ReleaseTempPinnedData();              //释放被pin住的块数据
+  ResetBlobValue();                     //重置可能缓存的blob值 
+  ResetValueAndColumns();               //重置可能缓存的列信息
+  local_stats_.skip_count_ += num_internal_keys_skipped_; //累计跳过的内部key数量 # 为什么不是上一次进行统计更新
+  local_stats_.skip_count_--;           //手动减1 可能是为了补偿某种默认跳过行为
+  num_internal_keys_skipped_ = 0;       //清空跳过计数器 为下一次准备
+  bool ok = true;                       //标记
+  if (direction_ == kReverse) {         
+    is_key_seqnum_zero_ = false;        
+    if (!ReverseToForward()) {          //切换成正方向失败
+      ok = false;                         
     }
-  } else if (!current_entry_is_merged_) {
+  } else if (!current_entry_is_merged_) { //当前不是合并项（非merge操作）
     // If the current value is not a merge, the iter position is the
     // current key, which is already returned. We can safely issue a
     // Next() without checking the current key.
     // If the current key is a merge, very likely iter already points
     // to the next internal position.
-    assert(iter_.Valid());
-    iter_.Next();
-    PERF_COUNTER_ADD(internal_key_skipped_count, 1);
+    assert(iter_.Valid());          //是否有效
+    iter_.Next();                   //
+    PERF_COUNTER_ADD(internal_key_skipped_count, 1);//跳过内部key计数器 +1
   }
 
-  local_stats_.next_count_++;
-  if (ok && iter_.Valid()) {
-    ClearSavedValue();
+  local_stats_.next_count_++; //本地统计执行next_count_ + 1
+  if (ok && iter_.Valid()) {  //底层迭代器有效
+    ClearSavedValue();        //清理保存的value
 
-    if (prefix_same_as_start_) {
+    if (prefix_same_as_start_) {  //是否有传入前缀参数
       assert(prefix_extractor_ != nullptr);
       const Slice prefix = prefix_.GetUserKey();
-      FindNextUserEntry(true /* skipping the current user key */, &prefix);
+      FindNextUserEntry(true /* skipping the current user key */, &prefix);//查找下一个用户可见的key（可能会跳过一些系统key）
     } else {
       FindNextUserEntry(true /* skipping the current user key */, nullptr);
     }
   } else {
-    is_key_seqnum_zero_ = false;
-    valid_ = false;
+    is_key_seqnum_zero_ = false;  
+    valid_ = false;               //迭代器失效
   }
-  if (statistics_ != nullptr && valid_) {
-    local_stats_.next_found_count_++;
-    local_stats_.bytes_read_ += (key().size() + value().size());
+  if (statistics_ != nullptr && valid_) {   //统计功能开启且有效
+    local_stats_.next_found_count_++;       //增加找到次数
+    local_stats_.bytes_read_ += (key().size() + value().size()); //统计读取的字节数
   }
 }
 
@@ -252,7 +252,7 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
 // within the prefix, and the iterator needs to be made invalid, if no
 // more entry for the prefix can be found.
 bool DBIter::FindNextUserEntry(bool skipping_saved_key, const Slice* prefix) {
-  PERF_TIMER_GUARD(find_next_user_entry_time);
+  PERF_TIMER_GUARD(find_next_user_entry_time);  //性能计时器 记录此函数执行时间
   return FindNextUserEntryInternal(skipping_saved_key, prefix);
 }
 
@@ -260,10 +260,10 @@ bool DBIter::FindNextUserEntry(bool skipping_saved_key, const Slice* prefix) {
 bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                                        const Slice* prefix) {
   // Loop until we hit an acceptable entry to yield
-  assert(iter_.Valid());
-  assert(status_.ok());
-  assert(direction_ == kForward);
-  current_entry_is_merged_ = false;
+  assert(iter_.Valid());  //迭代器是否无效
+  assert(status_.ok());   //当前状态是否ok
+  assert(direction_ == kForward); //正方向
+  current_entry_is_merged_ = false; //设置非合并
 
   // How many times in a row we have skipped an entry with user key less than
   // or equal to saved_key_. We could skip these entries either because
@@ -277,18 +277,18 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
   //                            greater than that,
   //  - none of the above     : saved_key_ can contain anything, it doesn't
   //                            matter.
-  uint64_t num_skipped = 0;
+  uint64_t num_skipped = 0; //跳过个数
   // For write unprepared, the target sequence number in reseek could be larger
   // than the snapshot, and thus needs to be skipped again. This could result in
   // an infinite loop of reseeks. To avoid that, we limit the number of reseeks
   // to one.
-  bool reseek_done = false;
+  bool reseek_done = false; //是否结束
 
   do {
     // Will update is_key_seqnum_zero_ as soon as we parsed the current key
     // but we need to save the previous value to be used in the loop.
-    bool is_prev_key_seqnum_zero = is_key_seqnum_zero_;
-    if (!ParseKey(&ikey_)) {
+    bool is_prev_key_seqnum_zero = is_key_seqnum_zero_;   
+    if (!ParseKey(&ikey_)) {  //解析key失败
       is_key_seqnum_zero_ = false;
       return false;
     }
@@ -306,19 +306,19 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
         iter_.UpperBoundCheckResult() != IterBoundCheck::kInbound &&
         user_comparator_.CompareWithoutTimestamp(
             user_key_without_ts, /*a_has_ts=*/false, *iterate_upper_bound_,
-            /*b_has_ts=*/false) >= 0) {
+            /*b_has_ts=*/false) >= 0) {  //检查当前key是否超过上界范围 则终止查找
       break;
     }
 
     assert(prefix == nullptr || prefix_extractor_ != nullptr);
     if (prefix != nullptr &&
         prefix_extractor_->Transform(user_key_without_ts).compare(*prefix) !=
-            0) {
+            0) {  //如果启用了 前缀 prefix scan 当前key不属于目标前缀 则终止查找
       assert(prefix_same_as_start_);
       break;
     }
 
-    if (TooManyInternalKeysSkipped()) {
+    if (TooManyInternalKeysSkipped()) { //跳过太多key的保护机制
       return false;
     }
 
@@ -327,7 +327,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                                          ikey_.user_key, timestamp_size_)
                                    : Slice();
     bool more_recent = false;
-    if (IsVisible(ikey_.sequence, ts, &more_recent)) {
+    if (IsVisible(ikey_.sequence, ts, &more_recent)) { //当前key是否小于快照序列号 是否对当前快照可见
       // If the previous entry is of seqnum 0, the current entry will not
       // possibly be skipped. This condition can potentially be relaxed to
       // prev_key.seq <= ikey_.sequence. We are cautious because it will be more
@@ -345,10 +345,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) > 0);
         num_skipped = 0;
         reseek_done = false;
-        switch (ikey_.type) {
+        switch (ikey_.type) { //key的类型
           case kTypeDeletion:
           case kTypeDeletionWithTimestamp:
-          case kTypeSingleDeletion:
+          case kTypeSingleDeletion: //查找被删除的key
             // Arrange to skip all upcoming entries for this key since
             // they are hidden by this deletion.
             if (timestamp_lb_) {
@@ -358,14 +358,14 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
             } else {
               saved_key_.SetUserKey(
                   ikey_.user_key, !pin_thru_lifetime_ ||
-                                      !iter_.iter()->IsKeyPinned() /* copy */);
-              skipping_saved_key = true;
+                                      !iter_.iter()->IsKeyPinned() /* copy */);  //保存当前key 
+              skipping_saved_key = true;  //开启跳过同名key
               PERF_COUNTER_ADD(internal_delete_skipped_count, 1);
             }
             break;
           case kTypeValue:
           case kTypeBlobIndex:
-          case kTypeWideColumnEntity:
+          case kTypeWideColumnEntity: //普通key 或blob index
             if (!iter_.PrepareValue()) {
               assert(!iter_.status().ok());
               valid_ = false;
@@ -408,9 +408,9 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 ikey_.user_key,
                 !pin_thru_lifetime_ || !iter_.iter()->IsKeyPinned() /* copy */);
             // By now, we are sure the current ikey is going to yield a value
-            current_entry_is_merged_ = true;
+            current_entry_is_merged_ = true;  //标记为当前key是合并状态
             valid_ = true;
-            return MergeValuesNewToOld();  // Go to a different state machine
+            return MergeValuesNewToOld();  // Go to a different state machine //进入专门的 merge 状态机，合并多个 merge 记录。
             break;
           default:
             valid_ = false;
@@ -451,7 +451,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
     // TODO(lth): If we reseek to sequence number greater than ikey_.sequence,
     // then it does not make sense to reseek as we would actually land further
     // away from the desired key. There is opportunity for optimization here.
-    if (num_skipped > max_skip_ && !reseek_done) {
+    if (num_skipped > max_skip_ && !reseek_done) { //跳过太多key 重新seek
       is_key_seqnum_zero_ = false;
       num_skipped = 0;
       reseek_done = true;
@@ -491,12 +491,12 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
               *timestamp_ub_);
         }
       }
-      iter_.Seek(last_key);
+      iter_.Seek(last_key); //重新定位
       RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
     } else {
-      iter_.Next();
+      iter_.Next(); //调用迭代器下一个  
     }
-  } while (iter_.Valid());
+  } while (iter_.Valid()); //迭代器有效就继续查找
 
   valid_ = false;
   return iter_.status().ok();
@@ -1438,10 +1438,10 @@ void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
   }
 }
 
-void DBIter::Seek(const Slice& target) {
-  PERF_COUNTER_ADD(iter_seek_count, 1);
-  PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
-  StopWatch sw(clock_, statistics_, DB_SEEK);
+void DBIter::Seek(const Slice& target) { //迭代器定位到一个指定的目标键或其后继键
+  PERF_COUNTER_ADD(iter_seek_count, 1);             //seek计数器+1
+  PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);//测试cpu
+  StopWatch sw(clock_, statistics_, DB_SEEK);       //对象用户统计整个seek操作的耗时
 
   if (db_impl_ != nullptr && cfd_ != nullptr) {
     // TODO: What do we do if this returns an error?
@@ -1457,59 +1457,59 @@ void DBIter::Seek(const Slice& target) {
       upper_bound = Slice("");
     }
     db_impl_->TraceIteratorSeek(cfd_->GetID(), target, lower_bound, upper_bound)
-        .PermitUncheckedError();
+        .PermitUncheckedError();   //记录本次seek （列族id 目标键， 迭代范围上下界）
   }
 
-  status_ = Status::OK();
-  ReleaseTempPinnedData();
+  status_ = Status::OK(); //状态初始化
+  ReleaseTempPinnedData();//清理上一次操作临时保存的数据
   ResetBlobValue();
   ResetValueAndColumns();
-  ResetInternalKeysSkippedCounter();
+  ResetInternalKeysSkippedCounter();//重置跳过的内部key计数器
 
   // Seek the inner iterator based on the target key.
   {
     PERF_TIMER_GUARD(seek_internal_seek_time);
 
-    SetSavedKeyToSeekTarget(target);
-    iter_.Seek(saved_key_.GetInternalKey());
+    SetSavedKeyToSeekTarget(target);        //构建一个内部键
+    iter_.Seek(saved_key_.GetInternalKey());//迭代器定位到第一个>=internal_key的位置
 
-    RecordTick(statistics_, NUMBER_DB_SEEK);
+    RecordTick(statistics_, NUMBER_DB_SEEK);//记录一次seek 操作的统计信息
   }
-  if (!iter_.Valid()) {
+  if (!iter_.Valid()) { //迭代器无效的话  设置当前状态无效
     valid_ = false;
     return;
   }
-  direction_ = kForward;
+  direction_ = kForward;  //设置迭代方向为正向
 
   // Now the inner iterator is placed to the target position. From there,
   // we need to find out the next key that is visible to the user.
-  ClearSavedValue();
-  if (prefix_same_as_start_) {
+  ClearSavedValue();      //清理之前缓存的value
+  if (prefix_same_as_start_) {  
     // The case where the iterator needs to be invalidated if it has exhausted
     // keys within the same prefix of the seek key.
     assert(prefix_extractor_ != nullptr);
-    Slice target_prefix = prefix_extractor_->Transform(target);
+    Slice target_prefix = prefix_extractor_->Transform(target); //提取目标的前缀
     FindNextUserEntry(false /* not skipping saved_key */,
-                      &target_prefix /* prefix */);
-    if (valid_) {
+                      &target_prefix /* prefix */); //找到第一个符合该前缀的用户键
+    if (valid_) {//找到有效键
       // Remember the prefix of the seek key for the future Next() call to
       // check.
-      prefix_.SetUserKey(target_prefix);
+      prefix_.SetUserKey(target_prefix); //记住这个前缀
     }
   } else {
-    FindNextUserEntry(false /* not skipping saved_key */, nullptr);
+    FindNextUserEntry(false /* not skipping saved_key */, nullptr); //不使用前缀限制
   }
-  if (!valid_) {
+  if (!valid_) {// 定位失败  结束
     return;
   }
 
   // Updating stats and perf context counters.
-  if (statistics_ != nullptr) {
+  if (statistics_ != nullptr) { //  统计信息
     // Decrement since we don't want to count this key as skipped
-    RecordTick(statistics_, NUMBER_DB_SEEK_FOUND);
-    RecordTick(statistics_, ITER_BYTES_READ, key().size() + value().size());
+    RecordTick(statistics_, NUMBER_DB_SEEK_FOUND);  //成功找到一个key
+    RecordTick(statistics_, ITER_BYTES_READ, key().size() + value().size()); 
   }
-  PERF_COUNTER_ADD(iter_read_bytes, key().size() + value().size());
+  PERF_COUNTER_ADD(iter_read_bytes, key().size() + value().size()); //统计字节数
 }
 
 void DBIter::SeekForPrev(const Slice& target) {

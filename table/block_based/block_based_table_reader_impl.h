@@ -45,22 +45,22 @@ struct IterTraits<IndexBlockIter> {
 // If input_iter is not null, update this iter and return it
 template <typename TBlockIter>
 TBlockIter* BlockBasedTable::NewDataBlockIterator(
-    const ReadOptions& ro, const BlockHandle& handle, TBlockIter* input_iter,
-    BlockType block_type, GetContext* get_context,
-    BlockCacheLookupContext* lookup_context,
-    FilePrefetchBuffer* prefetch_buffer, bool for_compaction, bool async_read,
-    Status& s) const {
+    const ReadOptions& ro/*读选项*/, const BlockHandle& handle/*block的offset + size*/, TBlockIter* input_iter /*输出迭代器*/,
+    BlockType block_type /*block 类型*/, GetContext* get_context /*统计和上下文*/,
+    BlockCacheLookupContext* lookup_context /*用于block cache lookup 上下文*/,
+    FilePrefetchBuffer* prefetch_buffer/*预期缓冲区 用于顺序扫描优化*/, bool for_compaction /*是否来自compaction*/, bool async_read /*是否异步读取*/,
+    Status& s/*状态*/) const {
   using IterBlocklike = typename IterTraits<TBlockIter>::IterBlocklike;
   PERF_TIMER_GUARD(new_table_block_iter_nanos);
 
-  TBlockIter* iter = input_iter != nullptr ? input_iter : new TBlockIter;
-  if (!s.ok()) {
+  TBlockIter* iter = input_iter != nullptr ? input_iter : new TBlockIter; //复用还是创建新的迭代器
+  if (!s.ok()) { //如果已经失败了 设置iter为无效
     iter->Invalidate(s);
     return iter;
   }
 
   CachableEntry<Block> block;
-  if (rep_->uncompression_dict_reader && block_type == BlockType::kData) {
+  if (rep_->uncompression_dict_reader && block_type == BlockType::kData) { //
     CachableEntry<UncompressionDict> uncompression_dict;
     const bool no_io = (ro.read_tier == kBlockCacheTier);
     // For async scans, don't use the prefetch buffer since an async prefetch

@@ -1376,33 +1376,33 @@ void LevelIterator::Next() {
 }
 
 bool LevelIterator::NextAndGetResult(IterateResult* result) {
-  assert(Valid());
+  assert(Valid());  //迭代器是否有效
   // file_iter_ is at EOF already when to_return_sentinel_
-  bool is_valid = !to_return_sentinel_ && file_iter_.NextAndGetResult(result);
-  if (!is_valid) {
-    if (to_return_sentinel_) {
-      ClearSentinel();
-    } else if (range_tombstone_iter_) {
-      TrySetDeleteRangeSentinel(file_largest_key(file_index_));
+  bool is_valid = !to_return_sentinel_ && file_iter_.NextAndGetResult(result);  //sst文件内部的迭代器
+  if (!is_valid) {  //无效
+    if (to_return_sentinel_) {  //正在返回一个哨兵
+      ClearSentinel();  //清理哨兵
+    } else if (range_tombstone_iter_) { //如果当前层级支持范围删除标记
+      TrySetDeleteRangeSentinel(file_largest_key(file_index_)); //尝试设置一个新的哨兵
     }
-    is_next_read_sequential_ = true;
-    SkipEmptyFileForward();
-    is_next_read_sequential_ = false;
-    is_valid = Valid();
-    if (is_valid) {
+    is_next_read_sequential_ = true;//顺序读
+    SkipEmptyFileForward(); //切换到下一个文件 跳过所有无效文件/空sst文件
+    is_next_read_sequential_ = false;//清理顺序读标记
+    is_valid = Valid();   //是否有效
+    if (is_valid) {       //有效 构造返回结果
       // This could be set in TrySetDeleteRangeSentinel() or
       // SkipEmptyFileForward() above.
       if (to_return_sentinel_) {
-        result->key = sentinel_;
-        result->bound_check_result = IterBoundCheck::kUnknown;
-        result->value_prepared = true;
+        result->key = sentinel_;    //文件最大key或者范围删除标记
+        result->bound_check_result = IterBoundCheck::kUnknown; //未知
+        result->value_prepared = true;  //value已经准备好了
       } else {
-        result->key = key();
-        result->bound_check_result = file_iter_.UpperBoundCheckResult();
+        result->key = key();  //  正常key
+        result->bound_check_result = file_iter_.UpperBoundCheckResult(); //底层状态
         // Ideally, we should return the real file_iter_.value_prepared but the
         // information is not here. It would casue an extra PrepareValue()
         // for the first key of a file.
-        result->value_prepared = !allow_unprepared_value_;
+        result->value_prepared = !allow_unprepared_value_; //配置项
       }
     }
   }

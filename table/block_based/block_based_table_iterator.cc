@@ -262,36 +262,36 @@ void BlockBasedTableIterator::Prev() {
 }
 
 void BlockBasedTableIterator::InitDataBlock() {
-  BlockHandle data_block_handle = index_iter_->value().handle;
-  if (!block_iter_points_to_real_block_ ||
-      data_block_handle.offset() != prev_block_offset_ ||
-      // if previous attempt of reading the block missed cache, try again
-      block_iter_.status().IsIncomplete()) {
-    if (block_iter_points_to_real_block_) {
-      ResetDataIter();
+  BlockHandle data_block_handle = index_iter_->value().handle; //获得当前的block handle
+  if (!block_iter_points_to_real_block_ || //当前没有指向一个有效的block 第一次加载
+      data_block_handle.offset() != prev_block_offset_ || //新block的offset 不同于上一个block （切换了block)
+      // if previous attempt of reading the block missed cache, try again //上次加载失败或者不完整
+      block_iter_.status().IsIncomplete()) {  
+    if (block_iter_points_to_real_block_) { //如果之前有block 先清理旧数据
+      ResetDataIter();  //清理
     }
-    auto* rep = table_->get_rep();
+    auto* rep = table_->get_rep(); //获得table内部表示rep 
 
     bool is_for_compaction =
-        lookup_context_.caller == TableReaderCaller::kCompaction;
-    // Prefetch additional data for range scans (iterators).
-    // Implicit auto readahead:
-    //   Enabled after 2 sequential IOs when ReadOptions.readahead_size == 0.
-    // Explicit user requested readahead:
-    //   Enabled from the very first IO when ReadOptions.readahead_size is set.
+        lookup_context_.caller == TableReaderCaller::kCompaction; //判断是否来自compaction
+    // Prefetch additional data for range scans (iterators).  // 为范围扫描（迭代器）预取额外数据。
+    // Implicit auto readahead: // 隐式自动预读：
+    //   Enabled after 2 sequential IOs when ReadOptions.readahead_size == 0. // 当 ReadOptions.readahead_size == 0 时，在 2 次连续 IO 后启用。
+    // Explicit user requested readahead: // 显式用户请求预读：
+    //   Enabled from the very first IO when ReadOptions.readahead_size is set. // 当 ReadOptions.readahead_size 已设置时，从第一次 IO 开始启用。
     block_prefetcher_.PrefetchIfNeeded(
         rep, data_block_handle, read_options_.readahead_size, is_for_compaction,
         /*no_sequential_checking=*/false, read_options_.rate_limiter_priority);
     Status s;
     table_->NewDataBlockIterator<DataBlockIter>(
-        read_options_, data_block_handle, &block_iter_, BlockType::kData,
-        /*get_context=*/nullptr, &lookup_context_,
-        block_prefetcher_.prefetch_buffer(),
-        /*for_compaction=*/is_for_compaction, /*async_read=*/false, s);
-    block_iter_points_to_real_block_ = true;
-    CheckDataBlockWithinUpperBound();
-    if (!is_for_compaction &&
-        (seek_stat_state_ & kDataBlockReadSinceLastSeek) == 0) {
+        read_options_ /*用户设置的读选项*/, data_block_handle /*加载的block的offset+size*/, &block_iter_ /*输出参数 block内部的迭代器*/, BlockType::kData /*表示这是一个data block*/,
+        /*get_context=*/nullptr, &lookup_context_ /*统计和上下文信息*/,
+        block_prefetcher_.prefetch_buffer() /*预期的数据缓冲区*/,
+        /*for_compaction=*/is_for_compaction, /*async_read=*/false, s /*返回的状态*/); //实际加载block数据
+    block_iter_points_to_real_block_ = true; //设置为有效的data block
+    CheckDataBlockWithinUpperBound(); //检查是否超过上限
+    if (!is_for_compaction /*如果不是compaction场景*/ &&
+        (seek_stat_state_ & kDataBlockReadSinceLastSeek) == 0) { //更新统计信息
       RecordTick(table_->GetStatistics(), is_last_level_
                                               ? LAST_LEVEL_SEEK_DATA
                                               : NON_LAST_LEVEL_SEEK_DATA);
@@ -302,7 +302,7 @@ void BlockBasedTableIterator::InitDataBlock() {
 }
 
 void BlockBasedTableIterator::AsyncInitDataBlock(bool is_first_pass) {
-  BlockHandle data_block_handle = index_iter_->value().handle;
+  BlockHandle data_block_handle = index_iter_->value().handle; //获得当前block handle
   bool is_for_compaction =
       lookup_context_.caller == TableReaderCaller::kCompaction;
   if (is_first_pass) {
@@ -393,15 +393,15 @@ bool BlockBasedTableIterator::MaterializeCurrentBlock() {
 void BlockBasedTableIterator::FindKeyForward() {
   // This method's code is kept short to make it likely to be inlined.
 
-  assert(!is_out_of_bound_);
-  assert(block_iter_points_to_real_block_);
+  assert(!is_out_of_bound_);      //未超过边界
+  assert(block_iter_points_to_real_block_); //确实有一个有效的block 可供查找
 
-  if (!block_iter_.Valid()) {
+  if (!block_iter_.Valid()) { //block迭代器无效
     // This is the only call site of FindBlockForward(), but it's extracted into
     // a separate method to keep FindKeyForward() short and likely to be
     // inlined. When transitioning to a different block, we call
     // FindBlockForward(), which is much longer and is probably not inlined.
-    FindBlockForward();
+    FindBlockForward(); //找下一个有效block
   } else {
     // This is the fast path that avoids a function call.
   }
@@ -411,47 +411,47 @@ void BlockBasedTableIterator::FindBlockForward() {
   // TODO the while loop inherits from two-level-iterator. We don't know
   // whether a block can be empty so it can be replaced by an "if".
   do {
-    if (!block_iter_.status().ok()) {
+    if (!block_iter_.status().ok()) { //迭代器有错误就跳出
       return;
     }
     // Whether next data block is out of upper bound, if there is one.
     const bool next_block_is_out_of_bound =
         read_options_.iterate_upper_bound != nullptr &&
         block_iter_points_to_real_block_ &&
-        block_upper_bound_check_ == BlockUpperBound::kUpperBoundInCurBlock;
+        block_upper_bound_check_ == BlockUpperBound::kUpperBoundInCurBlock; //判断下一个block是否超出上界
     assert(!next_block_is_out_of_bound ||
            user_comparator_.CompareWithoutTimestamp(
                *read_options_.iterate_upper_bound, /*a_has_ts=*/false,
                index_iter_->user_key(), /*b_has_ts=*/true) <= 0);
-    ResetDataIter();
-    index_iter_->Next();
+    ResetDataIter();//清理当前data block
+    index_iter_->Next(); //移动到下一个block描述符
     if (next_block_is_out_of_bound) {
       // The next block is out of bound. No need to read it.
       TEST_SYNC_POINT_CALLBACK("BlockBasedTableIterator:out_of_bound", nullptr);
       // We need to make sure this is not the last data block before setting
       // is_out_of_bound_, since the index key for the last data block can be
       // larger than smallest key of the next file on the same level.
-      if (index_iter_->Valid()) {
-        is_out_of_bound_ = true;
+      if (index_iter_->Valid()) { //有效的
+        is_out_of_bound_ = true; //超过界限
       }
       return;
     }
 
-    if (!index_iter_->Valid()) {
+    if (!index_iter_->Valid()) { //已经无效  没有更多的block
       return;
     }
 
-    IndexValue v = index_iter_->value();
+    IndexValue v = index_iter_->value(); //读取索引value
 
-    if (!v.first_internal_key.empty() && allow_unprepared_value_) {
+    if (!v.first_internal_key.empty() && allow_unprepared_value_) { //索引第一个key 非空 和配置允许延迟加载
       // Index contains the first key of the block. Defer reading the block.
       is_at_first_key_from_index_ = true;
       return;
     }
 
-    InitDataBlock();
-    block_iter_.SeekToFirst();
-  } while (!block_iter_.Valid());
+    InitDataBlock(); //加载block
+    block_iter_.SeekToFirst(); //seek 到第一个key
+  } while (!block_iter_.Valid()); //如果无效就一直循环下去
 }
 
 void BlockBasedTableIterator::FindKeyBackward() {
