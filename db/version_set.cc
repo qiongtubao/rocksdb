@@ -2359,6 +2359,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   BlobFetcher blob_fetcher(this, read_options);
 
   assert(pinned_iters_mgr);
+  // 准备 GetContext，用于跟踪查找状态 (Found, Deleted, NotFound 等)
   GetContext get_context(
       user_comparator(), merge_operator_, info_log_, db_statistics_,
       status->ok() ? GetContext::kNotFound : GetContext::kMerge, user_key,
@@ -2373,6 +2374,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr->StartPinning();
   }
 
+  // FilePicker 用于逐层选择可能包含 key 的 SST 文件
+  // 它利用了 LSMpTree 的结构 (L0 可能重叠, L1+ 不重叠) 进行优化查找
   FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
@@ -2393,6 +2396,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
         get_perf_context()->per_level_perf_context_enabled;
     StopWatchNano timer(clock_, timer_enabled /* auto_start */);
+    // 在选定的 SST 文件中查找
+    // TableCache 会负责缓存打开的文件句柄和 Index/Filter Block
     *status = table_cache_->Get(
         read_options, *internal_comparator(), *f->file_metadata, ikey,
         &get_context, mutable_cf_options_.block_protection_bytes_per_key,
@@ -2422,11 +2427,13 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     switch (get_context.State()) {
       case GetContext::kNotFound:
         // Keep searching in other files
+        // 如果当前文件没找到 (可能是 Filter 过滤了，或者 Block 中确实没有)，继续查找下一个文件
         break;
       case GetContext::kMerge:
         // TODO: update per-level perfcontext user_key_return_count for kMerge
         break;
       case GetContext::kFound:
+        // 找到了 Key，记录统计信息并返回
         if (fp.GetHitFileLevel() == 0) {
           RecordTick(db_statistics_, GET_HIT_L0);
         } else if (fp.GetHitFileLevel() == 1) {
@@ -2474,6 +2481,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
         return;
       case GetContext::kDeleted:
+        // 找到了 Key，但是是删除标记 (Tombstone)，返回 NotFound 并终止查找
         // Use empty error message for speed
         *status = Status::NotFound();
         return;

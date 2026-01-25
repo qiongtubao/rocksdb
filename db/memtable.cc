@@ -679,6 +679,12 @@ void MemTable::UpdateEntryChecksum(const ProtectionInfoKVOS64* kv_prot_info,
   }
 }
 
+// 将键值对插入到 MemTable 中
+// 1. 计算编码后的总长度
+// 2. 分配内存
+// 3. 编码 Internal Key (User Key + Sequence + Type)
+// 4. 将数据插入到底层数据结构 (如 SkipList)
+// 5. 更新统计信息和 Bloom Filter
 Status MemTable::Add(SequenceNumber s, ValueType type,
                      const Slice& key, /* user key */
                      const Slice& value,
@@ -694,14 +700,18 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   uint32_t key_size = static_cast<uint32_t>(key.size());
   uint32_t val_size = static_cast<uint32_t>(value.size());
   uint32_t internal_key_size = key_size + 8;
+  // 计算所需的总字节数：InternalKey长度 + Key + Value长度 + Value + Checksum
   const uint32_t encoded_len = VarintLength(internal_key_size) +
                                internal_key_size + VarintLength(val_size) +
                                val_size + moptions_.protection_bytes_per_key;
   char* buf = nullptr;
   std::unique_ptr<MemTableRep>& table =
       type == kTypeRangeDeletion ? range_del_table_ : table_;
+  // 从 MemTableRep (通常是 SkipListRep) 分配内存
   KeyHandle handle = table->Allocate(encoded_len, &buf);
 
+  // 编码数据到分配的 buffer 中
+  // 格式: [Varint32 key_size] [Key Data] [Sequence & Type (8 bytes)] [Varint32 val_size] [Value Data]
   char* p = EncodeVarint32(buf, internal_key_size);
   memcpy(p, key.data(), key_size);
   Slice key_slice(p, key_size);
@@ -738,6 +748,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
         return Status::TryAgain("key+seq exists");
       }
     } else {
+      // 插入到底层数据结构 (SkipList)
       bool res = table->InsertKey(handle);
       if (UNLIKELY(!res)) {
         return Status::TryAgain("key+seq exists");
@@ -756,6 +767,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
                          std::memory_order_relaxed);
     }
 
+    // 更新 Bloom Filter 用于加速读取
     if (bloom_filter_ && prefix_extractor_ &&
         prefix_extractor_->InDomain(key_without_ts)) {
       bloom_filter_->Add(prefix_extractor_->Transform(key_without_ts));

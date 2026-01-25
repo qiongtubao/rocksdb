@@ -136,6 +136,9 @@ void DBImpl::SetRecoverableStatePreReleaseCallback(
   recoverable_state_pre_release_callback_.reset(callback);
 }
 
+// 写入流程入口
+// 1. 处理 protection info
+// 2. 调用 WriteImpl 执行真正的写入逻辑
 Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
   Status s;
   if (write_options.protection_bytes_per_key > 0) {
@@ -302,6 +305,11 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                               log_ref, disable_memtable, seq_used);
   }
 
+  // 核心写入实现
+  // 1. 检查参数和配置
+  // 2. 处理 tracer
+  // 3. 处理 pipelined write 和 unordered write logic
+  // 4. 将当前线程加入 write_thread_ 的写入队列 (JoinBatchGroup)
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
                         disable_memtable, batch_cnt, pre_release_callback,
@@ -396,6 +404,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // and protects against concurrent loggers and concurrent writes
   // into memtables
 
+  // 成为 Leader 后:
+  // 1. 生成 WriteGroup (EnterAsBatchGroupLeader)
+  //    leader 会尝试打包队列中其他 writer 的 batch，形成一个大的 WriteGroup
   TEST_SYNC_POINT("DBImpl::WriteImpl:BeforeLeaderEnters");
   last_batch_group_size_ =
       write_thread_.EnterAsBatchGroupLeader(&w, &write_group);
@@ -435,6 +446,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       assert(writer);
       if (writer->CheckCallback(this)) {
         valid_batches += writer->batch_cnt;
+        // 计算整个 Group 的大小等统计信息
         if (writer->ShouldWriteToMemtable()) {
           total_count += WriteBatchInternal::Count(writer->batch);
           parallel = parallel && !writer->batch->HasMerge();
@@ -485,6 +497,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
     if (!two_write_queues_) {
       if (status.ok() && !write_options.disableWAL) {
+        // 2. 写 WAL (Write Ahead Log)
+        //    将整个 WriteGroup 的 batch 内容写入 WAL 文件，保证持久性
         assert(log_context.log_file_number_size);
         LogFileNumberSize& log_file_number_size =
             *(log_context.log_file_number_size);
@@ -546,6 +560,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       PERF_TIMER_GUARD(write_memtable_time);
 
       if (!parallel) {
+        // 3. 写 MemTable
+        //    如果不支持并发写 MemTable，则由 Leader 串行写入
+        //    InsertInto 会遍历 WriteGroup 中的每个 batch 并插入 MemTable
         // w.sequence will be set inside InsertInto
         w.status = WriteBatchInternal::InsertInto(
             write_group, current_sequence, column_family_memtables_.get(),
@@ -645,6 +662,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       versions_->SetLastSequence(last_sequence);
     }
     MemTableInsertStatusCheck(w.status);
+    // 4. 完成写入，Leader 唤醒 Follower 线程
     write_thread_.ExitAsBatchGroupLeader(write_group, status);
   }
 

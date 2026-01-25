@@ -147,6 +147,12 @@ IOStatus DBImpl::SyncClosedLogs(JobContext* job_context,
   return io_s;
 }
 
+// 将 MemTable 刷写到 Level 0 SST 文件
+// 1. 创建 FlushJob
+// 2. 同步已关闭的 WAL 日志 (如果需要)
+// 3. 选择要 Flush 的 MemTable (PickMemTable)
+// 4. 执行 Flush (FlushJob::Run)
+// 5. 安装新的 SuperVersion (包含新生成的 SST)
 Status DBImpl::FlushMemTableToOutputFile(
     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
     bool* made_progress, JobContext* job_context, FlushReason flush_reason,
@@ -205,6 +211,7 @@ Status DBImpl::FlushMemTableToOutputFile(
   // To address this, we make sure NotifyOnFlushBegin() executes after memtable
   // picking so that no new snapshot can be taken between the two functions.
 
+  // 1. 创建 FlushJob 对象，负责具体的 Flush 逻辑
   FlushJob flush_job(
       dbname_, cfd, immutable_db_options_, mutable_cf_options, max_memtable_id,
       file_options_for_compaction_, versions_.get(), &mutex_, &shutting_down_,
@@ -224,6 +231,8 @@ Status DBImpl::FlushMemTableToOutputFile(
   if (needs_to_sync_closed_wals) {
     // SyncClosedLogs() may unlock and re-lock the log_write_mutex multiple
     // times.
+    // 2. 如果有多个 Column Families，需要确保之前的 WAL 已同步
+    //    防止 Flush 后 crash 导致数据不一致
     VersionEdit synced_wals;
     mutex_.Unlock();
     log_io_s = SyncClosedLogs(job_context, &synced_wals);
@@ -249,6 +258,7 @@ Status DBImpl::FlushMemTableToOutputFile(
   // num_flush_not_started_ needs to be rollback.
   TEST_SYNC_POINT("DBImpl::FlushMemTableToOutputFile:BeforePickMemtables");
   if (s.ok()) {
+    // 3. 选择需要 Flush 的 MemTable (通常是 Immutable MemTables)
     flush_job.PickMemTable();
     need_cancel = true;
   }
@@ -267,6 +277,8 @@ Status DBImpl::FlushMemTableToOutputFile(
   // and EventListener callback will be called when the db_mutex
   // is unlocked by the current thread.
   if (s.ok()) {
+    // 4. 执行 Flush: 将 MemTable 内容写入 SST 文件
+    //    Run 方法内部会进行 iterator 遍历和 builder 构建文件
     s = flush_job.Run(&logs_with_prep_tracker_, &file_meta,
                       &switched_to_mempurge);
     need_cancel = false;
@@ -277,6 +289,8 @@ Status DBImpl::FlushMemTableToOutputFile(
   }
 
   if (s.ok()) {
+    // 5. 安装新的 SuperVersion
+    //    更新 VersionSet，将新生成的 Level 0 文件加入，并移除已 Flush 的 MemTable
     InstallSuperVersionAndScheduleWork(cfd, superversion_context,
                                        mutable_cf_options);
     if (made_progress) {
@@ -892,6 +906,9 @@ void DBImpl::NotifyOnFlushCompleted(
   // flush process.
 }
 
+// 手动触发 Compaction 的入口
+// 1. 用户调用 DB::CompactRange
+// 2. 内部处理 Timestamp 后调用 CompactRangeInternal
 Status DBImpl::CompactRange(const CompactRangeOptions& options,
                             ColumnFamilyHandle* column_family,
                             const Slice* begin_without_ts,
@@ -2639,6 +2656,10 @@ void DBImpl::EnableManualCompaction() {
   manual_compaction_paused_.fetch_sub(1, std::memory_order_release);
 }
 
+// 自动触发 Flush 或 Compaction 的调度逻辑
+// 1. 检查是否暂停、报错或关闭
+// 2. 调度 Flush 任务 (BGWorkFlush)
+// 3. 调度 Compaction 任务 (BGWorkCompaction)
 void DBImpl::MaybeScheduleFlushOrCompaction() {
   mutex_.AssertHeld();
   if (!opened_successfully_) {
@@ -3117,6 +3138,10 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
   }
 }
 
+// 后台 Compaction 线程的入口函数
+// 1. 设置线程上下文
+// 2. 调用 BackgroundCompaction 执行实际逻辑
+// 3. 任务完成后，再次调用 MaybeScheduleFlushOrCompaction 检查是否有更多工作
 void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                       Env::Priority bg_thread_pri) {
   bool made_progress = false;
@@ -3240,6 +3265,10 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
   }
 }
 
+// 执行后台 Compaction 的核心逻辑
+// 1. 如果是手动 Compaction (Manual)，直接执行
+// 2. 如果是自动 Compaction，从队列中取出一个 Compaction 任务 (PickCompactionFromQueue)
+// 3. 创建 CompactionJob 并运行 (Run)
 Status DBImpl::BackgroundCompaction(bool* made_progress,
                                     JobContext* job_context,
                                     LogBuffer* log_buffer,

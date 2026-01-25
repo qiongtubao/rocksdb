@@ -425,6 +425,8 @@ Status TableCache::Get(
   // Check row cache if enabled. Since row cache does not currently store
   // sequence numbers, we cannot use it if we need to fetch the sequence.
   if (ioptions_.row_cache && !get_context->NeedToReadSequence()) {
+    // 1. 查 Row Cache (如果开启)
+    //    Row Cache 缓存了每行数据的具体内容，速度最快
     auto user_key = ExtractUserKey(k);
     CreateRowCacheKeyPrefix(options, fd, k, get_context, row_cache_key);
     done = GetFromRowCache(user_key, row_cache_key, row_cache_key.Size(),
@@ -439,6 +441,9 @@ Status TableCache::Get(
   if (!done) {
     assert(s.ok());
     if (t == nullptr) {
+      // 2. 获取 TableReader
+      //    如果 TableReader 不在 Cache 中，则打开 SST 文件并创建 (FindTable)
+      //    FindTable 会查找 table_cache_ (LRU Cache)
       s = FindTable(options, file_options_, internal_comparator, file_meta,
                     &handle, block_protection_bytes_per_key, prefix_extractor,
                     options.read_tier == kBlockCacheTier /* no_io */,
@@ -469,6 +474,8 @@ Status TableCache::Get(
     }
     if (s.ok()) {
       get_context->SetReplayLog(row_cache_entry);  // nullptr if no cache.
+      // 3. 在 SST 文件内部查找
+      //    BlockBasedTable::Get -> Filter Block -> Index Block -> Data Block (Block Cache)
       s = t->Get(options, k, get_context, prefix_extractor.get(), skip_filters);
       get_context->SetReplayLog(nullptr);
     } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {

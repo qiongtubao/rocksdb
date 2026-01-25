@@ -613,6 +613,11 @@ void CompactionJob::GenSubcompactionBoundaries() {
                extra_num_subcompaction_threads_reserved_));
 }
 
+// 核心 Compaction 执行逻辑
+// 1. 初始化 (Prepare 已经在之前调用)
+// 2. 启动多个线程 (如果配置了 SubCompactions) 并行执行 ProcessKeyValueCompaction
+// 3. 等待所有 SubCompaction 完成
+// 4. 验证结果 (Verify)
 Status CompactionJob::Run() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_RUN);
@@ -813,6 +818,9 @@ Status CompactionJob::Run() {
   return status;
 }
 
+// 安装 Compaction 结果
+// 1. 将新生成的 SST 文件添加到 Version 中 (InstallCompactionResults)
+// 2. 更新统计信息
 Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
   assert(compact_);
 
@@ -1032,6 +1040,10 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
   }
 }
 
+// 处理实际的 Key-Value Compaction (可能在多个线程中并行执行)
+// 1. 创建 Compaction Iterator (合并多个输入文件的 Iterator)
+// 2. 遍历 Iterator，处理每个 Key (保留、删除、合并)
+// 3. 将结果写入输出文件 (CompactionOutputs)
 void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   assert(sub_compact);
   assert(sub_compact->compaction);

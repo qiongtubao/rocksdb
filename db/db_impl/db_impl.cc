@@ -1916,6 +1916,8 @@ ColumnFamilyHandle* DBImpl::PersistentStatsColumnFamily() const {
   return persist_stats_cf_handle_;
 }
 
+// 读取流程入口
+// 1. 调用带 timestamp 参数的 Get (内部转发)
 Status DBImpl::Get(const ReadOptions& read_options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableSlice* value) {
@@ -1931,6 +1933,7 @@ Status DBImpl::Get(const ReadOptions& read_options,
   get_impl_options.column_family = column_family;
   get_impl_options.value = value;
   get_impl_options.timestamp = timestamp;
+  // 调用核心实现 GetImpl
   Status s = GetImpl(read_options, key, get_impl_options);
   return s;
 }
@@ -2054,6 +2057,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   }
 
   // Acquire SuperVersion
+  // 获取 SuperVersion，它包含了当前的 MemTable、Immutable MemTables 和 Version (SST 文件列表)
+  // SuperVersion 是 Thread-Local 缓存的，因此获取非常快
   SuperVersion* sv = GetAndRefSuperVersion(cfd);
 
   TEST_SYNC_POINT("DBImpl::GetImpl:1");
@@ -2128,6 +2133,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   if (!skip_memtable) {
     // Get value associated with key
     if (get_impl_options.get_value) {
+      // 1. 查找活跃的 MemTable (Active MemTable)
       if (sv->mem->Get(
               lkey,
               get_impl_options.value ? get_impl_options.value->GetSelf()
@@ -2144,6 +2150,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 
         RecordTick(stats_, MEMTABLE_HIT);
       } else if ((s.ok() || s.IsMergeInProgress()) &&
+                 // 2. 查找不可变 MemTable 列表 (Immutable MemTables)
+                 //    这些是正在等待 Flush 的 MemTables
                  sv->imm->Get(lkey,
                               get_impl_options.value
                                   ? get_impl_options.value->GetSelf()
@@ -2188,6 +2196,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   PinnedIteratorsManager pinned_iters_mgr;
   if (!done) {
     PERF_TIMER_GUARD(get_from_output_files_time);
+    // 3. 查找 SST 文件 (Version::Get)
+    //    如果 MemTable 中没找到，则去磁盘上的 SST 文件中查找
     sv->current->Get(
         read_options, lkey, get_impl_options.value, get_impl_options.columns,
         timestamp, &s, &merge_context, &max_covering_tombstone_seq,
