@@ -60,12 +60,25 @@ struct ThreadPoolImpl::Impl {
 
   void LowerCPUPriority(CpuPriority pri);
 
+  // 唤醒所有等待中的后台线程
+  // 使用条件变量的 notify_all 方法通知所有等待的线程
+  // 通常用于任务队列有新任务、需要调整线程数或需要清理多余线程时
   void WakeUpAllThreads() { bgsignal_.notify_all(); }
 
+  // 后台线程主函数
+  // 每个后台线程都会执行这个函数，从任务队列中取出任务并执行
+  // thread_id: 线程的唯一标识符，用于区分不同的后台线程
   void BGThread(size_t thread_id);
 
+  // 启动后台线程
+  // 根据当前设置的线程限制，启动所需数量的后台线程
+  // 如果已经存在足够的线程，则不创建新线程
   void StartBGThreads();
 
+  // 提交任务到线程池
+  // schedule: 要执行的任务函数（右值引用，支持移动语义）
+  // unschedule: 取消任务时调用的清理函数（右值引用）
+  // tag: 任务的标签，用于标识和取消特定任务
   void Submit(std::function<void()>&& schedule,
               std::function<void()>&& unschedule, void* tag);
 
@@ -377,16 +390,26 @@ int ThreadPoolImpl::Impl::GetBackgroundThreads() {
 }
 
 void ThreadPoolImpl::Impl::StartBGThreads() {
-  // Start background thread if necessary
+  // 启动后台线程（如果必要）
+  // 循环直到当前线程数量达到或超过线程限制
   while ((int)bgthreads_.size() < total_threads_limit_) {
+    // 创建新的后台线程
+    // 参数：线程函数包装器、线程元数据（包含线程池指针和线程 ID）
     port::Thread p_t(&BGThreadWrapper,
                      new BGThreadMetadata(this, bgthreads_.size()));
 
-// Set the thread name to aid debugging
+// 设置线程名称以辅助调试
+// 仅在使用 GNU C Library 2.12 或更高版本时支持
 #if defined(_GNU_SOURCE) && defined(__GLIBC_PREREQ)
 #if __GLIBC_PREREQ(2, 12)
+    // 获取线程的底层原生句柄
     auto th_handle = p_t.native_handle();
+
+    // 将线程优先级枚举值转换为字符串
     std::string thread_priority = Env::PriorityToString(GetThreadPriority());
+
+    // 构建线程名称
+    // 格式为 "rocksdb:" 后跟小写的优先级名称（如 "rocksdb:high"）
     std::ostringstream thread_name_stream;
     thread_name_stream << "rocksdb:";
     for (char c : thread_priority) {
@@ -410,23 +433,35 @@ void ThreadPoolImpl::Impl::Submit(std::function<void()>&& schedule,
 
   StartBGThreads();
 
-  // Add to priority queue
+  // 将任务添加到任务队列
   queue_.push_back(BGItem());
+
+  // 测试同步点：在任务入队后
   TEST_SYNC_POINT("ThreadPoolImpl::Submit::Enqueue");
+
+  // 获取刚添加的任务引用
   auto& item = queue_.back();
+
+  // 设置任务标签（用于识别和取消任务）
   item.tag = tag;
+
+  // 设置要执行的任务函数（使用移动语义转移所有权）
   item.function = std::move(schedule);
+
+  // 设置取消任务时的清理函数（使用移动语义）
   item.unschedFunction = std::move(unschedule);
 
+  // 更新队列长度（原子操作，用于统计）
   queue_len_.store(static_cast<unsigned int>(queue_.size()),
                    std::memory_order_relaxed);
 
+  // 如果没有多余的线程（线程数量未超过限制）
   if (!HasExcessiveThread()) {
-    // Wake up at least one waiting thread.
+    // 唤醒至少一个等待的线程来执行新任务
     bgsignal_.notify_one();
   } else {
-    // Need to wake up all threads to make sure the one woken
-    // up is not the one to terminate.
+    // 需要唤醒所有线程，确保被唤醒的不是需要终止的线程
+    // 因为有多余线程，有些线程可能需要退出，需要确保有非退出的线程被唤醒
     WakeUpAllThreads();
   }
 }

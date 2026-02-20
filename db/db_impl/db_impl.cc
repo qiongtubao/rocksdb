@@ -547,33 +547,92 @@ Status DBImpl::MaybeReleaseTimestampedSnapshotsAndCheck() {
   return Status::OK();
 }
 
+// ============================================================================
+// DBImpl::CloseHelper 函数
+// ============================================================================
+// 函数名: DBImpl::CloseHelper
+// 功能描述: 执行 RocksDB 数据库的实际关闭操作，释放所有资源
+//
+// 返回值:
+//   - Status: 关闭操作的状态
+//     * Status::OK(): 关闭成功
+//     * Status::Error(): 关闭过程中出现错误（如 WAL 同步失败）
+//     * Status::Incomplete(): 用户未释放某些资源（如快照）
+//
+// 关闭流程的详细步骤:
+//   步骤1: 停止错误恢复并等待完成
+//   步骤2: 取消后台工作
+//   步骤3: 等待后台工作完成
+//   步骤4: 清理调度器和队列
+//   步骤5: 删除 ColumnFamily handles
+//   步骤6: 清理过期文件
+//   步骤7: 关闭 WAL 日志
+//   步骤8: 清理表缓存
+//   步骤9: 清理版本集和事务
+//   步骤10: 关闭日志和管理器
+//
+// 线程安全性:
+//   - 使用 mutex_ 保护共享状态的访问
+//   - 使用 bg_cv_ 等待后台任务完成
+//   - 使用 log_write_mutex_ 保护日志操作
+//
+// 错误处理:
+//   - 使用 PermitUncheckedError() 忽略析构中的错误
+//   - 保留第一个错误到 ret 变量
+//   - 对于 Aborted 错误，包装为 Incomplete 错误返回
+//   - 不中断关闭流程
+//
+// 资源释放顺序的重要性:
+//   1. 后台任务 → 防止后台线程访问已释放的资源
+//   2. ColumnFamily 引用 → 防止在清理队列时访问已释放的内存
+//   3. 过期文件 → 在关闭文件前清理，避免文件系统状态混乱
+//   4. WAL 日志 → 最后关闭，确保数据持久化
+//   5. 表缓存 → 在版本集之前清理
+//   6. 版本集 → 最后清理，因为它持有对其他资源的引用
+//   7. 文件锁 → 在释放所有其他资源后解锁
+//   8. 管理器和日志 → 在关闭其他资源后关闭
+//
+// 相关函数:
+//   - DBImpl::~DBImpl(): 调用此函数
+//   - DBImpl::CloseImpl(): 调用此函数
+//   - CancelAllBackgroundWork(): 取消后台工作
+//   - FindObsoleteFiles(): 找出过期文件
+//   - PurgeObsoleteFiles(): 删除过期文件
+// ============================================================================
 Status DBImpl::CloseHelper() {
   // Guarantee that there is no background error recovery in progress before
   // continuing with the shutdown
+
+  // === 步骤1: 停止错误恢复并等待完成 ===
   mutex_.Lock();
+  // 设置 shutdown_initiated_ 标志为 true，阻止新操作
   shutdown_initiated_ = true;
+
+  // 取消错误恢复操作
   error_handler_.CancelErrorRecovery();
+
+  // 等待错误恢复操作完成
   while (error_handler_.IsRecoveryInProgress()) {
     bg_cv_.Wait();
   }
   mutex_.Unlock();
 
-  // Below check is added as recovery_error_ is not checked and it causes crash
-  // in DBSSTTest.DBWithMaxSpaceAllowedWithBlobFiles when space limit is
-  // reached.
+  // === 处理恢复错误 ===
+  // 避免在某些测试中崩溃
   error_handler_.GetRecoveryError().PermitUncheckedError();
 
-  // CancelAllBackgroundWork called with false means we just set the shutdown
-  // marker. After this we do a variant of the waiting and unschedule work
-  // (to consider: moving all the waiting into CancelAllBackgroundWork(true))
+  // === 步骤2: 取消后台工作 ===
+  // CancelAllBackgroundWork(false) 设置关闭标记但不等待
   CancelAllBackgroundWork(false);
 
-  // Cancel manual compaction if there's any
+  // === 取消手动压缩任务 ===
   if (HasPendingManualCompaction()) {
     DisableManualCompaction();
   }
+
+  // === 取消所有调度任务 ===
   mutex_.Lock();
-  // Unschedule all tasks for this DB
+  // 遍历所有任务类型，取消所有优先级的任务
   for (uint8_t i = 0; i < static_cast<uint8_t>(TaskType::kCount); i++) {
     env_->UnSchedule(GetTaskTag(i), Env::Priority::BOTTOM);
     env_->UnSchedule(GetTaskTag(i), Env::Priority::LOW);
@@ -582,7 +641,8 @@ Status DBImpl::CloseHelper() {
 
   Status ret = Status::OK();
 
-  // Wait for background work to finish
+  // === 步骤3: 等待后台工作完成 ===
+  // 等待压缩、刷新、purge、错误恢复任务全部完成
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
          bg_flush_scheduled_ || bg_purge_scheduled_ ||
          pending_purge_obsolete_files_ ||
@@ -591,37 +651,58 @@ Status DBImpl::CloseHelper() {
     bg_cv_.Wait();
   }
   TEST_SYNC_POINT_CALLBACK("DBImpl::CloseHelper:PendingPurgeFinished",
-                           &files_grabbed_for_purge_);
+                         &files_grabbed_for_purge_);
+
+  // === 步骤4: 清理调度器和队列 ===
   EraseThreadStatusDbInfo();
   flush_scheduler_.Clear();
   trim_history_scheduler_.Clear();
 
+  // === 清理刷新队列 ===
+  // 遍历刷新队列中的所有刷新请求
   while (!flush_queue_.empty()) {
+    // 从队列中取出第一个刷新请求
     const FlushRequest& flush_req = PopFirstFromFlushQueue();
+
+    // 遍历刷新请求中的所有 ColumnFamily
+    // 减少引用计数并尝试删除 ColumnFamily 对象
     for (const auto& iter : flush_req.cfd_to_max_mem_id_to_persist) {
       iter.first->UnrefAndTryDelete();
     }
   }
 
+  // === 清理压缩队列 ===
+  // 遍历压缩队列中的所有压缩任务
   while (!compaction_queue_.empty()) {
+    // 从队列中取出第一个 ColumnFamily
     auto cfd = PopFirstFromCompactionQueue();
+
+    // 减少引用计数并尝试删除 ColumnFamily 对象
     cfd->UnrefAndTryDelete();
   }
 
+  // === 步骤5: 删除 ColumnFamily handles ===
   if (default_cf_handle_ != nullptr || persist_stats_cf_handle_ != nullptr) {
-    // we need to delete handle outside of lock because it does its own locking
+    // 需要在互斥锁外部删除 handle，因为 handle 的删除操作会自己获取锁
     mutex_.Unlock();
+
+    // 删除默认列族的 handle
     if (default_cf_handle_) {
       delete default_cf_handle_;
       default_cf_handle_ = nullptr;
     }
+
+    // 删除持久化统计信息列族的 handle
     if (persist_stats_cf_handle_) {
       delete persist_stats_cf_handle_;
       persist_stats_cf_handle_ = nullptr;
     }
+
+    // 重新获取互斥锁
     mutex_.Lock();
   }
 
+  // === 步骤6: 清理过期文件 ===
   // Clean up obsolete files due to SuperVersion release.
   // (1) Need to delete to obsolete files before closing because RepairDB()
   // scans all existing files in the file system and builds manifest file.
@@ -667,6 +748,7 @@ Status DBImpl::CloseHelper() {
     logs_.clear();
   }
 
+  // === 步骤8: 清理表缓存 ===
   // Table cache may have table handles holding blocks from the block cache.
   // We need to release them before the block cache is destroyed. The block
   // cache may be destroyed inside versions_.reset(), when column family data
@@ -682,22 +764,36 @@ Status DBImpl::CloseHelper() {
   // so the cache can be safely destroyed.
   table_cache_->EraseUnRefEntries();
 
+  // === 步骤9: 清理版本集和事务 ===
+  // 删除所有恢复的事务
   for (auto& txn_entry : recovered_transactions_) {
     delete txn_entry.second;
   }
 
-  // versions need to be destroyed before table_cache since it can hold
-  // references to table_cache.
+  // 重置版本集
+  // versions 需要在 table_cache 之前销毁，因为：
+  //   1. versions_ 持有对 table_cache 的引用
+  //   2. 如果先销毁 table_cache，versions_ 可能在之后访问已释放的缓存
   versions_.reset();
+
+  // 释放互斥锁，准备解锁文件
   mutex_.Unlock();
+
+  // 解锁数据库文件锁
+  // db_lock_ 是数据库目录的文件锁，防止多个进程同时访问同一个数据库
   if (db_lock_ != nullptr) {
-    // TODO: Check for unlock error
+    // TODO: 注释建议应该检查解锁错误
     env_->UnlockFile(db_lock_).PermitUncheckedError();
   }
 
+  // === 步骤10: 关闭日志和管理器 ===
+  // 记录关闭完成的日志
   ROCKS_LOG_INFO(immutable_db_options_.info_log, "Shutdown complete");
+
+  // 刷新日志到磁盘
   LogFlush(immutable_db_options_.info_log);
 
+  // 关闭 SST 文件管理器
   // If the sst_file_manager was allocated by us during DB::Open(), ccall
   // Close() on it before closing the info_log. Otherwise, background thread
   // in SstFileManagerImpl might try to log something
@@ -707,49 +803,259 @@ Status DBImpl::CloseHelper() {
     sfm->Close();
   }
 
+  // 关闭信息日志
+  // 如果 info_log 是数据库自己拥有的（own_info_log_ == true），需要关闭它
   if (immutable_db_options_.info_log && own_info_log_) {
     Status s = immutable_db_options_.info_log->Close();
+
+    // 如果关闭失败且错误不是 IsNotSupported（某些日志不支持关闭操作），
+    // 并且当前没有保存错误，则保存这个错误
     if (!s.ok() && !s.IsNotSupported() && ret.ok()) {
       ret = s;
     }
   }
 
+  // 从写缓冲管理器中移除数据库队列
+  // wbm_stall_ 是数据库在写缓冲管理器中的队列条目
   if (write_buffer_manager_ && wbm_stall_) {
     write_buffer_manager_->RemoveDBFromQueue(wbm_stall_.get());
   }
 
+  // 关闭目录
+  // directories_ 管理数据库的所有目录（包括数据库目录、WAL 目录等）
+  // Close() 会关闭所有打开的目录句柄
   IOStatus io_s = directories_.Close(IOOptions(), nullptr /* dbg */);
   if (!io_s.ok()) {
+    // 如果关闭目录失败，保存错误状态
     ret = io_s;
   }
+
+  // 处理 Aborted 错误
   if (ret.IsAborted()) {
     // Reserve IsAborted() error for those where users didn't release
     // certain resource and they can release them and come back and
     // retry. In this case, we wrap this exception to something else.
+    // IsAborted() 错误保留给用户未释放某些资源的情况
+    // 例如：用户持有快照未释放就尝试关闭数据库
+    // 在这种情况下：
+    //   1. 用户可以释放资源
+    //   2. 然后重试关闭操作
+    // 所以将 Aborted 错误包装为 Incomplete 错误返回
     return Status::Incomplete(ret.ToString());
   }
 
+  // 返回关闭状态
   return ret;
 }
 
 Status DBImpl::CloseImpl() { return CloseHelper(); }
 
+// ============================================================================
+// DBImpl 析构函数
+// ============================================================================
+// 函数名: DBImpl::~DBImpl
+// 功能描述: 销毁 RocksDB 数据库实例，释放所有资源
+//
+// 析构过程概述:
+//   DBImpl 的析构函数本身较简单，实际的清理工作委托给 CloseHelper() 完成。
+//   整个关闭流程可以分为多个阶段，确保数据安全释放、资源正确清理。
+//
+// 主要功能阶段:
+//   1. 防止重复关闭
+//   2. 检查并释放时间戳快照
+//   3. 调用 CloseHelper() 执行实际的关闭操作
+//
+// CloseHelper() 执行的详细步骤:
+//   阶段1: 停止后台任务和错误恢复
+//     1. 设置 shutdown_initiated_ 标志，阻止新的后台任务
+//     2. 取消错误恢复（error_handler_.CancelErrorRecovery）
+//     3. 等待正在进行的错误恢复完成
+//     4. 取消所有后台工作（压缩、刷新、purge 等）
+//     5. 取消手动压缩任务
+//     6. 取消所有调度任务
+//
+//   阶段2: 等待后台任务完成
+//     1. 等待后台压缩任务（bg_compaction_scheduled_）
+//     2. 等待后台刷新任务（bg_flush_scheduled_）
+//     3. 等待文件清理任务（bg_purge_scheduled_）
+//     4. 等待待清理的过期文件（pending_purge_obsolete_files_）
+//     5. 等待错误恢复完成
+//
+//   阶段3: 清理队列和调度器
+//     1. 清空刷新调度器（flush_scheduler_.Clear()）
+//     2. 清空历史修剪调度器（trim_history_scheduler_.Clear()）
+//     3. 清理刷新队列中的 ColumnFamily 引用
+//     4. 清理压缩队列中的 ColumnFamily 引用
+//
+//   阶段4: 删除 ColumnFamily handles
+//     1. 删除 default_cf_handle_（默认列族的句柄）
+//     2. 删除 persist_stats_cf_handle_（持久化统计信息的列族句柄）
+//     注意: 需要在 mutex 外部删除，因为删除操作会自己获取锁
+//
+//   阶段5: 清理过期文件
+//     1. 调用 FindObsoleteFiles() 找出所有过期文件
+//     2. 调用 PurgeObsoleteFiles() 删除这些文件
+//     为什么要删除过期文件:
+//       - RepairDB() 会扫描所有现有文件并构建 manifest 文件
+//       - 保留过期文件会混淆修复过程
+//     为什么要检查 opened_successfully_:
+//       - 如果 VersionSet 恢复失败（可能由于损坏的 manifest 文件），
+//         可能无法正确识别活跃文件
+//       - 错误地识别可能导致意外删除"活跃"文件
+//       - 损坏的 manifest 可以通过 RepairDB() 恢复
+//
+//   阶段6: 关闭和清理 WAL 日志
+//     1. 删除待释放的日志列表（logs_to_free_）
+//     2. 遍历所有活跃日志（logs_）
+//     3. 调用 ClearWriter() 同步并关闭 WAL 文件
+//     4. 记录任何关闭错误（但继续关闭流程）
+//     5. 清空日志列表
+//
+//   阶段7: 清理表缓存和块缓存
+//     1. 调用 EraseUnRefEntries() 清理表缓存中的未引用条目
+//     为什么要清理表缓存:
+//       - 表缓存可能持有来自块缓存的块
+//       - 需要在块缓存被销毁前释放这些块
+//       - 块缓存可能在 versions_.reset() 中被销毁
+//     清理逻辑:
+//       - 假设所有用户查询已完成
+//       - 只有版本集本身可能持有块缓存的块
+//       - 释放未引用的句柄后，只剩下版本集持有的句柄
+//       - 在 versions_.reset() 中，版本集会释放这些句柄
+//       - 每次释放句柄时，也会从缓存中删除
+//       - 保证 versions_.reset() 后表缓存为空，可以安全销毁
+//
+//   阶段8: 清理版本集和锁
+//     1. 删除恢复的事务（recovered_transactions_）
+//     2. 重置版本集（versions_.reset()）
+//       - 注意: versions 需要在 table_cache 之前销毁，因为它持有对 table_cache 的引用
+//     3. 解锁数据库文件锁（db_lock_）
+//
+//   阶段9: 记录日志和关闭资源
+//     1. 记录 "Shutdown complete" 日志
+//     2. 刷新日志（LogFlush）
+//     3. 关闭 SST 文件管理器（sst_file_manager）
+//        - 如果是 DB::Open() 时分配的，调用 Close()
+//        - 否则后台线程可能尝试记录日志
+//     4. 关闭信息日志（info_log）
+//        - 如果是 DB 拥有的日志（own_info_log_），调用 Close()
+//     5. 从写缓冲管理器中移除数据库队列（write_buffer_manager_）
+//     6. 关闭目录（directories_.Close()）
+//
+// 线程安全性:
+//   - 使用 closing_mutex_ 防止多个线程同时关闭数据库
+//   - 使用 mutex_ 保护共享状态的访问
+//   - 使用 bg_cv_ 等待后台任务完成
+//
+// 错误处理:
+//   - 使用 PermitUncheckedError() 忽略析构中的错误
+//   - 保留第一个错误到 closing_status_
+//   - 对于 Aborted 错误，包装为 Incomplete 错误返回
+//
+// 使用场景:
+//   - 用户调用 delete db 或智能指针自动析构时
+//   - DB::Open() 失败时自动清理部分初始化的资源
+//   - 数据库生命周期结束时
+//
+// 注意事项:
+//   - 析构函数不能抛异常（C++ 规则）
+//   - 所有错误都被忽略或记录，不中断析构流程
+//   - 必须确保所有后台任务都已完成
+//   - 必须正确处理资源释放顺序（避免访问已释放的资源）
+//   - 防止重复关闭（使用 closed_ 标志）
+//
+// 资源释放顺序的重要性:
+//   1. 后台任务 → 防止在释放资源时仍有后台线程访问
+//   2. ColumnFamily 引用 → 防止在清理队列时访问已释放的内存
+//   3. 过期文件 → 在关闭文件前清理，避免文件系统状态混乱
+//   4. WAL 日志 → 最后关闭，确保数据持久化
+//   5. 表缓存 → 在版本集之前清理
+//   6. 版本集 → 最后清理，因为它持有对其他资源的引用
+//   7. 文件锁 → 在释放所有其他资源后解锁
+//   8. 日志记录器 → 在释放其他资源后关闭，避免记录到已关闭的日志
+//
+// 相关函数:
+//   - CloseImpl(): 简单调用 CloseHelper()
+//   - CloseHelper(): 执行实际的关闭操作
+//   - MaybeReleaseTimestampedSnapshotsAndCheck(): 释放时间戳快照
+//   - CancelAllBackgroundWork(): 取消所有后台任务
+//   - WaitForBackgroundWork(): 等待后台任务完成
+//   - FindObsoleteFiles(): 找出过期文件
+//   - PurgeObsoleteFiles(): 删除过期文件
+//
+// 性能考虑:
+//   - 关闭操作可能较慢，特别是有大量后台任务或大文件时
+//   - 需要等待后台任务完成，可能阻塞一段时间
+//   - 文件删除操作可能需要 I/O 时间
+//   - 缓存清理可能需要时间释放内存
+// ============================================================================
 DBImpl::~DBImpl() {
-  // TODO: remove this.
+  // === 忽略初始化日志创建的错误 ===
+  // init_logger_creation_s_ 是在 DBImpl 构造过程中创建日志时的状态
+  // 这里使用 PermitUncheckedError() 忽略这个错误，因为：
+  //   1. 析构函数不能抛异常
+  //   2. 初始化错误已经处理过了，不需要在析构时再次处理
+  //   3. 保留此错误会导致 Status 对象析构时断言失败
+  // TODO: 注释提到可能需要移除这行，表示这是临时的解决方案
   init_logger_creation_s_.PermitUncheckedError();
 
+  // === 获取关闭锁，防止并发关闭 ===
+  // 使用 RAII 锁守卫，确保锁会在函数结束时自动释放
+  // 关闭锁的作用：
+  //   1. 防止多个线程同时调用析构函数
+  //   2. 确保关闭流程是原子的，不会被中断
+  //   3. 防止在关闭过程中还有新的操作尝试访问数据库
   InstrumentedMutexLock closing_lock_guard(&closing_mutex_);
+
+  // === 检查数据库是否已经关闭 ===
+  // 如果数据库已经关闭（closed_ == true），直接返回
+  // 这种情况可能发生：
+  //   1. 用户多次调用 delete db（虽然不应该）
+  //   2. Close() 方法已经被调用过
+  //   3. 某些错误处理路径已经触发关闭
   if (closed_) {
     return;
   }
 
+  // === 标记数据库为已关闭状态 ===
+  // 设置 closed_ 标志，阻止任何新的数据库操作
+  // 后续的任何操作检查这个标志，如果为 true 则拒绝操作
   closed_ = true;
 
+  // === 释放时间戳快照并检查 ===
+  // 调用 MaybeReleaseTimestampedSnapshotsAndCheck() 释放所有时间戳快照
+  // 时间戳快照（Timestamped Snapshot）是一种特殊的快照，用于读取历史数据
+  //
+  // 为什么要释放快照：
+  //   1. 快照持有对数据的引用
+  //   2. 如果在关闭时还有快照未释放，可能持有已释放的资源
+  //   3. 导致资源泄漏或访问已释放的内存
+  //
+  // 如果还有未释放的快照，返回 Aborted 状态
+  // 但在析构中，我们使用 PermitUncheckedError() 忽略这个错误
   {
     const Status s = MaybeReleaseTimestampedSnapshotsAndCheck();
     s.PermitUncheckedError();
   }
 
+  // === 调用 CloseImpl() 执行实际的关闭操作 ===
+  // CloseImpl() 内部调用 CloseHelper()，执行所有清理工作
+  // 详细的清理步骤见函数上方的注释
+  //
+  // 保存关闭状态到 closing_status_
+  // 虽然 CloseImpl() 可能返回错误，但析构函数必须完成
+  // 使用 PermitUncheckedError() 忽略错误状态
+  //
+  // CloseHelper() 执行的主要步骤：
+  //   1. 停止后台任务和错误恢复
+  //   2. 等待后台任务完成
+  //   3. 清理队列和调度器
+  //   4. 删除 ColumnFamily handles
+  //   5. 清理过期文件
+  //   6. 关闭和清理 WAL 日志
+  //   7. 清理表缓存和块缓存
+  //   8. 清理版本集和锁
+  //   9. 记录日志和关闭资源
   closing_status_ = CloseImpl();
   closing_status_.PermitUncheckedError();
 }
@@ -3934,43 +4240,313 @@ DBOptions DBImpl::GetDBOptions() const {
   return BuildDBOptions(immutable_db_options_, mutable_db_options_);
 }
 
+// ============================================================================
+// 函数名: DBImpl::GetProperty
+// 功能描述: 获取指定列族的数据库属性值（字符串格式）
+//
+// 参数说明:
+//   - column_family: 列族句柄（ColumnFamilyHandle*），指定查询的列族
+//     * 必须是有效的列族句柄（通过 Open 打开的列族）
+//     * 不能为 nullptr
+//     * 示例: db->DefaultColumnFamily()
+//
+//   - property: 属性名称（Slice 类型），指定要查询的属性
+//     * 属性格式: "rocksdb.<property-name>" 或 "rocksdb.<property-name>.<arg>"
+//     * 支持字符串属性和整数属性（都会转换为字符串返回）
+//     * 常见属性列表见下方 "支持的属性" 章节
+//     * 示例: "rocksdb.num-files-at-level0", "rocksdb.stats"
+//
+//   - value: [输出参数] 属性值（std::string*），用于返回查询结果
+//     * 调用者负责分配 std::string 对象
+//     * 函数成功时，*value 包含属性值的字符串表示
+//     * 函数失败时，*value 被清空（value->clear()）
+//     * 对于整数属性，返回十进制字符串（如 "123", "45678"）
+//     * 对于字符串属性，返回原始字符串（如统计信息、配置等）
+//
+// 返回值:
+//   - true: 成功获取属性值
+//     * value 中包含有效的属性值
+//   - false: 获取属性值失败
+//     * 属性名称不存在或无效
+//     * value 被清空
+//
+// 支持的属性:
+//
+//   1. 文件数量相关:
+//      - "rocksdb.num-files-at-level<N>": 第 N 层的文件数量
+//        * N 是层号（0, 1, 2, ...）
+//        * 示例: "rocksdb.num-files-at-level0", "rocksdb.num-files-at-level1"
+//        * 返回值: 十进制字符串（如 "5", "10"）
+//
+//   2. 压缩率相关:
+//      - "rocksdb.compression-ratio-at-level<N>": 第 N 层的压缩率
+//        * 示例: "rocksdb.compression-ratio-at-level0"
+//        * 返回值: 浮点数字符串（如 "0.5" 表示 50% 压缩率）
+//
+//   3. 统计信息:
+//      - "rocksdb.stats": 详细的列族统计信息
+//        * 返回值: 多行字符串，包含各种统计信息
+//      - "rocksdb.cfstats": 列族统计信息
+//      - "rocksdb.dbstats": 数据库统计信息
+//      - "rocksdb.levelstats": 各层文件数量和大小统计
+//
+//   4. 数据大小相关:
+//      - "rocksdb.estimate-num-keys": 估计的键值对数量
+//      - "rocksdb.estimate-live-data-size": 估计的存活数据大小（字节）
+//      - "rocksdb.estimate-table-readers-mem": SSTable 读取器的内存占用
+//
+//   5. 写入相关:
+//      - "rocksdb.num-entries-active-memtable": 活跃 memtable 中的条目数
+//      - "rocksdb.num-entries-imm-memtables": 不可变 memtable 中的条目数
+//      - "rocksdb.num-immutable-memtable": 不可变 memtable 的数量
+//      - "rocksdb.memtable-flush-pending": 是否有 memtable 刷新待处理
+//
+//   6. 事务相关:
+//      - "rocksdb.num-snapshots": 快照数量
+//      - "rocksdb.oldest-snapshot-time": 最旧快照的时间戳
+//      - "rocksdb.estimate-oldest-key-time": 估计最旧键的时间戳
+//
+//   7. 后台任务相关:
+//      - "rocksdb.background-errors": 后台任务错误数量
+//      - "rocksdb.cur-size-all-mem-tables": 所有 memtable 的总大小
+//      - "rocksdb.size-all-mem-tables": 所有 memtable 的总大小（别名）
+//
+//   8. 压缩相关:
+//      - "rocksdb.compaction-pending": 是否有压缩待处理
+//      - "rocksdb.num-running-compactions": 正在运行的压缩任务数量
+//      - "rocksdb.num-running-flushes": 正在运行的刷新任务数量
+//      - "rocksdb.estimate-pending-compaction-bytes": 待压缩数据大小（字节）
+//
+//   9. SSTable 相关:
+//      - "rocksdb.num-live-versions": 存活的版本数量
+//      - "rocksdb.current-super-version-number": 当前超级版本号
+//      - "rocksdb.estimate-num-keys": 估计键值对数量（别名）
+//
+//   10. 写入停止相关:
+//       - "rocksdb.is-write-stopped": 写入是否被停止
+//       - "rocksdb.is-write-stopped-by-overflow": 写入是否因 memtable 溢出而停止
+//
+// 实现细节:
+//
+//   1. 查找属性信息:
+//      - 调用 GetPropertyInfo() 查找属性的元信息
+//      - GetPropertyInfo() 返回 DBPropertyInfo*（包含属性的处理函数）
+//      - 如果属性不存在，返回 nullptr
+//
+//   2. 清空输出值:
+//      - 无论成功或失败，都先清空 value
+//      - 避免返回旧的或无效的数据
+//
+//   3. 获取列族数据:
+//      - 从 column_family 句柄获取 ColumnFamilyData* (cfd)
+//      - static_cast_with_check 确保类型转换安全
+//      - cfd 包含列族的元数据和状态信息
+//
+//   4. 根据属性类型处理:
+//      a) 整数属性 (handle_int):
+//         - 调用 GetIntPropertyInternal() 获取整数值
+//         - 将整数转换为字符串: std::to_string(int_value)
+//         - 返回转换后的字符串
+//
+//      b) 字符串属性 (handle_string):
+//         - 判断是否需要持锁: need_out_of_mutex
+//         - 如果 need_out_of_mutex = true: 不持锁调用
+//         - 如果 need_out_of_mutex = false: 持锁调用
+//         - 调用 cfd->internal_stats()->GetStringProperty()
+//
+//      c) DBImpl 字符串属性 (handle_string_dbimpl):
+//         - 判断是否需要持锁: need_out_of_mutex
+//         - 使用成员函数指针调用 DBImpl 的成员函数
+//         - 示例: (this->*(property_info->handle_string_dbimpl))(value)
+//
+//   5. 线程安全处理:
+//      - 某些属性需要在 mutex_ 保护下访问
+//      - 某些属性不需要持锁（避免阻塞）
+//      - 使用 InstrumentedMutexLock 进行带锁访问
+//
+// DBPropertyInfo 结构说明:
+//   - need_out_of_mutex: 是否需要在锁外访问（某些属性访问成本高，不应阻塞）
+//   - handle_int: 整数属性的处理函数指针
+//   - handle_string: 字符串属性的处理函数指针（InternalStats 成员函数）
+//   - handle_string_dbimpl: 字符串属性的处理函数指针（DBImpl 成员函数）
+//   - handle_map: Map 类型属性的处理函数指针
+//
+// 错误处理:
+//   - 属性名称不存在: 返回 false
+//   - 属性名称格式错误: 返回 false
+//   - 属性类型不支持: 返回 false（断言失败）
+//   - 其他运行时错误: 由内部处理函数决定返回值
+//
+// 线程安全性:
+//   - 函数本身是线程安全的（多个线程可以同时调用）
+//   - 内部使用 mutex_ 保护共享数据
+//   - 对于需要持锁的属性，会自动获取和释放锁
+//   - 对于不需要持锁的属性，不会阻塞其他线程
+//
+// 性能考虑:
+//   - 某些属性访问成本高（如遍历所有 SSTable）
+//   - 建议避免频繁查询高成本属性
+//   - 使用 GetIntProperty() 获取整数属性更高效
+//   - 持锁属性可能阻塞其他线程的操作
+//
+// 使用场景:
+//   - 监控数据库状态（文件数量、压缩率等）
+//   - 调试和诊断（查看统计信息）
+//   - 自动化测试（验证数据库状态）
+//   - 性能分析（监控后台任务、写入速度等）
+//   - 运维工具（查询数据库健康状态）
+//
+// 示例:
+//   ```cpp
+//   // 1. 获取第 0 层的文件数量
+//   std::string value;
+//   bool success = db->GetProperty(
+//       db->DefaultColumnFamily(),
+//       "rocksdb.num-files-at-level0",
+//       &value);
+//   if (success) {
+//       int num_files = std::stoi(value);
+//       printf("Number of files at level 0: %d\n", num_files);
+//   }
+//
+//   // 2. 获取数据库统计信息
+//   std::string stats;
+//   if (db->GetProperty(db->DefaultColumnFamily(), "rocksdb.stats", &stats)) {
+//       printf("Database stats:\n%s\n", stats.c_str());
+//   }
+//
+//   // 3. 检查是否有压缩任务正在运行
+//   std::string num_compactions;
+//   if (db->GetProperty(db->DefaultColumnFamily(),
+//                       "rocksdb.num-running-compactions",
+//                       &num_compactions)) {
+//       printf("Running compactions: %s\n", num_compactions.c_str());
+//   }
+//
+//   // 4. 获取估计的键值对数量
+//   std::string num_keys;
+//   if (db->GetProperty(db->DefaultColumnFamily(),
+//                       "rocksdb.estimate-num-keys",
+//                       &num_keys)) {
+//       printf("Estimated number of keys: %s\n", num_keys.c_str());
+//   }
+//
+//   // 5. 检查写入是否被停止
+//   std::string is_stopped;
+//   if (db->GetProperty(db->DefaultColumnFamily(),
+//                       "rocksdb.is-write-stopped",
+//                       &is_stopped)) {
+//       if (is_stopped == "1") {
+//           printf("Write is stopped!\n");
+//       }
+//   }
+//   ```
+//
+// 注意事项:
+//   - value 参数必须是有效的指针（不能为 nullptr）
+//   - 属性名称区分大小写（必须完全匹配）
+//   - 某些属性需要在特定状态下才能查询（如列族已打开）
+//   - 整数属性返回的字符串需要调用者转换（如 std::stoi, std::stoull）
+//   - 字符串属性的格式可能会随版本变化，不应依赖固定格式
+//   - 频繁查询属性可能影响性能（建议缓存结果或降低查询频率）
+//   - 持锁属性可能阻塞其他线程，建议在后台线程中查询
+//
+// 相关函数:
+//   - GetIntProperty(): 获取整数属性（直接返回 uint64_t）
+//   - GetMapProperty(): 获取 Map 类型属性（返回多组键值对）
+//   - GetPropertyInfo(): 查找属性的元信息
+//   - InternalStats::GetStringProperty(): 处理字符串属性
+//   - InternalStats::GetIntProperty(): 处理整数属性
+// ============================================================================
 bool DBImpl::GetProperty(ColumnFamilyHandle* column_family,
                          const Slice& property, std::string* value) {
+  // === 查找属性信息 ===
+  // GetPropertyInfo() 根据 property 名称查找 DBPropertyInfo
+  // 返回值:
+  //   - 成功: 指向 DBPropertyInfo 的指针（包含属性的处理函数）
+  //   - 失败: nullptr（属性名称不存在或无效）
+  //
+  // DBPropertyInfo 包含:
+  //   - need_out_of_mutex: 是否需要在锁外访问
+  //   - handle_int: 整数属性的处理函数（成员函数指针）
+  //   - handle_string: 字符串属性的处理函数（InternalStats 成员函数指针）
+  //   - handle_string_dbimpl: 字符串属性的处理函数（DBImpl 成员函数指针）
   const DBPropertyInfo* property_info = GetPropertyInfo(property);
+
+  // === 清空输出值 ===
+  // 无论成功或失败，都先清空 value
+  // 避免返回旧的或无效的数据
   value->clear();
+
+  // === 获取列族数据 ===
+  // 从 column_family 句柄获取 ColumnFamilyData* (cfd)
+  // static_cast_with_check 确保类型转换安全（会检查类型）
+  // ColumnFamilyData 包含列族的元数据和状态信息
   auto cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+
+  // === 检查属性是否存在 ===
+  // 如果 property_info 为 nullptr，说明属性名称不存在
   if (property_info == nullptr) {
-    return false;
-  } else if (property_info->handle_int) {
-    uint64_t int_value;
+    return false;  // 返回 false 表示失败
+  }
+
+  // === 处理整数属性 ===
+  // 整数属性的处理函数指针 (handle_int) 不为 nullptr
+  // 需要调用 GetIntPropertyInternal() 获取整数值
+  else if (property_info->handle_int) {
+    uint64_t int_value;  // 保存整数值
     bool ret_value =
         GetIntPropertyInternal(cfd, *property_info, false, &int_value);
     if (ret_value) {
+      // 如果成功获取整数值，将其转换为字符串
+      // std::to_string 将 uint64_t 转换为十进制字符串
       *value = std::to_string(int_value);
     }
-    return ret_value;
-  } else if (property_info->handle_string) {
+    return ret_value;  // 返回获取结果
+  }
+
+  // === 处理字符串属性（InternalStats 成员函数） ===
+  // 字符串属性的处理函数指针 (handle_string) 不为 nullptr
+  // 需要调用 cfd->internal_stats()->GetStringProperty()
+  else if (property_info->handle_string) {
     if (property_info->need_out_of_mutex) {
+      // 如果需要持锁外访问（不需要获取 mutex_）
+      // 某些属性访问成本高，不应阻塞其他线程
+      // 例如: 遍历所有 SSTable 获取统计信息
       return cfd->internal_stats()->GetStringProperty(*property_info, property,
                                                       value);
     } else {
+      // 如果需要持锁访问
+      // 某些属性需要访问共享数据，必须在 mutex_ 保护下访问
+      // InstrumentedMutexLock 是带性能统计的互斥锁
       InstrumentedMutexLock l(&mutex_);
       return cfd->internal_stats()->GetStringProperty(*property_info, property,
                                                       value);
     }
-  } else if (property_info->handle_string_dbimpl) {
+  }
+
+  // === 处理字符串属性（DBImpl 成员函数） ===
+  // 字符串属性的处理函数指针 (handle_string_dbimpl) 不为 nullptr
+  // 需要调用 DBImpl 的成员函数
+  // 使用成员函数指针调用: (this->*(property_info->handle_string_dbimpl))(value)
+  else if (property_info->handle_string_dbimpl) {
     if (property_info->need_out_of_mutex) {
+      // 如果需要持锁外访问（不需要获取 mutex_）
       return (this->*(property_info->handle_string_dbimpl))(value);
     } else {
+      // 如果需要持锁访问
       InstrumentedMutexLock l(&mutex_);
       return (this->*(property_info->handle_string_dbimpl))(value);
     }
   }
-  // Shouldn't reach here since exactly one of handle_string and handle_int
-  // should be non-nullptr.
+
+  // === 不应该到达此处 ===
+  // 如果到达此处，说明 DBPropertyInfo 的配置有误
+  // 因为 handle_string 和 handle_int 中至少有一个应该非空
+  // 这可能是 RocksDB 内部错误，使用 assert 检测
   assert(false);
-  return false;
+  return false;  // 防止编译器警告
 }
 
 bool DBImpl::GetMapProperty(ColumnFamilyHandle* column_family,
@@ -4008,33 +4584,278 @@ bool DBImpl::GetIntProperty(ColumnFamilyHandle* column_family,
   return GetIntPropertyInternal(cfd, *property_info, false, value);
 }
 
+// ============================================================================
+// 函数名: DBImpl::GetIntPropertyInternal
+// 功能描述: 获取整数类型属性值的内部实现函数
+//
+// 参数说明:
+//   - cfd: 列族数据指针（ColumnFamilyData*），指定要查询的列族
+//     * 必须是有效的列族数据指针
+//     * 不能为 nullptr
+//     * 包含列族的元数据、状态信息和内部统计对象
+//
+//   - property_info: 属性信息的常量引用（const DBPropertyInfo&）
+//     * 包含属性的元信息和处理函数指针
+//     * 从 GetPropertyInfo() 获取
+//     * 主要字段:
+//       - handle_int: 整数属性的处理函数指针（必须非空）
+//       - need_out_of_mutex: 是否需要在锁外访问
+//     * 此参数用于决定如何访问属性（持锁/不持锁）
+//
+//   - is_locked: 布尔值，表示调用者是否已持有 mutex_ 锁
+//     * true: 调用者已持有 mutex_ 锁（不需要重新获取）
+//     * false: 调用者未持有 mutex_ 锁（需要先获取锁）
+//     * 用于优化锁的使用（避免重复获取锁）
+//
+//   - value: [输出参数] 属性值指针（uint64_t*），用于返回查询结果
+//     * 调用者负责分配 uint64_t 变量
+//     * 函数成功时，*value 包含属性值
+//     * 函数失败时，*value 的值未定义
+//     * 典型值: 文件数量、字节数、键值对数量等
+//
+// 返回值:
+//   - true: 成功获取属性值
+//     * value 中包含有效的属性值
+//   - false: 获取属性值失败
+//     * value 的值未定义
+//     * 可能的原因: 属性不存在、内部错误、列族状态无效等
+//
+// 函数功能:
+//   根据 property_info 的配置，选择合适的方式获取属性值:
+//
+//   1. 需要持锁访问的属性 (need_out_of_mutex = false):
+//      - 如果调用者已持锁（is_locked = true），直接调用处理函数
+//      - 如果调用者未持锁（is_locked = false），先获取锁再调用
+//      - 调用 cfd->internal_stats()->GetIntProperty()
+//
+//   2. 需要持锁外访问的属性 (need_out_of_mutex = true):
+//      - 如果调用者已持锁，先释放锁
+//      - 获取 SuperVersion（不持锁）
+//      - 调用 cfd->internal_stats()->GetIntPropertyOutOfMutex()
+//      - 释放 SuperVersion
+//      - 如果调用者原本持锁，重新获取锁
+//
+// 为什么需要两种访问方式:
+//   - 持锁访问: 适用于访问成本低、需要保护共享数据的属性
+//     * 例如: 计数器、状态标志等
+//     * 优点: 线程安全、数据一致
+//     * 缺点: 可能阻塞其他线程
+//
+//   - 持锁外访问: 适用于访问成本高、不依赖共享数据的属性
+//     * 例如: 遍历所有 SSTable 统计键值对数量
+//     * 优点: 不阻塞其他线程、减少锁竞争
+//     * 缺点: 数据可能不是最新的（读取时可能有并发修改）
+//
+// SuperVersion 机制:
+//   - SuperVersion 是列族的"超级版本"，包含当前读取所需的所有信息
+//   - 包括: 当前版本 (current)、MemTableList、VersionEdits 等
+//   - 持锁外访问时需要引用 SuperVersion，确保数据一致性
+//   - 引用计数机制: GetAndRefSuperVersion() 增加引用，ReturnAndCleanupSuperVersion() 减少
+//
+// 锁状态管理:
+//   - 函数需要正确处理调用者的锁状态
+//   - 如果调用者已持锁（is_locked = true）:
+//     * 持锁访问: 直接调用处理函数
+//     * 持锁外访问: 先释放锁 → 访问 → 重新获取锁
+//   - 如果调用者未持锁（is_locked = false）:
+//     * 持锁访问: 获取锁 → 调用处理函数 → 自动释放锁
+//     * 持锁外访问: 直接访问（不需要锁）
+//
+// 错误处理:
+//   - 断言: 确保 property_info.handle_int 不为 nullptr
+//   - 如果属性不存在，返回 false（由内部处理函数决定）
+//   - 如果 cfd 无效，返回 false（由内部处理函数决定）
+//   - 如果 SuperVersion 获取失败，返回 false
+//
+// 线程安全性:
+//   - 函数本身是线程安全的（多个线程可以同时调用）
+//   - 内部正确管理 mutex_ 锁
+//   - 持锁外访问时，通过 SuperVersion 引用保证数据一致性
+//   - 锁状态管理确保不会死锁
+//
+// 性能考虑:
+//   - 持锁访问: 快速但可能阻塞（适用于简单属性）
+//   - 持锁外访问: 慢速但不阻塞（适用于复杂属性）
+//   - 锁获取/释放有开销，避免不必要的锁操作
+//   - SuperVersion 的引用计数开销较小
+//
+// 调用时机:
+//   - 被 GetProperty() 调用（获取整数属性）
+//   - 被 GetIntProperty() 调用（直接获取整数属性）
+//   - 被其他内部函数调用（如监控、调试）
+//
+// 使用场景:
+//   - 获取文件数量（各层 SSTable 文件数）
+//   - 获取数据大小（各层 SSTable 字节数）
+//   - 获取键值对数量（估计值）
+//   - 获取后台任务状态（运行中的压缩、刷新任务数量）
+//   - 获取内存使用情况（MemTable 大小、缓存占用）
+//
+// 示例:
+//   ```cpp
+//   // 1. 调用者未持锁
+//   uint64_t value;
+//   bool success = GetIntPropertyInternal(cfd, property_info, false, &value);
+//
+//   // 2. 调用者已持锁
+//   {
+//       InstrumentedMutexLock l(&mutex_);
+//       // ... 其他操作 ...
+//       uint64_t value;
+//       bool success = GetIntPropertyInternal(cfd, property_info, true, &value);
+//       // ... 其他操作 ...
+//   }
+//
+//   // 3. 获取第 0 层的文件数量（调用者未持锁）
+//   const DBPropertyInfo* info = GetPropertyInfo(
+//       Slice("rocksdb.num-files-at-level0"));
+//   if (info && info->handle_int) {
+//       uint64_t num_files;
+//       if (GetIntPropertyInternal(cfd, *info, false, &num_files)) {
+//           printf("Files at level 0: %llu\n", (unsigned long long)num_files);
+//       }
+//   }
+//   ```
+//
+// 注意事项:
+//   - cfd 必须是有效的指针（不能为 nullptr）
+//   - property_info.handle_int 必须非空（否则断言失败）
+//   - is_locked 必须准确反映调用者的锁状态
+//   - 持锁外访问时，数据可能不是最新的（读取时的快照）
+//   - 不要在持有其他锁时调用此函数（可能死锁）
+//   - 返回的 value 只在成功时有效，失败时值未定义
+//
+// 相关函数:
+//   - GetProperty(): 获取字符串属性（内部调用此函数）
+//   - GetIntProperty(): 获取整数属性（公开接口）
+//   - GetPropertyInfo(): 查找属性的元信息
+//   - InternalStats::GetIntProperty(): 处理整数属性（持锁访问）
+//   - InternalStats::GetIntPropertyOutOfMutex(): 处理整数属性（持锁外访问）
+//   - GetAndRefSuperVersion(): 获取并引用 SuperVersion
+//   - ReturnAndCleanupSuperVersion(): 释放 SuperVersion 引用
+// ============================================================================
 bool DBImpl::GetIntPropertyInternal(ColumnFamilyData* cfd,
                                     const DBPropertyInfo& property_info,
                                     bool is_locked, uint64_t* value) {
+  // === 断言检查 ===
+  // 确保 property_info.handle_int 不为 nullptr
+  // 如果为 nullptr，说明属性配置错误（属性应该是整数类型）
   assert(property_info.handle_int != nullptr);
+
+  // === 情况 1: 需要持锁访问的属性 ===
+  // need_out_of_mutex = false 表示此属性必须在 mutex_ 保护下访问
+  // 这类属性通常:
+  //   - 访问成本低（不会遍历大量文件）
+  //   - 需要访问共享数据（如计数器、状态标志）
+  //   - 需要保证数据一致性（不能读取到部分更新的数据）
+  //
+  // 示例属性:
+  //   - rocksdb.num-immutable-memtable（不可变 memtable 数量）
+  //   - rocksdb.memtable-flush-pending（刷新待处理标志）
+  //   - rocksdb.compaction-pending（压缩待处理标志）
+  //   - rocksdb.num-running-flushes（运行中的刷新任务数）
+  //   - rocksdb.num-running-compactions（运行中的压缩任务数）
   if (!property_info.need_out_of_mutex) {
     if (is_locked) {
+      // === 调用者已持锁 ===
+      // 直接调用处理函数，不需要重新获取锁
+      // AssertHeld() 确保 mutex_ 确实被持有（调试检查）
       mutex_.AssertHeld();
       return cfd->internal_stats()->GetIntProperty(property_info, value, this);
     } else {
+      // === 调用者未持锁 ===
+      // 使用 RAII 锁（InstrumentedMutexLock）获取 mutex_
+      // 锁会在函数返回时自动释放（析构函数中调用 Unlock()）
       InstrumentedMutexLock l(&mutex_);
       return cfd->internal_stats()->GetIntProperty(property_info, value, this);
     }
-  } else {
-    SuperVersion* sv = nullptr;
+  }
+
+  // === 情况 2: 需要持锁外访问的属性 ===
+  // need_out_of_mutex = true 表示此属性应在锁外访问
+  // 这类属性通常:
+  //   - 访问成本高（需要遍历大量 SSTable）
+  //   - 不依赖共享数据（只读取 SuperVersion 中的数据）
+  //   - 访问时间长（会阻塞其他线程如果持锁）
+  //
+  // 示例属性:
+  //   - rocksdb.num-files-at-level<N>（第 N 层的文件数量）
+  //   - rocksdb.estimate-num-keys（估计键值对数量）
+  //   - rocksdb.estimate-live-data-size（估计存活数据大小）
+  //   - rocksdb.estimate-table-readers-mem（SSTable 读取器内存占用）
+  //   - rocksdb.num-live-versions（存活的版本数量）
+  //
+  // 持锁外访问的原因:
+  //   - 避免阻塞其他线程（遍历 SSTable 可能很慢）
+  //   - 减少锁竞争（长时间的持锁会降低并发性能）
+  //   - SuperVersion 提供了足够的一致性保证（读取时的快照）
+  else {
+    SuperVersion* sv = nullptr;  // SuperVersion 指针
+
+    // === 如果调用者已持锁，先释放锁 ===
+    // 原因:
+    //   1. 持锁外访问不应该在持锁状态下执行
+    //   2. 避免长时间持有锁（GetAndRefSuperVersion 可能阻塞）
+    //   3. 调用者可能期望锁在函数前后保持不变
+    // 注意: 如果调用者未持锁（is_locked = false），跳过此步骤
     if (is_locked) {
       mutex_.Unlock();
     }
+
+    // === 获取 SuperVersion 并增加引用计数 ===
+    // GetAndRefSuperVersion() 的作用:
+    //   1. 获取列族的当前 SuperVersion
+    //   2. 增加引用计数（防止 SuperVersion 被释放）
+    //   3. 返回 SuperVersion 指针
+    //
+    // SuperVersion 的作用:
+    //   - SuperVersion 包含读取所需的所有信息
+    //   - 包括: current（版本指针）、MemTableList、VersionEdits 等
+    //   - 提供读取时的数据一致性保证（读取时的快照）
+    //
+    // 为什么需要 SuperVersion:
+    //   - 持锁外访问时，数据库状态可能发生变化
+    //   - 例如: 版本切换、压缩完成、刷新完成等
+    //   - SuperVersion 引用确保读取期间数据不会被修改
     sv = GetAndRefSuperVersion(cfd);
 
+    // === 调用持锁外访问的处理函数 ===
+    // GetIntPropertyOutOfMutex() 的参数:
+    //   1. property_info: 属性信息
+    //   2. sv->current: 当前版本指针（从 SuperVersion 获取）
+    //   3. value: [输出] 属性值
+    //
+    // 此函数会访问 sv->current 中的数据（不持锁）
+    // 可能的操作:
+    //   - 遍历所有 SSTable 统计键值对数量
+    //   - 计算各层的总大小
+    //   - 统计文件数量
+    //   - 估计内存使用
     bool ret = cfd->internal_stats()->GetIntPropertyOutOfMutex(
         property_info, sv->current, value);
 
+    // === 释放 SuperVersion 引用 ===
+    // ReturnAndCleanupSuperVersion() 的作用:
+    //   1. 减少引用计数
+    //   2. 如果引用计数降为 0，清理 SuperVersion
+    //   3. 通知等待线程（如果需要）
+    //
+    // 必须调用此函数，否则会导致 SuperVersion 内存泄漏
     ReturnAndCleanupSuperVersion(cfd, sv);
+
+    // === 如果调用者原本持锁，重新获取锁 ===
+    // 原因:
+    //   1. 调用者期望函数前后锁状态保持一致
+    //   2. 如果调用者在函数后需要继续操作，锁应该被持有
+    // 注意: 必须与前面的 Unlock() 对应，避免锁状态错误
     if (is_locked) {
       mutex_.Lock();
     }
 
+    // === 返回结果 ===
+    // ret 由 GetIntPropertyOutOfMutex() 返回
+    //   - true: 成功获取属性值
+    //   - false: 获取失败（属性不存在、内部错误等）
     return ret;
   }
 }

@@ -19,74 +19,621 @@ namespace ROCKSDB_NAMESPACE {
 // subset of Options that should not be changed during the entire lifetime
 // of DB. Raw pointers defined in this struct do not have ownership to the data
 // they point to. Options contains std::shared_ptr to these data.
+// ImmutableCFOptions 是 RocksDB 内部使用的数据结构，包含在 DB 整个生命周期中
+// 不应该改变的 Options 子集。此结构中定义的原始指针不拥有其指向数据的所有权。
+// Options 中包含指向这些数据的 std::shared_ptr。
+// 不可变 CF 选项：这些选项在 DB 打开后不能动态修改
+// 与 MutableCFOptions 相对，MutableCFOptions 可以通过 SetOptions() 动态修改
 struct ImmutableCFOptions {
  public:
   static const char* kName() { return "ImmutableCFOptions"; }
   explicit ImmutableCFOptions();
   explicit ImmutableCFOptions(const ColumnFamilyOptions& cf_options);
 
+  // 压缩风格
+  // 功能：指定压缩算法的类型，决定数据如何在层次结构中组织
+  // 支持的压缩风格：
+  //   - kCompactionStyleLevel：Level-style compaction（默认）
+  //     数据分层存储，每层的数据量呈指数增长
+  //     L0 层可能有重叠，L1+ 层不重叠
+  //     适用于读写均衡的场景
+  //   - kCompactionStyleUniversal：Universal-style compaction
+  //     所有文件都可能在同一层，通过时间排序
+  //     减少写放大，但增加读放大和空间放大
+  //     适用于写入密集型场景
+  //   - kCompactionStyleFIFO：FIFO-style compaction
+  //     先进先出，按文件创建时间删除旧文件
+  //     适用于时序数据、日志数据
+  //     数据有 TTL（生存时间）
+  // 重要说明：
+  //   - 压缩风格在 DB 创建后不能更改（immutable）
+  //   - 不同风格对性能和资源消耗影响很大
+  //   - 根据读写模式选择合适的压缩风格
   CompactionStyle compaction_style;
 
+  // 压缩优先级
+  // 功能：指定压缩时文件的选择策略，影响压缩性能
+  // 支持的优先级：
+  //   - kByCompensatedSize：基于补偿大小的优先级（默认）
+  //     考虑文件大小、层数、重叠度等因素
+  //     平衡压缩选择，适用于大多数场景
+  //   - kOldestLargestSeqFirst：优先选择最旧的文件
+  //     减少压缩延迟，加快旧数据清理
+  //     可能增加写放大
+  //   - kMinOverlappingRatio：最小重叠比例
+  //     优先压缩与上层重叠少的文件
+  //     减少读放大
+  //   - kOldestSmallestSeqFirst：优先选择最旧且序列号最小的文件
+  // 性能影响：
+  //   - 不同的优先级会影响压缩效率和写放大
+  //   - 建议根据具体场景测试选择
   CompactionPri compaction_pri;
 
+  // 用户键比较器
+  // 功能：定义用户键的排序方式，影响数据组织和查询
+  // 默认值：BytewiseComparator()（按字节字典序）
+  // 工作原理：
+  //   - 用于比较用户提供的键（不包含序列号）
+  //   - 与 internal_comparator 一起工作
+  //   - 决定键在 MemTable 和 SST 文件中的顺序
+  // 重要说明：
+  //   - 指针不拥有数据所有权，数据由 Options 中的 shared_ptr 管理
+  //   - DB 打开后不能更改（immutable）
+  //   - 必须与创建 DB 时使用的 comparator 完全一致
+  //   - 常用比较器：
+  //     - BytewiseComparator：按字节字典序
+  //     - ReverseBytewiseComparator：反向字典序
+  //     - 自定义 Comparator：根据业务需求实现
   const Comparator* user_comparator;
+
+  // 内部键比较器（仅存在于 ImmutableCFOptions）
+  // 功能：基于 user_comparator 的包装，用于比较内部键（包含序列号）
+  // 内部键格式：[user_key][sequence_number][type]
+  // 工作原理：
+  //   - 在比较内部键时，先比较 user_key
+  //   - 如果 user_key 相同，再比较 sequence_number（降序）
+  //   - 如果 sequence_number 相同，再比较 type
+  //   - 降序比较 sequence_number 确保新版本排在前面
+  // 重要说明：
+  //   - 只在 ImmutableCFOptions 中存在，不在 ColumnFamilyOptions 中
+  //   - 由 user_comparator 自动构造
+  //   - DB 打开后不能更改（immutable）
+  // 使用场景：
+  //   - 所有内部键的比较（MemTable、SST 文件、迭代器）
+  //   - 版本控制：新版本（更大 sequence_number）优先返回
   InternalKeyComparator internal_comparator;  // Only in Immutable
 
+  // 合并操作符
+  // 功能：定义如何合并同一键的多个值（用于 Merge() 操作）
+  // 默认值：nullptr（不使用合并操作）
+  // 工作原理：
+  //   - 当调用 DB::Merge(key, value) 时，使用 merge_operator 合并
+  //   - 避免读-修改-写的开销，实现原子增量更新
+  //   - 合并操作是无序的，必须满足结合律和交换律
+  // 使用场景：
+  //   - 计数器：Merge(key, "delta")
+  //   - 累加器：Merge(key, "addend_value")
+  //   - 集合：Merge(key, "new_item")
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 指针由 shared_ptr 管理，不拥有所有权
   std::shared_ptr<MergeOperator> merge_operator;
 
+  // 压缩过滤器（单实例）
+  // 功能：允许应用在后台压缩过程中修改或删除键值对
+  // 默认值：nullptr（不使用压缩过滤器）
+  // 工作原理：
+  //   - 在压缩过程中，对每个键值对调用 CompactionFilter
+  //   - 可以根据条件决定保留、修改或删除数据
+  //   - 返回 kKeep：保留，kRemove：删除，kChangeValue：修改值
+  // 使用场景：
+  //   - TTL 过期数据清理
+  //   - 数据生命周期管理（根据版本号、时间戳）
+  //   - 数据脱敏
+  //   - 自定义清理策略
+  // 重要说明：
+  //   - 原始指针，不拥有数据所有权
+  //   - 可能被多个压缩线程并发调用，必须线程安全
+  //   - 与 compaction_filter_factory 只能指定一个
+  //   - DB 打开后不能更改（immutable）
   const CompactionFilter* compaction_filter;
 
+  // 压缩过滤器工厂
+  // 功能：为创建 SST 文件的线程提供独立的 CompactionFilter 实例
+  // 默认值：nullptr（不使用压缩过滤器工厂）
+  // 工作原理：
+  //   - 工厂模式，为每个线程创建新的 CompactionFilter 实例
+  //   - 适用于多线程压缩场景，每个线程有独立实例
+  //   - 可以根据 TableFileCreationReason 决定是否使用过滤器
+  // 使用场景：
+  //   - 多线程压缩：避免线程安全问题
+  //   - 状态依赖的过滤：根据线程上下文创建不同过滤器
+  //   - 多场景过滤：Flush、压缩、恢复等不同场景
+  // 重要说明：
+  //   - 指针由 shared_ptr 管理
+  //   - DB 打开后不能更改（immutable）
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory;
 
+  // 最小合并写缓冲区数量
+  // 功能：指定 Flush 时最少需要合并的 MemTable 数量
+  // 默认值：1
+  // 工作原理：
+  //   - 当活跃 MemTable 数量达到 min_write_buffer_number_to_merge 时
+  //   - 将这些 MemTable 合并为一个进行 Flush
+  //   - 减少小文件数量，提高压缩效率
+  // 使用场景：
+  //   - 减少小文件：设置较大的值（2-4）
+  //   - 快速 Flush：设置较小的值（1）
+  // 性能影响：
+  //   - 较大的值：
+  //     - 优点：减少文件数量，提高压缩效率
+  //     - 缺点：增加 Flush 延迟，增加内存使用
+  //   - 较小的值：
+  //     - 优点：快速释放内存
+  //     - 缺点：产生更多小文件，增加压缩开销
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 应该 <= max_write_buffer_number
   int min_write_buffer_number_to_merge;
 
+  // 最大维护的写缓冲区数量
+  // 功能：指定允许在内存中维护的最大 MemTable 数量（包括不可变和活跃的）
+  // 默认值：0（由 max_write_buffer_number 决定）
+  // 工作原理：
+  //   - 当 MemTable 数量超过此值时，多余的会被释放
+  //   - 用于控制内存使用，防止 MemTable 堆积
+  //   - 0 表示不限制，使用 max_write_buffer_number
+  // 使用场景：
+  //   - 内存受限：设置较小的值（2-3）
+  //   - 写入密集：设置较大的值（4-6）
+  // 性能影响：
+  //   - 较小的值：
+  //     - 优点：减少内存使用
+  //     - 缺点：增加 Flush 频率，可能影响读取性能
+  //   - 较大的值：
+  //     - 优点：提高读取性能（缓存更多数据）
+  //     - 缺点：增加内存使用
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 设置为 0 时，实际限制为 max_write_buffer_number
   int max_write_buffer_number_to_maintain;
 
+  // 最大维护的写缓冲区大小
+  // 功能：指定允许在内存中维护的最大 MemTable 总大小
+  // 默认值：0（不限制）
+  // 工作原理：
+  //   - 当 MemTable 总大小超过此值时，会释放最老的 MemTable
+  //   - 用于控制内存使用
+  //   - 0 表示不限制
+  // 使用场景：
+  //   - 内存受限：设置合理的上限（如 1 GB）
+  //   - 写入密集：不限制（0）
+  // 性能影响：
+  //   - 设置限制：
+  //     - 优点：严格控制内存使用
+  //     - 缺点：可能影响读取性能
+  //   - 不限制：
+  //     - 优点：最大化读取性能
+  //     - 缺点：内存使用可能很高
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 与 max_write_buffer_number_to_maintain 一起控制内存
   int64_t max_write_buffer_size_to_maintain;
 
+  // 支持原地更新
+  // 功能：允许在已存在的值上直接更新，避免创建新版本
+  // 默认值：false（不支持原地更新）
+  // 工作原理：
+  //   - 当新值比旧值小时，可以原地更新
+  //   - 节省内存和存储空间
+  //   - 需要配合 inplace_callback 使用
+  // 使用场景：
+  //   - 频繁更新同一键的值
+  //   - 新值不大于旧值（如计数器）
+  // 性能影响：
+  //   - true：
+  //     - 优点：减少内存和存储使用
+  //     - 缺点：增加代码复杂度，需要实现回调
+  //   - false：
+  //     - 优点：简单可靠
+  //     - 缺点：每次更新创建新版本
+  // 前提条件：
+  //   - 必须实现 inplace_callback
+  //   - 新值大小必须 <= 旧值大小
+  //   - 不支持所有 MemTable 类型（如 SkipList 支持，HashSkipList 不支持）
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 实验性功能，可能不稳定
   bool inplace_update_support;
 
+  // 原地更新回调函数
+  // 功能：定义如何执行原地更新的回调函数
+  // 默认值：nullptr
+  // 函数签名：
+  //   UpdateStatus (*inplace_callback)(
+  //     char* existing_value,              // 已存在的值（可修改）
+  //     uint32_t* existing_value_size,    // 已存在的值大小（可修改）
+  //     Slice delta_value,                // 新值（增量）
+  //     std::string* merged_value          // 合并后的值（如果需要扩展）
+  //   )
+  // 返回值：
+  //   - UPDATE_OK：原地更新成功
+  //   - UPDATE_FAILED：原地更新失败
+  //   - UPDATE_SKIPPED：跳过更新
+  // 工作原理：
+  //   - RocksDB 调用此回调执行原地更新
+  //   - 如果新值能放入现有值，原地修改
+  //   - 如果新值太大，写入 merged_value，RocksDB 创建新版本
+  // 使用场景：
+  //   - 计数器：existing_value += delta_value
+  //   - 拼接：strcat(existing_value, delta_value)
+  //   - 自定义逻辑：根据业务需求实现
+  // 示例：
+  //   UpdateStatus MyInplaceCallback(
+  //       char* existing_value, uint32_t* existing_value_size,
+  //       Slice delta_value, std::string* merged_value) {
+  //     if (delta_value.size_ > *existing_value_size) {
+  //       *merged_value = std::string(existing_value, *existing_value_size);
+  //       merged_value->append(delta_value.data_, delta_value.size_);
+  //       return UPDATE_FAILED;  // 需要创建新版本
+  //     }
+  //     memcpy(existing_value, delta_value.data_, delta_value.size_);
+  //     *existing_value_size = delta_value.size_;
+  //     return UPDATE_OK;  // 原地更新成功
+  //   }
+  // 重要说明：
+  //   - 必须配合 inplace_update_support 使用
+  //   - 回调函数必须是线程安全的
+  //   - DB 打开后不能更改（immutable）
   UpdateStatus (*inplace_callback)(char* existing_value,
                                    uint32_t* existing_value_size,
                                    Slice delta_value,
                                    std::string* merged_value);
 
+  // MemTable 表示工厂
+  // 功能：指定 MemTable 的数据结构和实现方式
+  // 默认值：SkipListFactory（基于跳表的 MemTable）
+  // 支持的 MemTable 类型：
+  //   - SkipListFactory：跳表（默认）
+  //     支持范围查询，适用于大多数场景
+  //   - VectorRepFactory：向量
+  //     适合小数据量，纯内存场景
+  //   - HashSkipListRepFactory：哈希跳表
+  //     适合纯点查询场景
+  //   - HashLinkListRepFactory：哈希链表
+  //     适合纯点查询场景
+  //   - cuckoo_hashing：布谷鸟哈希
+  //     适合纯点查询，超低延迟
+  // 使用场景：
+  //   - SkipListFactory（默认）：
+  //     - 支持范围查询和点查询
+  //     - 适用于大多数通用场景
+  //   - HashSkipListRepFactory：
+  //     - 只有点查询
+  //     - 不需要范围查询
+  //     - 内存充足
+  //   - VectorRepFactory：
+  //     - 小数据量
+  //     - 纯内存，需要快速启动和关闭
+  // 性能影响：
+  //   - SkipList：
+  //     - 读写：O(log N)
+  //     - 内存：约 1.5 倍数据大小
+  //   - HashSkipList：
+  //     - 读：O(1)，写：O(log N)
+  //     - 内存：约 2 倍数据大小（哈希表 + 跳表）
+  //   - Vector：
+  //     - 读写：O(log N)
+  //     - 内存：约 1 倍数据大小
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 选择后不能轻易更换
   std::shared_ptr<MemTableRepFactory> memtable_factory;
 
+  // 表工厂
+  // 功能：指定 SST 文件的格式和实现
+  // 默认值：BlockBasedTableFactory（基于块的表格式）
+  // 支持的表格式：
+  //   - BlockBasedTable（默认）：
+  //     数据分为固定大小的块
+  //     支持多种索引类型和过滤器
+  //     适用于大多数场景
+  //   - PlainTable：
+  //     扁平存储，无块结构
+  //     仅适用于纯内存文件系统（RAMFS）
+  //   - CuckooTable：
+  //     基于布谷鸟哈希
+  //     仅支持点查询，不支持范围查询
+  // 使用场景：
+  //   - BlockBasedTable（默认）：大多数通用场景
+  //   - PlainTable：纯内存、大量小键值对
+  //   - CuckooTable：只读、纯点查询、超低延迟
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 不同表格式不兼容
   std::shared_ptr<TableFactory> table_factory;
 
+  // 表属性收集器工厂列表
+  // 功能：指定用于收集和报告 SST 文件统计信息的收集器
+  // 默认值：空列表
+  // 工作原理：
+  //   - 在构建 SST 文件时，收集器收集各种统计信息
+  //   - 包括：键值对数量、数据大小、压缩比等
+  //   - 信息可以用于监控、调优、分析
+  // 常见的表属性收集器：
+  //   - SizePropertiesCollector：收集大小信息
+  //   - TimestampedPropertiesCollector：收集时间戳信息
+  //   - CustomPropertiesCollector：自定义收集器
+  // 使用场景：
+  //   - 监控：收集文件大小、键值对数量等
+  //   - 调优：分析压缩比、热点数据等
+  //   - 分析：统计访问模式、数据分布等
+  // 重要说明：
+  //   - 每个收集器会增加少量开销
+  //   - DB 打开后不能更改（immutable）
   Options::TablePropertiesCollectorFactories
       table_properties_collector_factories;
 
-  // This options is required by PlainTableReader. May need to move it
-  // to PlainTableOptions just like bloom_bits_per_key
+  // Bloom 过滤器局部性
+  // 功能：指定 Bloom 过滤器的局部性，用于优化 PlainTable 的 Bloom filter
+  // 默认值：0（不使用局部性）
+  // 工作原理：
+  //   - 将 Bloom filter 分成多个部分
+  //   - 减少内存访问，提高查询性能
+  //   - 适用于 PlainTable 格式
+  // 使用场景：
+  //   - PlainTable 格式：设置合理的值（如 1-6）
+  //   - BlockBasedTable 格式：不需要设置此参数
+  // 性能影响：
+  //   - 较大的值：
+  //     - 优点：减少内存访问
+  //     - 缺点：增加 Bloom filter 大小
+  //   - 0：
+  //     - 不使用局部性，简单但可能性能较差
+  // 重要说明：
+  //   - 主要用于 PlainTableReader
+  //   - 可能需要移动到 PlainTableOptions
+  //   - DB 打开后不能更改（immutable）
   uint32_t bloom_locality;
 
+  // 动态层级大小（Level-style compaction）
+  // 功能：启用动态调整各层目标大小，优化层级大小分布
+  // 默认值：false（不启用）
+  // 工作原理：
+  //   - 根据实际数据量动态调整每层的目标大小
+  //   - 避免某些层过小或过大
+  //   - 优化压缩性能和空间使用
+  // 使用场景：
+  //   - 数据量快速增长：启用动态调整
+  //   - 数据量稳定：可以不启用
+  // 性能影响：
+  //   - 启用：
+  //     - 优点：更合理的层级分布，更好的性能
+  //     - 缺点：需要一定的计算开销
+  //   - 不启用：
+  //     - 优点：简单，开销小
+  //     - 缺点：可能产生不合理的层级分布
+  // 重要说明：
+  //   - 只对 Level-style compaction 有效
+  //   - DB 打开后不能更改（immutable）
   bool level_compaction_dynamic_level_bytes;
 
+  // 动态文件大小（Level-style compaction）
+  // 功能：启用动态调整目标文件大小，优化文件大小分布
+  // 默认值：false（不启用）
+  // 工作原理：
+  //   - 根据层数和数据量动态调整目标文件大小
+  //   - 优化文件数量和大小
+  // 使用场景：
+  //   - 多层 Level compaction：启用动态调整
+  //   - 少层 Level compaction：可以不启用
+  // 性能影响：
+  //   - 启用：
+  //     - 优点：更合理的文件大小分布
+  //     - 缺点：增加复杂性
+  //   - 不启用：
+  //     - 优点：简单
+  //     - 缺点：可能产生不合理的文件大小
+  // 重要说明：
+  //   - 只对 Level-style compaction 有效
+  //   - DB 打开后不能更改（immutable）
   bool level_compaction_dynamic_file_size;
 
+  // 层数
+  // 功能：指定压缩的层数
+  // 默认值：7
+  // 工作原理：
+  //   - 数据分层存储，从 L0 到 L(num_levels-1)
+  //   - L0 层可能有重叠，L1+ 层不重叠
+  //   - 每层的数据量呈指数增长
+  // 使用场景：
+  //   - Level-style compaction：
+  //     - 小数据量：3-5 层
+  //     - 中等数据量：5-7 层
+  //     - 大数据量：7-10 层
+  //   - Universal-style compaction：
+  //     - 通常设置为 1 层或更少
+  //   - FIFO-style compaction：
+  //     - 通常设置为 1 层
+  // 性能影响：
+  //   - 较少的层数：
+  //     - 优点：读放大小，读取性能好
+  //     - 缺点：写放大大
+  //   - 较多的层数：
+  //     - 优点：写放大小
+  //     - 缺点：读放大大，读取性能差
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - Level-style 推荐使用 7 层
+  //   - Universal/FIFO 推荐使用 1 层
   int num_levels;
 
+  // 优化过滤器以提高命中性能
+  // 功能：优先优化 Bloom filter 以提高命中率场景的性能
+  // 默认值：false（优先优化未命中场景）
+  // 工作原理：
+  //   - false：优先优化未命中场景（键不存在的情况）
+  //     Bloom filter 更积极，增加过滤能力
+  //   - true：优先优化命中场景（键存在的情况）
+  //     Bloom filter 较保守，减少假阳性
+  // 使用场景：
+  //   - 命中率高：设置为 true
+  //   - 未命中率高：设置为 false（默认）
+  // 性能影响：
+  //   - true：
+  //     - 优点：减少命中场景的磁盘 I/O
+  //     - 缺点：增加未命中场景的磁盘 I/O
+  //   - false：
+  //     - 优点：减少未命中场景的磁盘 I/O
+  //     - 缺点：增加命中场景的磁盘 I/O
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 根据实际命中率选择
   bool optimize_filters_for_hits;
 
+  // 强制一致性检查
+  // 功能：启用额外的内部一致性检查，帮助发现 Bug
+  // 默认值：false（不启用）
+  // 工作原理：
+  //   - 在关键路径上添加断言和验证
+  //   - 发现不一致时触发断言失败
+  // 使用场景：
+  //   - 开发和测试：启用以发现问题
+  //   - 生产环境：禁用以提高性能
+  // 性能影响：
+  //   - 启用：
+  //     - 优点：帮助发现 Bug
+  //     - 缺点：显著降低性能
+  //   - 不启用：
+  //     - 优点：性能最佳
+  //     - 缺点：难以发现内部 Bug
+  // 重要说明：
+  //   - 仅用于开发和测试
+  //   - DB 打开后不能更改（immutable）
+  //   - 生产环境应该禁用
   bool force_consistency_checks;
 
+  // 排除最底层数据的秒数
+  // 功能：指定数据在最底层可以停留的最长时间
+  // 默认值：0（不限制）
+  // 工作原理：
+  //   - 数据在最底层停留超过此时间后，会触发压缩
+  //   - 用于避免数据长期停留在最底层
+  // 使用场景：
+  //   - 时序数据：设置合理的 TTL
+  //   - 日志数据：定期清理旧数据
+  // 重要说明：
+  //   - 0 表示不限制
+  //   - DB 打开后不能更改（immutable）
   uint64_t preclude_last_level_data_seconds;
 
+  // 保留内部时间的秒数
+  // 功能：指定保留内部时间戳的持续时间
+  // 默认值：0（不保留）
+  // 工作原理：
+  //   - 内部时间戳用于版本控制和快照
+  //   - 超过此时间的旧版本数据会被清理
+  // 使用场景：
+  //   - 快照管理：控制快照的保留时间
+  //   - 版本管理：控制旧版本的保留时间
+  // 重要说明：
+  //   - 0 表示不限制
+  //   - DB 打开后不能更改（immutable）
   uint64_t preserve_internal_time_seconds;
 
+  // MemTable 插入提示前缀提取器
+  // 功能：为 MemTable 插入操作提供前缀提取器，用于优化插入性能
+  // 默认值：nullptr（不使用）
+  // 工作原理：
+  //   - 在插入键时，提取前缀用于提示 MemTable 的位置
+  //   - 减少 MemTable 的查找时间
+  //   - 适用于某些 MemTable 实现（如 SkipList）
+  // 使用场景：
+  //   - 写入密集型：可以提高插入性能
+  //   - 键有明显前缀结构
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 与 prefix_extractor 不同，此提取器仅用于插入优化
   std::shared_ptr<const SliceTransform>
       memtable_insert_with_hint_prefix_extractor;
 
+  // 列族存储路径
+  // 功能：指定此列族的 SST 文件存储路径，实现数据分层存储
+  // 默认值：空（使用 db_paths）
+  // 工作原理：
+  //   - 新数据存储在路径列表前面的路径
+  //   - 老数据通过压缩逐渐移动到后面的路径
+  //   - 每个路径可以指定目标大小
+  // 使用场景：
+  //   - SSD + HDD 混合存储：
+  //     - 路径 0：/ssd/rocksdb（新数据）
+  //     - 路径 1：/hdd/rocksdb（老数据）
+  //   - 分层存储：
+  //     - 路径 0：/fast/storage（热数据）
+  //     - 路径 1：/slow/storage（冷数据）
+  // 重要说明：
+  //   - 如果为空，使用 db_paths
+  //   - DB 打开后不能更改（immutable）
   std::vector<DbPath> cf_paths;
 
+  // 压缩线程限制器
+  // 功能：限制列族的最大并发压缩任务数量
+  // 默认值：nullptr（不限制）
+  // 工作原理：
+  //   - 限制同时进行的压缩任务数量
+  //   - 可以在多个列族或 DB 实例间共享
+  //   - 当达到限制时，新的压缩任务需要等待
+  // 使用场景：
+  //   - CPU 受限：限制压缩线程数，避免影响主业务
+  //   - I/O 受限：减少并发 I/O，避免磁盘瓶颈
+  //   - 多租户：为不同租户的列族分配不同资源
+  // 重要说明：
+  //   - nullptr 表示不限制
+  //   - DB 打开后不能更改（immutable）
   std::shared_ptr<ConcurrentTaskLimiter> compaction_thread_limiter;
 
+  // SST 文件分割器工厂（实验性功能）
+  // 功能：根据键前缀分割 SST 文件，减少压缩时的写放大
+  // 默认值：nullptr（不使用）
+  // 工作原理：
+  //   - 在压缩时，根据键前缀将 SST 文件分割成多个文件
+  //   - 避免单个 SST 文件跨越整个键空间
+  //   - 下次压缩时，可以只选择部分文件
+  // 使用场景：
+  //   - 键空间分布不均匀
+  //   - 压缩优化
+  // 重要说明：
+  //   - 实验性功能，可能不稳定
+  //   - DB 打开后不能更改（immutable）
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory;
 
+  // Blob 缓存
+  // 功能：指定 Blob 文件的缓存
+  // 默认值：nullptr（不使用）
+  // 工作原理：
+  //   - 缓存 Blob 文件中的大值
+  //   - 减少 Blob 文件的磁盘 I/O
+  //   - 与 block_cache 不同，block_cache 缓存的是数据块
+  // 使用场景：
+  //   - 大值存储：存储大量大值（如图片、文档）
+  //   - 读取密集：频繁读取 Blob 值
+  // 重要说明：
+  //   - 仅当启用 Blob 文件时有效
+  //   - DB 打开后不能更改（immutable）
   std::shared_ptr<Cache> blob_cache;
 
+  // 持久化用户定义的时间戳
+  // 功能：控制是否将用户定义的时间戳持久化到 SST 文件
+  // 默认值：false（不持久化）
+  // 工作原理：
+  //   - 如果启用，用户时间戳会存储在 SST 文件中
+  //   - 时间戳可以用于时序数据管理、TTL 等
+  // 使用场景：
+  //   - 时序数据：需要存储时间戳
+  //   - TTL 管理：根据时间戳过期数据
+  // 重要说明：
+  //   - DB 打开后不能更改（immutable）
+  //   - 需要配合 comparator 支持
   bool persist_user_defined_timestamps;
 };
 

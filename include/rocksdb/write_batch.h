@@ -491,6 +491,203 @@ class WriteBatch : public WriteBatchBase {
   size_t default_cf_ts_sz_ = 0;
 
  protected:
+  // ============================================================================
+  // rep_: WriteBatch 内部表示缓冲区（序列化数据）
+  //
+  // 概述:
+  // rep_ 是 WriteBatch 的核心成员变量，用于存储所有操作序列化后的二进制数据。
+  // 所有的 Put/Delete/Merge 等操作都会按照特定格式序列化到这个字符串缓冲区中。
+  //
+  // 数据格式（write_batch.cc:10-37）:
+  //
+  //   WriteBatch::rep_ :=
+  //       sequence: fixed64           [0-7 字节] 序列号（写入时由 DB 分配）
+  //       count: fixed32              [8-11 字节] 操作记录数量（包括 Put/Delete/Merge 等）
+  //       data: record[count]         [12字节开始] 操作记录数组
+  //
+  //   record := （操作记录，按添加顺序排列）
+  //       kTypeValue varstring varstring                        [Put 操作，默认列族]
+  //           varstring = len: varint32 + data: uint8[len]
+  //           格式: [类型][key长度][key数据][value长度][value数据]
+  //
+  //       kTypeDeletion varstring                                [Delete 操作，默认列族]
+  //           格式: [类型][key长度][key数据]
+  //
+  //       kTypeSingleDeletion varstring                          [SingleDelete 操作]
+  //           格式: [类型][key长度][key数据]
+  //
+  //       kTypeRangeDeletion varstring varstring                 [DeleteRange 操作]
+  //           格式: [类型][begin_key长度][begin_key数据][end_key长度][end_key数据]
+  //
+  //       kTypeMerge varstring varstring                          [Merge 操作]
+  //           格式: [类型][key长度][key数据][value长度][value数据]
+  //
+  //       kTypeColumnFamilyValue varint32 varstring varstring     [Put 操作，指定列族]
+  //           格式: [类型][列族ID][key长度][key数据][value长度][value数据]
+  //
+  //       kTypeColumnFamilyDeletion varint32 varstring            [Delete 操作，指定列族]
+  //           格式: [类型][列族ID][key长度][key数据]
+  //
+  //       kTypeColumnFamilySingleDeletion varint32 varstring      [SingleDelete，指定列族]
+  //           格式: [类型][列族ID][key长度][key数据]
+  //
+  //       kTypeColumnFamilyRangeDeletion varint32 varstring varstring  [DeleteRange，指定列族]
+  //           格式: [类型][列族ID][begin_key长度][begin_key数据][end_key长度][end_key数据]
+  //
+  //       kTypeColumnFamilyMerge varint32 varstring varstring    [Merge 操作，指定列族]
+  //           格式: [类型][列族ID][key长度][key数据][value长度][value数据]
+  //
+  //       kTypeBeginPrepareXID                                    [两阶段提交：开始 Prepare]
+  //           格式: [类型]
+  //
+  //       kTypeEndPrepareXID varstring                            [两阶段提交：结束 Prepare]
+  //           格式: [类型][XID长度][XID数据]
+  //
+  //       kTypeCommitXID varstring                                [两阶段提交：Commit]
+  //           格式: [类型][XID长度][XID数据]
+  //
+  //       kTypeCommitXIDAndTimestamp varstring varstring         [两阶段提交：Commit with Timestamp]
+  //           格式: [类型][XID长度][XID数据][timestamp长度][timestamp数据]
+  //
+  //       kTypeRollbackXID varstring                              [两阶段提交：Rollback]
+  //           格式: [类型][XID长度][XID数据]
+  //
+  //       kTypeBeginPersistedPrepareXID                           [持久化 Prepare 开始]
+  //           格式: [类型]
+  //
+  //       kTypeBeginUnprepareXID                                  [Unprepare 操作]
+  //           格式: [类型]
+  //
+  //       kTypeWideColumnEntity varstring varstring               [宽列实体操作]
+  //           格式: [类型][key长度][key数据][entity长度][entity数据]
+  //
+  //       kTypeColumnFamilyWideColumnEntity varint32 varstring varstring  [宽列，指定列族]
+  //           格式: [类型][列族ID][key长度][key数据][entity长度][entity数据]
+  //
+  //       kTypeNoop                                               [空操作（No-Op）]
+  //           格式: [类型]
+  //
+  //   varstring := （变长字符串）
+  //       len: varint32            [1-5 字节] 字符串长度（使用变长整数编码）
+  //       data: uint8[len]        [len 字节] 字符串数据
+  //
+  // 内存布局示例:
+  //
+  //   示例 1: 默认列族的 Put 操作
+  //   操作: batch.Put("key1", "value1")
+  //   rep_ 内容（十六进制）:
+  //       00000000 00000000    [0-7]   sequence = 0（未分配）
+  //       01000000              [8-11]  count = 1
+  //       0A                    [12]    kTypeValue = 0x0A
+  //       04                    [13]    key 长度 = 4
+  //       6B657931              [14-17] key = "key1"
+  //       06                    [18]    value 长度 = 6
+  //       76616C756531         [19-24] value = "value1"
+  //
+  //   示例 2: 指定列族的 Delete 操作
+  //   操作: batch.Delete(cf_handle, "key2")
+  //   rep_ 内容（续上）:
+  //       1F                    [25]    kTypeColumnFamilyDeletion = 0x1F
+  //       05                    [26]    列族 ID = 5（varint32）
+  //       04                    [27]    key 长度 = 4
+  //       6B657932              [28-31] key = "key2"
+  //
+  //   示例 3: Merge 操作
+  //   操作: batch.Merge("key3", "delta")
+  //   rep_ 内容（续上）:
+  //       0E                    [32]    kTypeMerge = 0x0E
+  //       04                    [33]    key 长度 = 4
+  //       6B657933              [34-37] key = "key3"
+  //       05                    [38]    value 长度 = 5
+  //       64656C7461            [39-43] value = "delta"
+  //
+  // 类型常量（db/dbformat.h）:
+  //   kTypeValue = 0x0A                              [Put，默认列族]
+  //   kTypeDeletion = 0x0C                           [Delete，默认列族]
+  //   kTypeSingleDeletion = 0x0F                     [SingleDelete]
+  //   kTypeMerge = 0x0E                              [Merge]
+  //   kTypeRangeDeletion = 0x42                      [DeleteRange]
+  //   kTypeColumnFamilyValue = 0x1A                  [Put，指定列族]
+  //   kTypeColumnFamilyDeletion = 0x1F               [Delete，指定列族]
+  //   kTypeColumnFamilySingleDeletion = 0x2C         [SingleDelete，指定列族]
+  //   kTypeColumnFamilyRangeDeletion = 0x56          [DeleteRange，指定列族]
+  //   kTypeColumnFamilyMerge = 0x2D                  [Merge，指定列族]
+  //   kTypeBeginPrepareXID = 0xB                     [2PC: Begin Prepare]
+  //   kTypeEndPrepareXID = 0xC                       [2PC: End Prepare]
+  //   kTypeCommitXID = 0xD                           [2PC: Commit]
+  //   kTypeCommitXIDAndTimestamp = 0x12              [2PC: Commit with Timestamp]
+  //   kTypeRollbackXID = 0xE                          [2PC: Rollback]
+  //   kTypeBeginPersistedPrepareXID = 0x20           [2PC: Begin Persisted Prepare]
+  //   kTypeBeginUnprepareXID = 0x21                   [2PC: Begin Unprepare]
+  //   kTypeWideColumnEntity = 0x2E                   [宽列实体]
+  //   kTypeColumnFamilyWideColumnEntity = 0x2F       [宽列实体，指定列族]
+  //   kTypeNoop = 0x0                                 [空操作]
+  //
+  // 主要用途:
+  //   1. 序列化存储: 将所有操作序列化到二进制缓冲区，便于：
+  //      - 写入 WAL（Write-Ahead Log）
+  //      - 网络传输（如复制）
+  //      - 持久化存储
+  //
+  //   2. 批量写入: 将多个操作打包为一个批次，实现原子写入
+  //      - 所有操作要么全部成功，要么全部失败
+  //      - 通过序列号保证顺序一致性
+  //
+  //   3. 重放和恢复: 从 WAL 或备份中恢复数据
+  //      - 通过 Iterate() 解析 rep_ 中的所有操作
+  //      - 重新应用到 MemTable
+  //
+  //   4. 事务支持: 两阶段提交（2PC）的实现基础
+  //      - Prepare 阶段: 写入 WAL（rep_）
+  //      - Commit 阶段: 写入 MemTable
+  //
+  // 使用示例:
+  //
+  //   1. 添加操作:
+  //   WriteBatch batch;
+  //   batch.Put("key1", "value1");      // 序列化到 rep_[12..24]
+  //   batch.Delete("key2");            // 序列化到 rep_[25..31]
+  //   batch.Merge("key3", "delta");     // 序列化到 rep_[32..43]
+  //
+  //   2. 获取序列化数据:
+  //   Slice data = WriteBatchInternal::Contents(&batch);  // 返回 rep_
+  //   printf("Batch size: %zu\n", data.size());           // 输出 rep_.size()
+  //
+  //   3. 从序列化数据创建:
+  //   std::string serialized_data = "..."  // 从 WAL 或备份中读取
+  //   WriteBatch batch_from_serialized(serialized_data);
+  //
+  //   4. 迭代操作:
+  //   batch.Iterate(handler);  // 解析 rep_，调用 handler 的回调函数
+  //
+  //   5. 清空:
+  //   batch.Clear();  // rep_.clear()，重置为空（只保留 sequence 和 count）
+  //
+  // 线程安全性:
+  //   - 多个线程可以同时调用 const 方法（如 GetDataSize()）
+  //   - 多个线程调用非 const 方法（如 Put/Delete）需要外部同步
+  //   - rep_ 本身不是线程安全的（std::string 不保证线程安全）
+  //
+  // 性能考虑:
+  //   - std::string 自动扩容：当 rep_ 空间不足时，会重新分配内存并复制数据
+  //   - 预分配：构造函数可以预分配空间（reserved_bytes 参数）
+  //   - 最小化复制：WriteBatch 支持移动语义（move constructor/assignment）
+  //
+  // 相关函数:
+  //   - WriteBatchInternal::Contents(): 获取 rep_ 的 Slice 视图
+  //   - WriteBatchInternal::SetContents(): 设置 rep_ 的内容
+  //   - WriteBatchInternal::GetDataSize(): 获取 rep_ 的数据大小
+  //   - WriteBatch::Iterate(): 遍历 rep_ 中的所有操作
+  //   - WriteBatch::Clear(): 清空 rep_
+  //
+  // 注意事项:
+  //   - rep_ 的格式是内部实现细节，不应依赖具体的字节偏移
+  //   - 序列号（sequence）在写入时由 DB 分配，创建 WriteBatch 时为 0
+  //   - count 包括所有操作类型（Put/Delete/Merge/LogData 等）
+  //   - 变长整数编码（varint32）节省空间，但需要解码
+  //   - 时间戳（Timestamp）存储在 key 的末尾（如果列族启用）
+  //   - 保护信息（ProtectionInfo，如校验和）存储在 prot_info_ 中，不在 rep_ 中
+  // ============================================================================
   std::string rep_;  // See comment in write_batch.cc for the format of rep_
 };
 

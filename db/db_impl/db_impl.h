@@ -1716,6 +1716,9 @@ class DBImpl : public DB {
 
   // Information for a manual compaction
   struct ManualCompactionState {
+    // 手动压缩状态结构体，用于跟踪手动压缩请求的状态和进度
+    // 该结构体在整个手动压缩生命周期中被使用，可能跨越多个后台压缩任务
+
     ManualCompactionState(ColumnFamilyData* _cfd, int _input_level,
                           int _output_level, uint32_t _output_path_id,
                           bool _exclusive, bool _disallow_trivial_move,
@@ -1727,32 +1730,111 @@ class DBImpl : public DB {
           exclusive(_exclusive),
           disallow_trivial_move(_disallow_trivial_move),
           canceled(_canceled ? *_canceled : canceled_internal_storage) {}
+
+    // 当用户未提供 _canceled 指针时，我们使用 canceled_internal_storage 的引用
+    // 这样可以统一处理 canceled 和 manual_compaction_paused
+    // 因为 DisableManualCompaction() 可能会被调用，此时需要使用内部存储
     // When _canceled is not provided by ther user, we assign the reference of
     // canceled_internal_storage to it to consolidate canceled and
     // manual_compaction_paused since DisableManualCompaction() might be
     // called
 
-    ColumnFamilyData* cfd;
-    int input_level;
-    int output_level;
-    uint32_t output_path_id;
-    Status status;
-    bool done = false;
-    bool in_progress = false;    // compaction request being processed?
-    bool incomplete = false;     // only part of requested range compacted
-    bool exclusive;              // current behavior of only one manual
-    bool disallow_trivial_move;  // Force actual compaction to run
-    const InternalKey* begin = nullptr;  // nullptr means beginning of key range
-    const InternalKey* end = nullptr;    // nullptr means end of key range
-    InternalKey* manual_end = nullptr;   // how far we are compacting
-    InternalKey tmp_storage;      // Used to keep track of compaction progress
-    InternalKey tmp_storage1;     // Used to keep track of compaction progress
+    // ===== 基本信息 =====
 
+    // 目标列族数据指针，指向要压缩的列族
+    ColumnFamilyData* cfd;
+
+    // 输入层：指定要从哪一层开始压缩
+    // - 特殊值 ColumnFamilyData::kCompactAllLevels 表示压缩所有层
+    // - 非负数表示特定层号（如 0, 1, 2...）
+    int input_level;
+
+    // 输出层：指定压缩到哪一层
+    // - 特殊值 ColumnFamilyData::kCompactToBaseLevel 表示压缩到 base_level
+    // - 非负数表示特定层号
+    int output_level;
+
+    // 输出路径 ID：指定压缩输出文件的存储路径
+    // 用于多磁盘场景，可以将不同层的数据分布到不同磁盘上
+    uint32_t output_path_id;
+
+    // 压缩状态：记录压缩操作的执行结果或错误信息
+    Status status;
+
+    // ===== 控制标志 =====
+
+    // 完成标志：表示整个手动压缩请求已完成（成功或失败）
+    // - true：压缩已完成（无论是成功还是失败）
+    // - false：压缩仍在进行中
+    bool done = false;
+
+    // 执行中标志：表示压缩任务正在后台处理
+    // - true：压缩任务已被后台线程获取并正在执行
+    // - false：压缩任务尚未开始或已完成
+    bool in_progress = false;
+
+    // 不完整标志：表示只压缩了请求范围的一部分
+    // 当压缩一轮完成后，如果还有未压缩的范围，会设置此标志为 true
+    // 下次循环会继续压缩剩余范围
+    // - true：只完成了部分范围的压缩，需要继续
+    // - false：压缩已完成或尚未开始
+    bool incomplete = false;
+
+    // 排他性标志：表示是否要求排他性执行
+    // - true：要求排他性执行，不能与其他压缩（包括后台自动压缩）同时进行
+    //         必须等待所有后台压缩完成后才开始
+    // - false：可以与其他压缩并行执行
+    bool exclusive;
+
+    // 禁止平凡移动标志：表示是否强制执行实际的压缩操作
+    // - true：禁止平凡移动，必须进行实际的压缩（即使只是文件移动）
+    //         平凡移动（trivial move）是指将文件从一层移动到另一层，
+    //         不需要读取和重写数据，适用于输出层没有重叠文件的情况
+    // - false：允许平凡移动，如果可以使用文件移动则不进行实际压缩
+    bool disallow_trivial_move;
+
+    // ===== 范围信息 =====
+
+    // 压缩范围的起始键（内部格式 InternalKey）
+    // nullptr 表示从数据库的最小键开始
+    // InternalKey 包含 user key 和 sequence number，用于精确控制压缩范围
+    const InternalKey* begin = nullptr;
+
+    // 压缩范围的结束键（内部格式 InternalKey）
+    // nullptr 表示到数据库的最大键结束
+    const InternalKey* end = nullptr;
+
+    // 实际压缩的结束键（输出参数）
+    // 用于跟踪压缩进度，记录当前轮压缩到了哪里
+    // CompactRange() 函数会设置此值，告知调用者本轮压缩的范围
+    // 例如：请求压缩 [a, z]，但一轮只能压缩 [a, m]，则 manual_end 指向 m
+    InternalKey* manual_end = nullptr;
+
+    // 临时存储：用于跟踪压缩进度的内部缓冲区
+    // 当 manual_end 指向 tmp_storage1 时，tmp_storage1 存储实际压缩到的键
+    // 这是一个预分配的内存区域，避免频繁的内存分配
+    InternalKey tmp_storage;
+
+    // 临时存储 1：用于跟踪压缩进度的内部缓冲区
+    // 在调用 CompactRange() 时，manual_end 被设置为指向此存储
+    // CompactRange() 会将实际压缩到的键写入此处
+    InternalKey tmp_storage1;
+
+    // ===== 取消控制 =====
+
+    // 内部取消标志存储
+    // 当用户未提供 canceled 指针时，使用此变量作为取消标志
+    // 用于响应 DisableManualCompaction() 调用
+    std::atomic<bool> canceled_internal_storage = false;
+
+    // 取消标志的引用（线程安全）
+    // 当用户在 CompactRangeOptions 中提供了 canceled 指针时，这是对用户提供的
+    // `canceled` 变量的引用；否则，这是对 canceled_internal_storage 的引用
+    // 后台线程会定期检查此标志，如果为 true 则取消压缩
     // When the user provides a canceled pointer in CompactRangeOptions, the
     // above varaibe is the reference of the user-provided
     // `canceled`, otherwise, it is the reference of canceled_internal_storage
-    std::atomic<bool> canceled_internal_storage = false;
-    std::atomic<bool>& canceled;  // Compaction canceled pointer reference
+    std::atomic<bool>& canceled;
   };
   struct PrepickedCompaction {
     // background compaction takes ownership of `compaction`.
@@ -1943,32 +2025,120 @@ class DBImpl : public DB {
       const autovector<const uint64_t*>& flush_memtable_ids,
       bool resuming_from_bg_err);
 
-  inline void WaitForPendingWrites() {
-    mutex_.AssertHeld();
-    TEST_SYNC_POINT("DBImpl::WaitForPendingWrites:BeforeBlock");
-    // In case of pipelined write is enabled, wait for all pending memtable
-    // writers.
-    if (immutable_db_options_.enable_pipelined_write) {
-      // Memtable writers may call DB::Get in case max_successive_merges > 0,
-      // which may lock mutex. Unlocking mutex here to avoid deadlock.
-      mutex_.Unlock();
-      write_thread_.WaitForMemTableWriters();
-      mutex_.Lock();
-    }
+// DBImpl::WaitForPendingWrites - 等待所有待处理的写入完成
+//
+// 功能概述：
+// 等待所有正在进行的写入操作完成。这个函数在需要确保数据一致性
+// 之前被调用，例如在切换 WAL、flush memtable、ingest 外部文件等操作前。
+//
+// 调用时机：
+// 1. 切换 WAL（SwitchWAL）前：确保切换过程中没有写入正在进行
+// 2. 处理写缓冲区刷新前（HandleWriteBufferManagerFlush）：确保所有写入完成
+// 3. 调度 Flush 操作前（ScheduleFlushes）：确保 flush 前没有写入正在进行
+// 4. Ingest 外部文件前：确保有序写入时 key 范围检查的准确性
+// 5. Flush memtable 前：确保 flush 前所有写入已完成
+//
+// 前置条件：
+// - 调用此函数时必须持有 mutex_（DB 的主互斥量）
+// - 此函数不会释放 mutex_，但在流水线写入模式下会临时释放
+//
+// 写入模式处理：
+// 1. 流水线写入模式（enable_pipelined_write）：
+//    - WAL 写入和 MemTable 写入由不同的 writer 线程处理
+//    - 需要等待所有 MemTable writer 完成
+//    - 可能临时释放 mutex_ 以避免死锁（因为 MemTable writer 可能调用 DB::Get）
+//
+// 2. 有序写入模式（unordered_write = false）：
+//    - 写入批处理组是顺序执行的
+//    - 当新的写入批处理组开始时，前一个写入已经完成
+//    - 无需额外等待
+//
+// 3. 无序写入模式（unordered_write = true）：
+//    - 写入可能在 WAL 之后、MemTable 写入之前返回
+//    - 需要等待所有已写入 WAL 但尚未完成 MemTable 写入的操作
+//    - 使用 pending_memtable_writes_ 计数器跟踪
+//
+// 设计考虑：
+// - 在流水线写入模式下，临时释放 mutex_ 是必要的，因为：
+//   1. MemTable writer 可能调用 DB::Get（在 max_successive_merges > 0 时）
+//   2. DB::Get 需要获取 mutex_
+//   3. 如果不释放 mutex_，会导致死锁
+// - 在无序写入模式下，使用 switch_mutex_ 和 switch_cv_ 来等待：
+//   1. pending_memtable_writes_ 是原子计数器，无需互斥量保护读取
+//   2. 但需要互斥量保护条件变量的等待操作
+//   3. 当计数器归零时，条件变量被唤醒
+//
+// 性能影响：
+// - 对于有序写入模式，此函数几乎没有开销（立即返回）
+// - 对于流水线写入模式，可能需要等待 MemTable writers 队列清空
+// - 对于无序写入模式，可能需要等待 MemTable 写入完成
+//
+// 同步点：
+// - BeforeBlock: 用于测试，在可能阻塞前插入同步点
+inline void WaitForPendingWrites() {
+  // 断言：当前线程必须持有 DB 的主互斥量 mutex_
+  mutex_.AssertHeld();
 
-    if (!immutable_db_options_.unordered_write) {
-      // Then the writes are finished before the next write group starts
-      return;
-    }
+  // 测试同步点：用于单元测试，在阻塞前插入
+  // 测试代码可以在此点暂停执行，验证等待逻辑
+  TEST_SYNC_POINT("DBImpl::WaitForPendingWrites:BeforeBlock");
 
-    // Wait for the ones who already wrote to the WAL to finish their
-    // memtable write.
-    if (pending_memtable_writes_.load() != 0) {
-      std::unique_lock<std::mutex> guard(switch_mutex_);
-      switch_cv_.wait(guard,
-                      [&] { return pending_memtable_writes_.load() == 0; });
-    }
+  // ============================================================================
+  // 情况 1：流水线写入模式
+  // ============================================================================
+  // 如果启用了流水线写入，需要等待所有待处理的 MemTable writer 完成
+  // 在流水线模式下，WAL 写入和 MemTable 写入由不同的线程处理
+  // 可能存在已写入 WAL 但尚未写入 MemTable 的操作
+  if (immutable_db_options_.enable_pipelined_write) {
+    // MemTable writer 可能在 max_successive_merges > 0 时调用 DB::Get
+    // DB::Get 需要锁定 mutex_，为了避免死锁，这里临时释放 mutex_
+    mutex_.Unlock();
+
+    // 等待所有 MemTable writer 完成
+    // 这会阻塞直到 newest_memtable_writer_ 队列为空
+    write_thread_.WaitForMemTableWriters();
+
+    // 重新获取 mutex_
+    mutex_.Lock();
   }
+
+  // ============================================================================
+  // 情况 2：有序写入模式
+  // ============================================================================
+  // 如果没有启用无序写入，则写入在下一个写入批处理组开始之前就已完成
+  // 这是因为写入批处理组是顺序执行的：
+  // 1. Leader 处理当前批处理组
+  // 2. 当前批处理组完成后，下一个批处理组才能开始
+  // 3. 因此当新批处理组开始时，前一批处理组的写入已经完成
+  if (!immutable_db_options_.unordered_write) {
+    // 写入已经在下一个写入组开始前完成，无需额外等待
+    return;
+  }
+
+  // ============================================================================
+  // 情况 3：无序写入模式
+  // ============================================================================
+  // 在无序写入模式下：
+  // - WAL 写入完成后，写入操作可能立即返回（不等待 MemTable 写入）
+  // - MemTable 写入在后台异步进行
+  // - 需要等待所有已写入 WAL 但尚未完成 MemTable 写入的操作
+  //
+  // pending_memtable_writes_ 原子计数器：
+  // - 增加在每个写入的 MemTable 写入开始前
+  // - 减少在每个写入的 MemTable 写入完成后
+  // - 当计数器归零时，表示所有写入的 MemTable 写入都已完成
+  if (pending_memtable_writes_.load() != 0) {
+    // 锁定切换互斥量
+    // switch_mutex_ 保护条件变量和等待操作
+    std::unique_lock<std::mutex> guard(switch_mutex_);
+
+    // 在条件变量上等待，直到 pending_memtable_writes_ 归零
+    // 当 MemTable 写入完成时，会减少计数器并调用 switch_cv_.notify_one()
+    // 注意：计数器使用 load() 读取，不需要互斥量保护（原子操作）
+    switch_cv_.wait(guard,
+                    [&] { return pending_memtable_writes_.load() == 0; });
+  }
+}
 
   // TaskType is used to identify tasks in thread-pool, currently only
   // differentiate manual compaction, which could be unscheduled from the

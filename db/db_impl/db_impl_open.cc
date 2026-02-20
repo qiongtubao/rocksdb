@@ -38,178 +38,297 @@ Options SanitizeOptions(const std::string& dbname, const Options& src,
   return Options(db_options, cf_options);
 }
 
+// ============================================================================
+// 函数名: SanitizeOptions
+// 功能描述: 清理和验证用户提供的数据库选项（DBOptions）
+//
+// 参数说明:
+//   - dbname: 数据库的路径/名称，用于确定日志文件和数据库文件的存储位置
+//   - src: 用户提供的原始 DBOptions 配置
+//   - read_only: 是否以只读模式打开数据库
+//     - true: 只读模式，不会创建日志记录器
+//     - false: 读写模式，会创建日志记录器
+//   - logger_creation_s: [输出参数] 用于返回日志记录器创建时的状态
+//     - 如果日志创建失败，非空指针会保存失败状态
+//     - 调用者可通过此状态判断日志是否可用
+//
+// 返回值:
+//   - 返回经过清理和修正后的 DBOptions 对象
+//   - 确保所有配置项都在合理范围内，避免用户错误配置导致的问题
+//
+// 主要功能:
+//   1. 环境初始化: 设置默认的 Env（环境对象）
+//   2. 文件句柄限制: 调整 max_open_files 在系统允许范围内
+//   3. 日志系统创建: 为非只读模式创建信息日志记录器
+//   4. 写缓冲区管理: 初始化 WriteBufferManager
+//   5. 后台线程设置: 根据配置调整压缩和刷新的线程池大小
+//   6. 速率限制配置: 设置默认的速率限制参数
+//   7. WAL 配置冲突处理: 解决 WAL 配置之间的不兼容问题
+//   8. 路径规范化: 处理数据库路径和 WAL 路径
+//   9. 垃圾文件清理: 清理遗留的 .trash 文件
+//  10. 两阶段提交适配: 调整与 2PC 相关的配置
+//
+// 使用场景:
+//   - 在打开数据库（DB::Open）之前调用
+//   - 确保用户提供的配置选项是有效的、合理的
+//   - 防止无效配置导致运行时错误或性能问题
+//
+// 注意事项:
+//   - 此函数会修改传入的 DBOptions，创建一个副本并返回
+//   - 某些配置会被强制修改为默认值（如 bytes_per_sync、delayed_write_rate）
+//   - 不兼容的配置会被自动禁用（如 recycle_log_file_num 与某些 WAL 恢复模式）
+// ============================================================================
 DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
                           bool read_only, Status* logger_creation_s) {
+  // 复制原始配置，避免修改用户传入的配置对象
   DBOptions result(src);
 
+  // === 环境初始化 ===
+  // 如果用户没有设置 Env，使用默认的环境对象
+  // Env 封装了文件系统操作、线程创建、时间获取等系统调用
   if (result.env == nullptr) {
     result.env = Env::Default();
   }
 
-  // result.max_open_files means an "infinite" open files.
+  // === 文件句柄限制调整 ===
+  // -1 表示不限制打开的文件数量
+  // 如果用户指定了具体数值，则确保该值在系统允许的范围内
   if (result.max_open_files != -1) {
     int max_max_open_files = port::GetMaxOpenFiles();
+    // 如果无法获取系统最大值，使用一个较大的默认值 (4MB)
     if (max_max_open_files == -1) {
       max_max_open_files = 0x400000;
     }
+    // 将 max_open_files 限制在 [20, max_max_open_files] 范围内
+    // 下限 20 是为了确保基本的文件操作性能
     ClipToRange(&result.max_open_files, 20, max_max_open_files);
+    // 测试同步点：用于单元测试验证此逻辑
     TEST_SYNC_POINT_CALLBACK("SanitizeOptions::AfterChangeMaxOpenFiles",
                              &result.max_open_files);
   }
 
+  // === 日志记录器创建 ===
+  // 仅在非只读模式下创建日志记录器
+  // 只读模式不需要记录日志，也避免写入权限问题
   if (result.info_log == nullptr && !read_only) {
     Status s = CreateLoggerFromOptions(dbname, result, &result.info_log);
     if (!s.ok()) {
-      // No place suitable for logging
+      // 没有合适的地方用于记录日志（可能是权限问题或路径不存在）
       result.info_log = nullptr;
+      // 将日志创建失败的状态保存到输出参数
       if (logger_creation_s) {
         *logger_creation_s = s;
       }
     }
   }
 
+  // === 写缓冲区管理器初始化 ===
+  // 如果用户没有设置 write_buffer_manager，根据 db_write_buffer_size 创建默认的
+  // WriteBufferManager 用于跟踪和控制所有列族的 memtable 内存使用
   if (!result.write_buffer_manager) {
     result.write_buffer_manager.reset(
         new WriteBufferManager(result.db_write_buffer_size));
   }
+
+  // === 后台线程池调整 ===
+  // 根据 flush、compaction 和 max_background_jobs 的配置计算实际的线程限制
+  // parallelize_compactions = true 表示允许并行压缩
   auto bg_job_limits = DBImpl::GetBGJobLimits(
       result.max_background_flushes, result.max_background_compactions,
       result.max_background_jobs, true /* parallelize_compactions */);
+
+  // 增加低优先级（压缩）后台线程
+  // 压缩通常是后台任务，使用低优先级线程池
   result.env->IncBackgroundThreadsIfNeeded(bg_job_limits.max_compactions,
                                            Env::Priority::LOW);
+
+  // 增加高优先级（刷新）后台线程
+  // flush 是关键任务，影响写入性能，使用高优先级线程池
   result.env->IncBackgroundThreadsIfNeeded(bg_job_limits.max_flushes,
                                            Env::Priority::HIGH);
 
+  // === 速率限制配置 ===
+  // 如果用户配置了速率限制器，确保同步相关的配置不为 0
   if (result.rate_limiter.get() != nullptr) {
     if (result.bytes_per_sync == 0) {
+      // 默认设置为 1MB，避免每次写入都同步，提高性能
       result.bytes_per_sync = 1024 * 1024;
     }
   }
 
+  // === 延迟写入速率配置 ===
+  // delayed_write_rate 用于写入流控，当系统压力大时限制写入速率
   if (result.delayed_write_rate == 0) {
+    // 如果有速率限制器，使用速率限制器的配置
     if (result.rate_limiter.get() != nullptr) {
       result.delayed_write_rate = result.rate_limiter->GetBytesPerSecond();
     }
+    // 如果仍然为 0（没有速率限制器或获取失败），使用默认值 16MB/s
     if (result.delayed_write_rate == 0) {
       result.delayed_write_rate = 16 * 1024 * 1024;
     }
   }
 
+  // === WAL 回收与 WAL TTL/大小限制的互斥处理 ===
+  // WAL TTL 或大小限制与 WAL 回收功能互斥
+  // 原因：
+  //   - WAL TTL (WAL_ttl_seconds) 根据时间删除 WAL
+  //   - WAL 大小限制 (WAL_size_limit_MB) 根据大小删除 WAL
+  //   - WAL 回收 (recycle_log_file_num) 重用旧的 WAL 文件名
+  // 这两种机制冲突，如果启用了 TTL/大小限制，则禁用回收
   if (result.WAL_ttl_seconds > 0 || result.WAL_size_limit_MB > 0) {
     result.recycle_log_file_num = false;
   }
 
+  // === WAL 回收与 WAL 恢复模式的兼容性检查 ===
+  // 某些 WAL 恢复模式与 WAL 回收功能不兼容，需要禁用回收
   if (result.recycle_log_file_num &&
       (result.wal_recovery_mode ==
            WALRecoveryMode::kTolerateCorruptedTailRecords ||
        result.wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery ||
        result.wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency)) {
-    // - kTolerateCorruptedTailRecords is inconsistent with recycle log file
-    //   feature. WAL recycling expects recovery success upon encountering a
-    //   corrupt record at the point where new data ends and recycled data
-    //   remains at the tail. However, `kTolerateCorruptedTailRecords` must fail
-    //   upon encountering any such corrupt record, as it cannot differentiate
-    //   between this and a real corruption, which would cause committed updates
-    //   to be truncated -- a violation of the recovery guarantee.
-    // - kPointInTimeRecovery and kAbsoluteConsistency are incompatible with
-    //   recycle log file feature temporarily due to a bug found introducing a
-    //   hole in the recovered data
-    //   (https://github.com/facebook/rocksdb/pull/7252#issuecomment-673766236).
-    //   Besides this bug, we believe the features are fundamentally compatible.
+    // - kTolerateCorruptedTailRecords 与 WAL 回收不兼容：
+    //   WAL 回收期望在遇到损坏记录时（新数据结束和回收数据残留处）
+    //   能够成功恢复。但 kTolerateCorruptedTailRecords 必须在任何损坏记录处失败，
+    //   因为它无法区分这是回收导致的假损坏还是真正的数据损坏。
+    //   如果忽略真正的损坏，会导致已提交的更新被截断，违反恢复保证。
+    //
+    // - kPointInTimeRecovery 和 kAbsoluteConsistency 暂时不兼容：
+    //   由于一个 bug 导致恢复的数据中可能存在空洞
+    //   (https://github.com/facebook/rocksdb/pull/7252#issuecomment-673766236)
+    //   除 bug 外，这两个功能在理论上应该是兼容的
     result.recycle_log_file_num = 0;
   }
 
+  // === 数据库路径设置 ===
+  // 如果用户没有指定 db_paths，使用 dbname 作为默认路径
+  // 路径大小限制设置为最大值（uint64_max），表示不限制该路径的文件大小
   if (result.db_paths.size() == 0) {
     result.db_paths.emplace_back(dbname, std::numeric_limits<uint64_t>::max());
   } else if (result.wal_dir.empty()) {
-    // Use dbname as default
+    // 如果设置了 db_paths 但没有设置 wal_dir，使用 dbname 作为默认 WAL 目录
     result.wal_dir = dbname;
   }
+
+  // === WAL 目录路径规范化 ===
+  // 处理从旧版本选项文件读取的配置，其中强制设置了 wal_dir
+  // 目的：如果 wal_dir、dbname 和 db_paths[0] 指向同一目录，则清空 wal_dir
+  // 这样 wal_dir 就等于 dbname（空字符串表示使用数据库路径）
   if (!result.wal_dir.empty()) {
-    // If there is a wal_dir already set, check to see if the wal_dir is the
-    // same as the dbname AND the same as the db_path[0] (which must exist from
-    // a few lines ago). If the wal_dir matches both of these values, then clear
-    // the wal_dir value, which will make wal_dir == dbname.  Most likely this
-    // condition was the result of reading an old options file where we forced
-    // wal_dir to be set (to dbname).
+    // 检查 wal_dir 是否与 dbname 和 db_paths[0] 指向同一目录
+    // NormalizePath 将路径规范化为标准形式（处理斜杠、相对路径等）
     auto npath = NormalizePath(dbname + "/");
     if (npath == NormalizePath(result.wal_dir + "/") &&
         npath == NormalizePath(result.db_paths[0].path + "/")) {
+      // 三个路径相同，清空 wal_dir 使其使用数据库路径
       result.wal_dir.clear();
     }
   }
 
+  // === 移除 WAL 目录路径末尾的斜杠 ===
+  // 统一路径格式，避免后续处理中的路径比较问题
   if (!result.wal_dir.empty() && result.wal_dir.back() == '/') {
     result.wal_dir = result.wal_dir.substr(0, result.wal_dir.size() - 1);
   }
 
+  // === 直接 I/O 预读大小配置 ===
+  // 如果启用了直接读取（use_direct_reads）但没有设置压缩预读大小
+  // 则设置一个合理的默认值（2MB）
+  // 直接 I/O 需要较大的预读缓冲区来弥补缺乏操作系统页缓存的缺点
   if (result.use_direct_reads && result.compaction_readahead_size == 0) {
     TEST_SYNC_POINT_CALLBACK("SanitizeOptions:direct_io", nullptr);
-    result.compaction_readahead_size = 1024 * 1024 * 2;
+    result.compaction_readahead_size = 1024 * 1024 * 2;  // 2MB
   }
 
-  // Force flush on DB open if 2PC is enabled, since with 2PC we have no
-  // guarantee that consecutive log files have consecutive sequence id, which
-  // make recovery complicated.
+  // === 两阶段提交 (2PC) 的恢复配置 ===
+  // 如果启用了 2PC（allow_2pc = true），必须在数据库打开时强制执行 flush
+  // 原因：
+  //   - 在 2PC 模式下，无法保证连续的日志文件具有连续的序列号
+  //   - 这会使 WAL 恢复过程变得复杂且不可靠
+  //   - 通过在恢复时执行 flush，确保所有已提交的事务都持久化到 SST 文件
+  //   - 这样可以从 SST 文件恢复，而不依赖可能不连续的 WAL
   if (result.allow_2pc) {
-    result.avoid_flush_during_recovery = false;
+    result.avoid_flush_during_recovery = false;  // 强制在恢复时 flush
   }
 
+  // === WAL 目录与数据库目录不同时的垃圾文件清理 ===
+  // 创建不可变数据库选项用于路径判断
   ImmutableDBOptions immutable_db_options(result);
   if (!immutable_db_options.IsWalDirSameAsDBPath()) {
-    // Either the WAL dir and db_paths[0]/db_name are not the same, or we
-    // cannot tell for sure. In either case, assume they're different and
-    // explicitly cleanup the trash log files (bypass DeleteScheduler)
-    // Do this first so even if we end up calling
-    // DeleteScheduler::CleanupDirectory on the same dir later, it will be
-    // safe
+    // WAL 目录与数据库主目录不同（或无法确定是否相同）
+    // 在这种情况下，显式清理 WAL 目录中的垃圾日志文件（.log.trash）
+    // 绕过 DeleteScheduler，因为这些是立即删除而不是延迟调度
+    // 优先执行此操作，确保即使稍后调用 DeleteScheduler::CleanupDirectory 也不会冲突
     std::vector<std::string> filenames;
     IOOptions io_opts;
-    io_opts.do_not_recurse = true;
+    io_opts.do_not_recurse = true;  // 不递归遍历子目录
     auto wal_dir = immutable_db_options.GetWalDir();
     Status s = immutable_db_options.fs->GetChildren(
         wal_dir, io_opts, &filenames, /*IODebugContext*=*/nullptr);
-    s.PermitUncheckedError();  //**TODO: What to do on error?
+    // 错误被忽略，因为这是清理操作，失败不应阻止数据库打开
+    s.PermitUncheckedError();  // TODO: 需要确定如何处理错误
+
+    // 查找并删除所有 .log.trash 文件
+    // 这些文件是之前 WAL 回收过程中被标记为垃圾但未被删除的文件
     for (std::string& filename : filenames) {
+      // 检查文件名是否以 ".log.trash" 结尾
       if (filename.find(".log.trash", filename.length() -
                                           std::string(".log.trash").length()) !=
           std::string::npos) {
         std::string trash_file = wal_dir + "/" + filename;
+        // 立即删除垃圾文件，忽略删除失败
         result.env->DeleteFile(trash_file).PermitUncheckedError();
       }
     }
   }
-  // When the DB is stopped, it's possible that there are some .trash files that
-  // were not deleted yet, when we open the DB we will find these .trash files
-  // and schedule them to be deleted (or delete immediately if SstFileManager
-  // was not used)
+
+  // === SST 垃圾文件清理 ===
+  // 数据库停止时可能存在一些未删除的 .trash 文件（例如 SST 文件的垃圾文件）
+  // 打开数据库时，查找这些 .trash 文件并安排删除（或立即删除）
+  // 如果使用了 SstFileManager，则通过 DeleteScheduler 延迟删除
+  // 如果没有使用，则立即删除
   auto sfm = static_cast<SstFileManagerImpl*>(result.sst_file_manager.get());
   for (size_t i = 0; i < result.db_paths.size(); i++) {
+    // 对每个配置的数据库路径执行清理
     DeleteScheduler::CleanupDirectory(result.env, sfm, result.db_paths[i].path)
-        .PermitUncheckedError();
+        .PermitUncheckedError();  // 忽略清理错误
   }
 
-  // Create a default SstFileManager for purposes of tracking compaction size
-  // and facilitating recovery from out of space errors.
+  // === SST 文件管理器创建 ===
+  // 如果用户没有设置 sst_file_manager，创建一个默认的
+  // SstFileManager 的作用：
+  //   - 跟踪压缩操作产生/删除的 SST 文件大小
+  //   - 在磁盘空间不足时帮助恢复（通过删除一些文件）
+  //   - 控制总的 SST 文件大小
   if (result.sst_file_manager.get() == nullptr) {
     std::shared_ptr<SstFileManager> sst_file_manager(
         NewSstFileManager(result.env, result.info_log));
     result.sst_file_manager = sst_file_manager;
   }
 
-  // Supported wal compression types
+  // === WAL 压缩类型支持检查 ===
+  // 检查用户配置的 WAL 压缩类型是否受支持
+  // 当前 RocksDB 只支持部分压缩类型（如 zstd）
+  // 如果配置的压缩类型不支持，则禁用 WAL 压缩
   if (!StreamingCompressionTypeSupported(result.wal_compression)) {
     result.wal_compression = kNoCompression;
     ROCKS_LOG_WARN(result.info_log,
                    "wal_compression is disabled since only zstd is supported");
   }
 
+  // === 偏执检查优化 ===
+  // 如果用户没有启用偏执检查（paranoid_checks），则跳过打开时的 SST 文件大小检查
+  // 这是一个性能优化：
+  //   - paranoid_checks = false: 不进行严格的校验和检查
+  //   - 此时不需要验证 SST 文件大小是否与 MANIFEST 中的记录一致
+  //   - 跳过检查可以加快数据库打开速度
   if (!result.paranoid_checks) {
     result.skip_checking_sst_file_sizes_on_db_open = true;
     ROCKS_LOG_INFO(result.info_log,
                    "file size check will be skipped during open.");
   }
 
+  // 返回经过清理和修正的 DBOptions
   return result;
 }
 
@@ -1895,31 +2014,98 @@ IOStatus DBImpl::CreateWAL(uint64_t log_file_num, uint64_t recycle_log_number,
   return io_s;
 }
 
+// ============================================================================
+// 函数名: DBImpl::Open
+// 功能描述: 打开一个 RocksDB 数据库实例
+//
+// 参数说明:
+//   - db_options: 数据库级别的选项配置
+//     包括环境、缓存、线程池、WAL 配置等
+//   - dbname: 数据库的路径/名称
+//   - column_families: 要打开的列族描述列表
+//     包含列族名称和列族选项
+//   - handles: [输出参数] 返回的列族句柄列表
+//     每个句柄对应一个打开的列族，用于后续操作
+//   - dbptr: [输出参数] 返回创建的数据库实例指针
+//   - seq_per_batch: 是否每个批分配一个序列号
+//     true: WriteBatch 的每个操作有独立的序列号
+//     false: WriteBatch 的所有操作共享一个序列号（默认）
+//   - batch_per_txn: 是否每个事务对应一个批
+//     与事务机制相关
+//
+// 返回值:
+//   - Status::OK(): 数据库成功打开
+//   - Status::Error(): 打开失败（如选项无效、文件系统错误、恢复失败等）
+//
+// 主要功能流程:
+//   1. 选项验证: 验证数据库和列族选项的有效性
+//   2. 数据库实例创建: 创建 DBImpl 对象
+//   3. 日志系统初始化: 创建或使用用户提供的日志记录器
+//   4. 目录创建: 创建 WAL 目录、数据库目录、列族目录等
+//   5. 数据恢复: 从 MANIFEST 和 WAL 文件恢复数据库状态
+//   6. WAL 初始化: 创建新的 WAL 文件用于后续写入
+//   7. 列族初始化: 创建或加载列族
+//   8. SuperVersion 安装: 安装 SuperVersion 用于读写操作
+//   9. 选项持久化: 将选项写入 OPTIONS 文件
+//   10. 后台任务启动: 启动压缩、刷新等后台任务
+//   11. SST 文件管理: 通知 SST 文件管理器已存在的文件
+//
+// 恢复机制:
+//   - 读取 MANIFEST 文件获取数据库元数据
+//   - 从 WAL 文件恢复未持久化的写入
+//   - 支持多种 WAL 恢复模式（绝对一致性、时间点恢复等）
+//   - 处理日志文件损坏和数据丢失情况
+//
+// 使用场景:
+//   - 首次打开新创建的数据库
+//   - 打开已存在的数据库（从持久化状态恢复）
+//   - 带有多个列族的数据库打开
+//   - 读写模式或只读模式的数据库打开
+//
+// 注意事项:
+//   - 此函数是同步的，阻塞直到数据库完全打开
+//   - 打开失败会清理所有已分配的资源
+//   - 支持在打开后立即进行写入和查询
+//   - 错误处理包括资源清理和状态回滚
+// ============================================================================
 Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                     const std::vector<ColumnFamilyDescriptor>& column_families,
                     std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
                     const bool seq_per_batch, const bool batch_per_txn) {
+  // === 选项验证 ===
+  // 验证表（SST 表格式）相关的选项是否有效
   Status s = ValidateOptionsByTable(db_options, column_families);
   if (!s.ok()) {
     return s;
   }
 
+  // 验证所有数据库和列族选项的有效性
   s = ValidateOptions(db_options, column_families);
   if (!s.ok()) {
     return s;
   }
 
+  // === 初始化输出参数 ===
   *dbptr = nullptr;
   assert(handles);
   handles->clear();
 
+  // === 计算最大写缓冲区大小 ===
+  // 用于 WAL 预分配大小的计算
+  // 所有列族的 write_buffer_size 中的最大值
   size_t max_write_buffer_size = 0;
   for (auto cf : column_families) {
     max_write_buffer_size =
         std::max(max_write_buffer_size, cf.options.write_buffer_size);
   }
 
+  // === 创建数据库实例 ===
+  // DBImpl 是 RocksDB 的核心实现类
   DBImpl* impl = new DBImpl(db_options, dbname, seq_per_batch, batch_per_txn);
+
+  // === 验证日志记录器是否创建成功 ===
+  // 日志记录器在 DBImpl 构造函数中通过 CreateLoggerFromOptions 创建
+  // 如果创建失败，清理资源并返回错误
   if (!impl->immutable_db_options_.info_log) {
     s = impl->init_logger_creation_s_;
     delete impl;
@@ -1927,17 +2113,24 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   } else {
     assert(impl->init_logger_creation_s_.ok());
   }
+
+  // === 创建 WAL 目录 ===
+  // 确保日志文件的存储目录存在
   s = impl->env_->CreateDirIfMissing(impl->immutable_db_options_.GetWalDir());
   if (s.ok()) {
+    // === 创建所有需要的目录 ===
     std::vector<std::string> paths;
+    // 添加数据库主路径
     for (auto& db_path : impl->immutable_db_options_.db_paths) {
       paths.emplace_back(db_path.path);
     }
+    // 添加列族的存储路径
     for (auto& cf : column_families) {
       for (auto& cf_path : cf.options.cf_paths) {
         paths.emplace_back(cf_path.path);
       }
     }
+    // 逐个创建目录
     for (auto& path : paths) {
       s = impl->env_->CreateDirIfMissing(path);
       if (!s.ok()) {
@@ -1945,12 +2138,16 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
 
-    // For recovery from NoSpace() error, we can only handle
-    // the case where the database is stored in a single path
+    // === 启用从磁盘空间不足错误自动恢复 ===
+    // 只能处理数据库存储在单一路径的情况
+    // 原因：多路径时，无法确定哪个路径空间不足，恢复策略复杂
     if (paths.size() <= 1) {
       impl->error_handler_.EnableAutoRecovery();
     }
   }
+
+  // === 创建归档目录 ===
+  // 用于存储被删除但未立即清理的 SST 文件
   if (s.ok()) {
     s = impl->CreateArchivalDirectory();
   }
@@ -1959,24 +2156,44 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     return s;
   }
 
+  // === 确定 WAL 是否在数据库路径中 ===
+  // 这会影响垃圾文件清理和 WAL 管理策略
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
+
+  // === 准备恢复上下文 ===
   RecoveryContext recovery_ctx;
+
+  // === 获取主锁 ===
+  // 恢复过程需要独占访问数据库状态
   impl->mutex_.Lock();
 
-  // Handles create_if_missing, error_if_exists
+  // === 数据库恢复 ===
+  // 从 MANIFEST 和 WAL 文件恢复数据库状态
+  // 处理 create_if_missing 和 error_if_exists 选项
   uint64_t recovered_seq(kMaxSequenceNumber);
   s = impl->Recover(column_families, false /* read_only */,
                     false /* error_if_wal_file_exists */,
                     false /* error_if_data_exists_in_wals */, &recovered_seq,
                     &recovery_ctx);
+
+  // === 创建新的 WAL 文件 ===
+  // 恢复成功后，创建新的 WAL 文件用于后续写入
   if (s.ok()) {
+    // 分配新的 WAL 文件编号
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     log::Writer* new_log = nullptr;
+
+    // 计算 WAL 预分配块大小
+    // 预分配可以提高写入性能，减少文件系统分配开销
     const size_t preallocate_block_size =
         impl->GetWalPreallocateBlockSize(max_write_buffer_size);
+
+    // 创建新的 WAL 文件
     s = impl->CreateWAL(new_log_number, 0 /*recycle_log_number*/,
                         preallocate_block_size, &new_log);
+
     if (s.ok()) {
+      // 在日志写锁保护下更新日志文件信息
       InstrumentedMutexLock wl(&impl->log_write_mutex_);
       impl->logfile_number_ = new_log_number;
       assert(new_log != nullptr);
@@ -1984,20 +2201,23 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       impl->logs_.emplace_back(new_log_number, new_log);
     }
 
+    // === 写入虚拟 WAL 记录 ===
+    // 在 WritePrepared 模式下，序列号可能不连续
+    // 这会破坏 kPointInTimeRecovery 的假设：损坏日志后的第一个日志的序列号
+    // 应比从 WAL 读取的最后序列号大 1
+    // 为了使这个技巧仍然有效，我们在恢复后的第一个日志中写入一个虚拟记录
+    // 在非 WritePrepared 模式下，新日志也可能是空的
+    // 缺少连续序列号提示来区分日志中间损坏和恢复后残留的损坏日志
+    // 这个情况也会通过虚拟写入解决
     if (s.ok()) {
+      // 记录活跃的日志文件
       impl->alive_log_files_.push_back(
           DBImpl::LogFileNumberSize(impl->logfile_number_));
-      // In WritePrepared there could be gap in sequence numbers. This breaks
-      // the trick we use in kPointInTimeRecovery which assumes the first seq in
-      // the log right after the corrupted log is one larger than the last seq
-      // we read from the wals. To let this trick keep working, we add a dummy
-      // entry with the expected sequence to the first log right after recovery.
-      // In non-WritePrepared case also the new log after recovery could be
-      // empty, and thus missing the consecutive seq hint to distinguish
-      // middle-log corruption to corrupted-log-remained-after-recovery. This
-      // case also will be addressed by a dummy write.
+
+      // 只有在成功恢复到某个序列号时才写入虚拟记录
       if (recovered_seq != kMaxSequenceNumber) {
         WriteBatch empty_batch;
+        // 设置虚拟批次的序列号为恢复的序列号
         WriteBatchInternal::SetSequence(&empty_batch, recovered_seq);
         WriteOptions write_options;
         uint64_t log_used, log_size;
@@ -2006,50 +2226,66 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
         assert(log_writer->get_log_number() == log_file_number_size.number);
         impl->mutex_.AssertHeld();
+
+        // 将空批次写入 WAL
         s = impl->WriteToWAL(empty_batch, log_writer, &log_used, &log_size,
                              Env::IO_TOTAL, log_file_number_size);
         if (s.ok()) {
-          // Need to fsync, otherwise it might get lost after a power reset.
+          // 需要同步，否则断电后可能丢失
           s = impl->FlushWAL(false);
           TEST_SYNC_POINT_CALLBACK("DBImpl::Open::BeforeSyncWAL", /*arg=*/&s);
           if (s.ok()) {
+            // 根据 use_fsync 选项选择 fsync 或 fdatasync
             s = log_writer->file()->Sync(impl->immutable_db_options_.use_fsync);
           }
         }
       }
     }
   }
+
+  // === 应用恢复的版本编辑 ===
+  // 将恢复过程中收集的版本编辑应用到 VersionSet
   if (s.ok()) {
     s = impl->LogAndApplyForRecovery(recovery_ctx);
   }
 
+  // === 初始化持久化统计列族 ===
+  // 如果启用了统计信息持久化，创建统计列族
   if (s.ok() && impl->immutable_db_options_.persist_stats_to_disk) {
     impl->mutex_.AssertHeld();
     s = impl->InitPersistStatsColumnFamily();
   }
 
+  // === 创建列族句柄 ===
+  // 为请求的每个列族创建句柄，供应用程序使用
   if (s.ok()) {
     // set column family handles
     for (auto cf : column_families) {
+      // 从 VersionSet 获取列族
       auto cfd =
           impl->versions_->GetColumnFamilySet()->GetColumnFamily(cf.name);
       if (cfd != nullptr) {
+        // 列族已存在，创建句柄
         handles->push_back(
             new ColumnFamilyHandleImpl(cfd, impl, &impl->mutex_));
         impl->NewThreadStatusCfInfo(cfd);
       } else {
+        // 列族不存在
         if (db_options.create_missing_column_families) {
           // missing column family, create it
+          // 允许自动创建缺失的列族
           ColumnFamilyHandle* handle = nullptr;
-          impl->mutex_.Unlock();
+          // === 释放主锁 ===
+  impl->mutex_.Unlock();  // 创建列族需要释放锁
           s = impl->CreateColumnFamily(cf.options, cf.name, &handle);
-          impl->mutex_.Lock();
+          impl->mutex_.Lock();  // 重新获取锁
           if (s.ok()) {
             handles->push_back(handle);
           } else {
             break;
           }
         } else {
+          // 不允许自动创建，返回错误
           s = Status::InvalidArgument("Column family not found", cf.name);
           break;
         }
@@ -2057,6 +2293,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     }
   }
 
+  // === 安装 SuperVersion ===
+  // SuperVersion 是读写操作的核心数据结构
+  // 包含当前版本的 MemTable、Immutable MemTable 和 SST 文件列表
   if (s.ok()) {
     SuperVersionContext sv_context(/* create_superversion */ true);
     for (auto cfd : *impl->versions_->GetColumnFamilySet()) {
@@ -2066,16 +2305,21 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     sv_context.Clean();
   }
 
+  // === 处理持久化统计的格式版本 ===
   if (s.ok() && impl->immutable_db_options_.persist_stats_to_disk) {
     // try to read format version
     s = impl->PersistentStatsProcessFormatVersion();
   }
 
+  // === 检查 MemTable 功能兼容性 ===
+  // 验证 MemTable 是否支持快照和合并操作
   if (s.ok()) {
     for (auto cfd : *impl->versions_->GetColumnFamilySet()) {
+      // 检查快照支持
       if (!cfd->mem()->IsSnapshotSupported()) {
         impl->is_snapshot_supported_ = false;
       }
+      // 检查合并操作支持
       if (cfd->ioptions()->merge_operator != nullptr &&
           !cfd->mem()->IsMergeOperatorSupported()) {
         s = Status::InvalidArgument(
@@ -2104,6 +2348,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   } else {
     persist_options_status.PermitUncheckedError();
   }
+  // === 释放主锁 ===
   impl->mutex_.Unlock();
 
   auto sfm = static_cast<SstFileManagerImpl*>(
@@ -2180,6 +2425,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
 
+    // === 预留磁盘缓冲区空间 ===
+    // 这是一个启发式策略：当磁盘空间不足时，
+    // 确保在恢复数据库写入之前至少有 write_buffer_size 大小的可用空间
+    // 在低磁盘空间条件下，避免由于频繁的 WAL 写入失败和强制刷新
+    // 导致产生大量小的 L0 文件
     // Reserve some disk buffer space. This is a heuristic - when we run out
     // of disk space, this ensures that there is atleast write_buffer_size
     // amount of free space before we resume DB writes. In low disk space
@@ -2189,42 +2439,62 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                            impl->immutable_db_options_.db_paths[0].path);
   }
 
-
+  // === 日志输出和 WAL 同步 ===
   if (s.ok()) {
+    // 记录数据库指针信息
     ROCKS_LOG_HEADER(impl->immutable_db_options_.info_log, "DB pointer %p",
                      impl);
     LogFlush(impl->immutable_db_options_.info_log);
+
+    // 如果 WAL 缓冲区不为空，刷新并同步
     if (!impl->WALBufferIsEmpty()) {
       s = impl->FlushWAL(false);
       if (s.ok()) {
+        // 需要同步，否则断电后 WAL 缓冲数据可能丢失
         // Sync is needed otherwise WAL buffered data might get lost after a
         // power reset.
         log::Writer* log_writer = impl->logs_.back().writer;
         s = log_writer->file()->Sync(impl->immutable_db_options_.use_fsync);
       }
     }
+
+    // 检查选项持久化状态
+    // 即使之前的 s.ok()，如果选项持久化失败，返回错误
     if (s.ok() && !persist_options_status.ok()) {
       s = Status::IOError(
           "DB::Open() failed --- Unable to persist Options file",
           persist_options_status.ToString());
     }
   }
+
+  // === 错误日志记录 ===
   if (!s.ok()) {
     ROCKS_LOG_WARN(impl->immutable_db_options_.info_log,
                    "DB::Open() failed: %s", s.ToString().c_str());
   }
+
+  // === 启动周期性任务调度器 ===
+  // 包括定期统计信息 dump、日志清理等后台任务
   if (s.ok()) {
     s = impl->StartPeriodicTaskScheduler();
   }
 
+  // === 注册序列号时间记录工作器 ===
+  // 用于跟踪序列号和时间戳的关系
   if (s.ok()) {
     s = impl->RegisterRecordSeqnoTimeWorker();
   }
+
+  // === 错误清理 ===
+  // 如果打开失败，清理所有已分配的资源
   if (!s.ok()) {
+    // 删除所有创建的列族句柄
     for (auto* h : *handles) {
       delete h;
     }
+    // 清空句柄列表
     handles->clear();
+    // 删除数据库实例
     delete impl;
     *dbptr = nullptr;
   }

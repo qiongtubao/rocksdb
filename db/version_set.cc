@@ -899,35 +899,174 @@ bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
                            const LevelFilesBrief& file_level,
                            const Slice* smallest_user_key,
                            const Slice* largest_user_key) {
+  // ==================== 参数说明 ====================
+  // @param icmp                 内部键比较器，包含 user_comparator 用于比较用户键
+  // @param disjoint_sorted_files 文件是否不重叠且有序
+  //                              - false: L0 层，文件可能重叠，需要线性扫描
+  //                              - true:  L1+ 层，文件不重叠且有序，可用二分查找
+  // @param file_level           文件元数据简表，包含该层所有文件的键范围信息
+  // @param smallest_user_key     要检查的起始键（可以为 nullptr，表示没有下界）
+  // @param largest_user_key      要检查的结束键（可以为 nullptr，表示没有上界）
+  //
+  // ==================== 函数功能 ====================
+  // 判断指定层中是否存在文件与给定的用户键范围 [smallest_user_key, largest_user_key] 重叠
+  //
+  // ==================== 返回值 ====================
+  // @return true  - 存在文件与范围重叠
+  // @return false - 不存在文件与范围重叠
+  //
+  // ==================== 使用场景 ====================
+  // 1. VersionStorageInfo::OverlapInLevel: 判断某层是否有重叠
+  // 2. CompactionPicker::SetupOtherInputs: 查找输出层中与输入范围重叠的文件
+  // 3. VersionStorageInfo::RangeMightExistAfterSortedRun: 检查更深层的重叠
+  //
+  // ==================== 两种算法的选择 ====================
+  // 根据文件组织特性选择不同算法：
+  //
+  // 【算法1：L0 层线性扫描（disjoint_sorted_files = false）】
+  // 适用场景：L0 层
+  //   - L0 文件来自 memtable flush，文件之间可能有 key 重叠
+  //   - 无法使用二分查找，因为文件范围不是严格有序的
+  //   - 必须检查所有文件
+  //
+  // 时间复杂度：O(n)，n = file_level.num_files
+  //
+  // 【算法2：L1+ 层二分查找（disjoint_sorted_files = true）】
+  // 适用场景：L1, L2, ..., L6 层
+  //   - L1+ 文件通过 compaction 生成，文件之间严格不重叠
+  //   - 文件按 smallest key 排序，可以用二分查找快速定位
+  //
+  // 时间复杂度：O(log n)，n = file_level.num_files
+  //
+  // ==================== 算法1：L0 层线性扫描 ====================
   const Comparator* ucmp = icmp.user_comparator();
   if (!disjoint_sorted_files) {
-    // Need to check against all files
+    // L0 层：文件可能重叠，需要线性扫描检查所有文件
+    //
+    // 检查逻辑：
+    // 对于每个文件 f = [smallest_f, largest_f] 和范围 [smallest_user_key, largest_user_key]：
+    //   如果 largest_user_key < smallest_f  或  smallest_user_key > largest_f
+    //   则文件 f 不与范围重叠
+    //
+    // 数学表达：
+    //   不重叠条件: (largest_user_key < smallest_f) || (smallest_user_key > largest_f)
+    //   重叠条件:   !不重叠条件
+    //
+    // 示例：
+    //   文件: [a, e]
+    //   范围: [c, g]  → 重叠（c 在 [a, e] 内）
+    //   范围: [f, g]  → 重叠（e 在 [f, g] 内）
+    //   范围: [g, h]  → 不重叠（范围在文件右侧）
+    //   范围: [b, c]  → 重叠（范围在文件内）
+    //   范围: [x, y]  → 不重叠（范围在文件左侧）
     for (size_t i = 0; i < file_level.num_files; i++) {
       const FdWithKeyRange* f = &(file_level.files[i]);
+      // AfterFile: 判断范围是否在文件右侧（largest_user_key < smallest_f）
+      // BeforeFile: 判断范围是否在文件左侧（smallest_user_key > largest_f）
       if (AfterFile(ucmp, smallest_user_key, f) ||
           BeforeFile(ucmp, largest_user_key, f)) {
+        // 文件 f 与给定范围不重叠，继续检查下一个文件
         // No overlap
       } else {
+        // 文件 f 与给定范围重叠，立即返回 true
+        // 由于只需要判断是否存在重叠，找到第一个就足够了
         return true;  // Overlap
       }
     }
+    // 所有文件都检查完毕，没有发现重叠
     return false;
   }
 
+  // ==================== 算法2：L1+ 层二分查找 ====================
+  // L1+ 层：文件不重叠且有序，使用二分查找快速定位
+  //
+  // 二分查找策略：
+  // 1. 找到 smallest_user_key 可能存在的最左位置
+  // 2. 检查该位置的文件是否与范围重叠
+  //
+  // 为什么只需检查一个文件？
+  // 因为 L1+ 层文件不重叠：
+  //   - 如果找到位置的文件不与范围重叠，则该范围不可能与任何文件重叠
+  //   - 如果找到位置的文件与范围重叠，则必然存在重叠
+  //
+  // 示例：
+  // L1 文件: [a,b], [c,d], [e,f], [g,h], [i,j]
+  // 范围: [e,g]
+  // 二分查找 smallest_key = e → 找到文件 [e,f]
+  // 检查 largest_key = g 是否与 [e,f] 重叠 → 重叠，返回 true
+  //
+  // 范围: [k,l]
+  // 二分查找 smallest_key = k → 找到文件 [i,j] 的右侧（index >= num_files）
+  // 返回 false
+  //
   // Binary search over file list
   uint32_t index = 0;
   if (smallest_user_key != nullptr) {
+    // 步骤1：找到 smallest_user_key 可能存在的最左文件位置
+    //
+    // 为什么需要 SetMinPossibleForUserKey？
+    // 因为 smallest_user_key 只是用户键，而文件中存储的是内部键（包含 sequence number）
+    // 内部键比较规则：user_key 相同时，sequence number 越小，内部键越小
+    //
+    // SetMinPossibleForUserKey(smallest_user_key) 会生成：
+    //   InternalKey(smallest_user_key, kMaxSequenceNumber, kValueTypeForSeek)
+    // 这样可以找到可能包含 smallest_user_key 的最左文件
+    //
+    // 示例：
+    // 用户键: "apple"
+    // 内部键: ("apple", 100), ("apple", 99), ("apple", 1), ("banana", 50)
+    // SetMinPossibleForUserKey("apple") → ("apple", kMaxSequenceNumber)
+    // FindFile 找到第一个 >= ("apple", kMaxSequenceNumber) 的文件
     // Find the leftmost possible internal key for smallest_user_key
     InternalKey small;
     small.SetMinPossibleForUserKey(*smallest_user_key);
+    // 调用 FindFile 进行二分查找
+    // FindFile 返回第一个 >= small 的文件索引
     index = FindFile(icmp, file_level, small.Encode());
   }
 
+  // 步骤2：检查查找结果是否超出文件列表
+  // 如果 index >= num_files，说明 smallest_user_key 比所有文件的 largest_key 都大
+  // 因此范围在所有文件右侧，不可能有重叠
   if (index >= file_level.num_files) {
+    // 范围起始位置在所有文件之后，所以没有重叠
     // beginning of range is after all files, so no overlap.
     return false;
   }
 
+  // 步骤3：检查找到的文件是否与范围重叠
+  // 此时 file_level.files[index] 是第一个可能包含 smallest_user_key 的文件
+  //
+  // 检查逻辑：
+  // BeforeFile(largest_user_key, file) = (largest_user_key < file->smallest)
+  // 如果 largest_user_key < file->smallest，说明范围在文件左侧，不重叠
+  // 反之，范围与文件重叠（因为文件之间不重叠，这个文件是第一个可能的）
+  //
+  // 返回 !BeforeFile 的结果：
+  //   - !BeforeFile = false → largest_user_key < file->smallest → 不重叠 → 返回 false
+  //   - !BeforeFile = true  → largest_user_key >= file->smallest → 重叠 → 返回 true
+  //
+  // 示例：
+  // L1 文件: [a,b], [c,d], [e,f], [g,h], [i,j]
+  // 范围: [e,g]
+  // index = 2 (文件 [e,f])
+  // BeforeFile(g, [e,f]) = (g < e) = false
+  // !BeforeFile = true → 返回 true（有重叠）
+  //
+  // 范围: [b,b]
+  // index = 0 (文件 [a,b])
+  // BeforeFile(b, [a,b]) = (b < a) = false
+  // !BeforeFile = true → 返回 true（有重叠）
+  //
+  // 范围: [a,a]
+  // index = 0 (文件 [a,b])
+  // BeforeFile(a, [a,b]) = (a < a) = false
+  // !BeforeFile = true → 返回 true（有重叠）
+  //
+  // 范围: [Z,Z]
+  // index = 0 (文件 [a,b])
+  // BeforeFile(Z, [a,b]) = true
+  // !BeforeFile = false → 返回 false（无重叠）
   return !BeforeFile(ucmp, largest_user_key, &file_level.files[index]);
 }
 
@@ -3175,19 +3314,106 @@ void Version::UpdateAccumulatedStats(const ReadOptions& read_options) {
   }
 }
 
+/**
+ * @brief 计算每个文件的补偿大小（Compensated Size）
+ *
+ * 本函数用于计算每个文件的"补偿大小"，这是 RocksDB 选择 compaction 文件时的关键指标。
+ * 补偿大小 = 文件实际大小 + 删除条目的额外补偿大小。
+ *
+ * 为什么需要补偿大小？
+ * 1. 文件中的删除操作（Deletion）会增加 compaction 的工作量
+ * 2. 删除操作在合并时需要特殊处理（丢弃旧版本的键）
+ * 3. 只看文件大小会低估包含大量删除的文件的 compaction 成本
+ * 4. 补偿大小更能反映真实的 compaction 工作量
+ *
+ * 补偿大小的计算逻辑：
+ * 1. 基础值：文件的实际大小（fd.GetFileSize()）
+ * 2. 单点删除补偿：当单点删除数 > 非删除条目数/2 时，增加额外大小
+ * 3. 范围删除补偿：直接加上范围删除的补偿大小
+ *
+ * 为什么要只在删除数 > 非删除数/2 时补偿？
+ * - 在稳定工作负载中，删除数应该与非删除数大致相等
+ * - 如果对所有删除都补偿，可能改变 LSM tree 的形状
+ * - 只补偿"异常"文件（删除占比过高的文件），避免副作用
+ *
+ * 单点删除补偿公式：
+ * compensated_size += (num_point_deletions * 2 - num_entries) *
+ *                      average_value_size * kDeletionWeightOnCompaction
+ *
+ * 其中：
+ * - num_point_deletions = num_deletions - num_range_deletions
+ * - num_entries = 文件中所有条目数
+ * - average_value_size = 所有文件的平均 value 大小
+ * - kDeletionWeightOnCompaction = 2（删除权重）
+ *
+ * 范围删除补偿：
+ * compensated_size += compensated_range_deletion_size
+ * （这个值已经在创建文件时预先计算好）
+ *
+ * 调用时机：
+ * - 创建新文件后（Flush 或 Compaction 完成后）
+ * - 在 VersionSet::AppendVersion 中调用
+ * - 只对新创建的文件计算（compensated_file_size == 0）
+ *
+ * 为什么只对新文件计算？
+ * - 老文件的 compensated_file_size 已经在之前的 Version 中计算过
+ * - 新创建的文件没有其他线程访问，可以安全修改
+ * - 避免重复计算和并发问题
+ *
+ * @note kDeletionWeightOnCompaction = 2：
+ *   - 删除操作的权重是普通操作的 2 倍
+ *   - 反映删除操作在 compaction 时的额外成本
+ *   - 可以调整此值来改变删除文件的选择倾向
+ *
+ * @note average_value_size 的作用：
+ *   - 无法精确知道每个删除条目节省的空间
+ *   - 使用平均值作为估计
+ *   - 计算方式：总数据大小 / 总条目数（排除删除）
+ *
+ * @note 条件 (num_point_deletions * 2 >= num_entries)：
+ *   - num_point_deletions * 2 >= num_entries
+ *   - 即：点删除数 >= 总条目数 / 2
+ *   - 意味着：删除条目占比 >= 50%（假设点删除和非删除各占一半）
+ *   - 只对"异常"文件进行补偿
+ *
+ * @note 范围删除为什么单独处理？
+ *   - 范围删除影响的 key 数量不确定
+ *   - 难以精确估计其节省的空间
+ *   - 在文件创建时预先计算 compensated_range_deletion_size
+ *   - 这里直接累加即可
+ *
+ * @note 补偿大小的用途：
+ *   - compaction_picker 按补偿大小选择文件（kByCompensatedSize 策略）
+ *   - 大补偿大小的文件优先被压缩
+ *   - 可以更准确地估计 compaction 工作量
+ *
+ * @see UpdateFilesByCompactionPri 按补偿大小排序文件
+ * @see PickFileToCompact 按优先级选择文件
+ */
 void VersionStorageInfo::ComputeCompensatedSizes() {
+  // 删除操作的权重系数（2倍）
+  // 表示删除操作在 compaction 时的额外成本是普通操作的 2 倍
   static const int kDeletionWeightOnCompaction = 2;
+  // 计算所有文件的平均 value 大小
+  // 用于估计每个删除条目节省的空间
   uint64_t average_value_size = GetAverageValueSize();
 
   // compute the compensated size
+  // 遍历所有层级，计算每个文件的补偿大小
   for (int level = 0; level < num_levels_; level++) {
+    // 遍历该层的所有文件
     for (auto* file_meta : files_[level]) {
       // Here we only compute compensated_file_size for those file_meta
       // which compensated_file_size is uninitialized (== 0). This is true only
       // for files that have been created right now and no other thread has
       // access to them. That's why we can safely mutate compensated_file_size.
+      // 只对补偿大小未初始化的文件（== 0）进行计算。
+      // 这仅适用于刚刚创建且没有其他线程访问的文件。
+      // 因此可以安全地修改 compensated_file_size。
       if (file_meta->compensated_file_size == 0) {
+        // 基础值：文件的实际大小
         file_meta->compensated_file_size = file_meta->fd.GetFileSize();
+
         // Here we only boost the size of deletion entries of a file only
         // when the number of deletion entries is greater than the number of
         // non-deletion entries in the file.  The motivation here is that in
@@ -3196,13 +3422,31 @@ void VersionStorageInfo::ComputeCompensatedSizes() {
         // size of deletion entries in a stable workload, the deletion
         // compensation logic might introduce unwanted effet which changes the
         // shape of LSM tree.
+        // 只在文件中的删除条目数大于非删除条目数时，才增加文件大小。
+        // 这里的动机是，在稳定的工作负载中，删除条目数应该与非删除条目数大致相等。
+        // 如果我们对稳定工作负载中的删除条目大小进行补偿，
+        // 删除补偿逻辑可能会引入不希望的副作用，改变 LSM tree 的形状。
+        //
+        // 条件：(num_deletions - num_range_deletions) * 2 >= num_entries
+        // 即：单点删除数 * 2 >= 总条目数
+        // 等价于：单点删除数 >= 总条目数 / 2（假设点删除和非删除各占一半）
         if ((file_meta->num_deletions - file_meta->num_range_deletions) * 2 >=
             file_meta->num_entries) {
+          // 计算需要补偿的额外大小：
+          // (单点删除数 * 2 - 总条目数) * 平均值大小 * 删除权重
+          // 解释：
+          // - 单点删除数 * 2：假设点删除和非删除各占一半，那么点删除数 * 2 ≈ 总条目数
+          // - 如果点删除数 * 2 > 总条目数，说明删除占比过高
+          // - 差值就是"额外"的删除数，需要补偿
+          // - 乘以平均值大小和权重，得到补偿的字节数
           file_meta->compensated_file_size +=
               ((file_meta->num_deletions - file_meta->num_range_deletions) * 2 -
                file_meta->num_entries) *
               average_value_size * kDeletionWeightOnCompaction;
         }
+        // 加上范围删除的补偿大小
+        // 这个值在文件创建时已经预先计算好
+        // 范围删除补偿的具体逻辑在写入文件时计算
         file_meta->compensated_file_size +=
             file_meta->compensated_range_deletion_size;
       }
@@ -3383,9 +3627,100 @@ bool ShouldChangeFileTemperature(const ImmutableOptions& ioptions,
 }
 }  // anonymous namespace
 
+/**
+ * @brief 获取指定Level的最大目标字节数
+ *
+ * 该值在ComputeCompactionScore中用于计算Compaction分数：
+ * - score = level实际大小 / MaxBytesForLevel(level)
+ * - 当 score >= 1.0 时触发Compaction
+ *
+ * level_max_bytes_ 的计算在 CalculateBaseBytes 中完成：
+ * - 静态模式：L0/L1 = max_bytes_for_level_base, L2+按倍数递增
+ * - 动态模式：根据实际数据大小动态计算
+ *
+ * @param level 层级编号（0为L0）
+ * @return 该层的最大目标字节数
+ *
+ * @note L0层的阈值主要基于文件数量而非字节数
+ */
+uint64_t VersionStorageInfo::MaxBytesForLevel(int level) const {
+  // Note: the result for level zero is not really used since we set
+  // level-0 compaction threshold based on number of files.
+  // 注意：level 0的结果并未真正使用，因为我们基于文件数量设置L0压缩阈值。
+  assert(level >= 0);
+  assert(level < static_cast<int>(level_max_bytes_.size()));
+  return level_max_bytes_[level];
+}
+
+/**
+ * @brief 计算各层的Compaction分数
+ *
+ * 该函数是Level层满触发Compaction的核心逻辑：
+ * 1. 遍历所有层级（L0到MaxInputLevel）
+ * 2. 对每层计算Compaction分数
+ * 3. 分数 >= 1.0 表示该层需要Compaction
+ *
+ * 分数计算规则：
+ * - L0层：基于文件数量或大小（取决于Compaction风格）
+ * - L1+层：score = 实际大小 / MaxBytesForLevel(level)
+ *
+ * 触发阈值：score >= 1.0
+ */
+/**
+ * @brief 计算所有层级的 compaction 分数并排序
+ *
+ * 本函数是 Level Compaction 触发的核心逻辑，负责：
+ * 1. 遍历所有层级，计算每个层的 compaction 分数
+ * 2. 区分 L0 和其他层的计算方式
+ * 3. 根据分数对层级进行排序，分数高的优先 compact
+ * 4. 处理 TTL compaction、周期性 compaction、Blob GC 等特殊情况
+ *
+ * @param immutable_options 不可变配置（如 compaction_style、allow_ingest_behind）
+ * @param mutable_cf_options 可变配置（如 max_bytes_for_level_base、ttl）
+ *
+ * @note Compaction Score 的含义：
+ *   - score >= 1.0：该层需要 compaction
+ *   - score < 1.0：该层暂不需要 compaction
+ *   - 分数越高，优先级越高
+ *   - 如果 score > 1.0，可能乘以 10 倍（kScoreScale）以便排序
+ *
+ * @note 计算方式：
+ *   - L0 层：score = 文件数 / level0_file_num_compaction_trigger
+ *   - L1+ 层（静态模式）：score = 层大小 / MaxBytesForLevel(level)
+ *   - L1+ 层（动态模式）：score = 层大小 / (MaxBytesForLevel + 传入数据)
+ *
+ * @note 动态模式的影响：
+ *   - 当有大量数据正在 compact 到某层时，会降低该层的 score
+ *   - 避免在大量数据传入时进行不必要的 compaction
+ *   - 传入数据由 total_downcompact_bytes 累计
+ *
+ * @note L0 层的特殊处理：
+ *   - 考虑文件数而非字节数（避免过多小文件）
+ *   - 动态模式时考虑 L0 与 base level 的大小关系
+ *   - 避免 L0 积累过多数据导致写 stall
+ *
+ * @note 排序规则：
+ *   - 使用冒泡排序对层级的 score 进行降序排列
+ *   - 排序后：compaction_score_[0] 最高，compaction_level_[0] 对应的层
+ *   - LevelCompactionPicker 按照 score 从高到低的顺序选择层
+ *
+ * @note 特殊情况：
+ *   - TTL 过期文件：单独计算 score
+ *   - 周期性 compaction：强制标记需要 compact
+ *   - Blob 垃圾回收：标记需要回收的文件
+ *   - FIFO compaction：特殊的 score 计算方式
+ *   - Universal compaction：特殊的 L0 score 计算方式
+ *
+ * @note 相关成员变量：
+ *   - compaction_score_[]：各层的 compaction 分数（降序排列）
+ *   - compaction_level_[]：各层的层级号（降序排列）
+ *   - lowest_unnecessary_level_：最低的不必要层级（用于降优先）
+ *   - files_marked_for_compaction_：标记为需要 compact 的文件
+ */
 void VersionStorageInfo::ComputeCompactionScore(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
+  // 累计所有层级待压缩的字节数，用于动态模式下的分数调整
   double total_downcompact_bytes = 0.0;
   // Historically, score is defined as actual bytes in a level divided by
   // the level's target size, and 1.0 is the threshold for triggering
@@ -3395,11 +3730,15 @@ void VersionStorageInfo::ComputeCompactionScore(
   // In order to provide flexibility for reducing score while still
   // maintaining it to be over 1.0, we scale the original score by 10x
   // if it is larger than 1.0.
+  // 分数缩放系数：当分数 > 1.0 时，乘以 10 以便在排序时区分优先级
   const double kScoreScale = 10.0;
+  // 计算最大输出层级（如果允许 ingest_behind，则最大层级减一）
   int max_output_level = MaxOutputLevel(immutable_options.allow_ingest_behind);
+  // 遍历所有层级（从 L0 到最大输入层），为每层计算 compaction 分数
   for (int level = 0; level <= MaxInputLevel(); level++) {
     double score;
     if (level == 0) {
+      // L0 层的特殊处理
       // We treat level-0 specially by bounding the number of files
       // instead of number of bytes for two reasons:
       //
@@ -3411,57 +3750,72 @@ void VersionStorageInfo::ComputeCompactionScore(
       // file size is small (perhaps because of a small write-buffer
       // setting, or very high compression ratios, or lots of
       // overwrites/deletions).
-      int num_sorted_runs = 0;
-      uint64_t total_size = 0;
+      int num_sorted_runs = 0;  // L0 层未在压缩中的有序运行数量（即文件数）
+      uint64_t total_size = 0;  // L0 层未在压缩中的总大小
+      // 遍历 L0 层的所有文件
       for (auto* f : files_[level]) {
+        // 累计文件大小到 total_downcompact_bytes（用于动态模式调整）
         total_downcompact_bytes += static_cast<double>(f->fd.GetFileSize());
+        // 只计算未被压缩的文件（避免重复计算）
         if (!f->being_compacted) {
           total_size += f->compensated_file_size;
           num_sorted_runs++;
         }
       }
+      // Universal Compaction 的特殊处理
       if (compaction_style_ == kCompactionStyleUniversal) {
         // For universal compaction, we use level0 score to indicate
         // compaction score for the whole DB. Adding other levels as if
         // they are L0 files.
+        // 将其他层级也视为 L0 文件，计算整个 DB 的 compaction 分数
         for (int i = 1; i <= max_output_level; i++) {
           // It's possible that a subset of the files in a level may be in a
           // compaction, due to delete triggered compaction or trivial move.
           // In that case, the below check may not catch a level being
           // compacted as it only checks the first file. The worst that can
           // happen is a scheduled compaction thread will find nothing to do.
+          // 只检查第一个文件是否在压缩中（简化处理）
           if (!files_[i].empty() && !files_[i][0]->being_compacted) {
-            num_sorted_runs++;
+            num_sorted_runs++;  // 将整个层视为一个有序运行
           }
         }
       }
 
+      // FIFO Compaction 的特殊处理
       if (compaction_style_ == kCompactionStyleFIFO) {
+        // FIFO 的分数 = L0 总大小 / 最大文件大小限制
         score = static_cast<double>(total_size) /
                 mutable_cf_options.compaction_options_fifo.max_table_files_size;
+        // 如果分数 < 1 但允许 compaction，则考虑文件数触发
         if (score < 1 &&
             mutable_cf_options.compaction_options_fifo.allow_compaction) {
+          // 取文件数分数和大小分数的最大值
           score = std::max(
               static_cast<double>(num_sorted_runs) /
                   mutable_cf_options.level0_file_num_compaction_trigger,
               score);
         }
+        // 如果分数 < 1 但配置了 TTL，则考虑 TTL 过期文件
         if (score < 1 && mutable_cf_options.ttl > 0) {
+          // 取 TTL 过期分数和当前分数的最大值
           score =
               std::max(static_cast<double>(GetExpiredTtlFilesCount(
                            immutable_options, mutable_cf_options, files_[0])),
                        score);
         }
+        // 如果分数 < 1 但需要改变文件温度，则设置一个足够高的分数
         if (score < 1 &&
             ShouldChangeFileTemperature(immutable_options, mutable_cf_options,
                                         files_[0])) {
           // For FIFO, just need a large enough score to trigger compaction.
           const double kScoreForNeedCompaction = 1.1;
-          score = kScoreForNeedCompaction;
+          score = kScoreForNeedCompaction;  // 设置为 1.1 以触发 compaction
         }
       } else {
+        // 非 FIFO 模式（Level 和 Universal），基于文件数计算分数
         score = static_cast<double>(num_sorted_runs) /
                 mutable_cf_options.level0_file_num_compaction_trigger;
+        // Level Compaction 的额外处理
         if (compaction_style_ == kCompactionStyleLevel && num_levels() > 1) {
           // Level-based involves L0->L0 compactions that can lead to oversized
           // L0 files. Take into account size as well to avoid later giant
@@ -3471,7 +3825,9 @@ void VersionStorageInfo::ComputeCompactionScore(
           // accumulate to too large. But if L0 score isn't high enough, L0 will
           // accumulate and data is not moved to LBase fast enough. The score
           // calculation below takes into account L0 size vs LBase size.
+          // 动态字节模式处理
           if (immutable_options.level_compaction_dynamic_level_bytes) {
+            // 如果 L0 大小 >= base level 的目标大小，强制分数 > 1.0
             if (total_size >= mutable_cf_options.max_bytes_for_level_base) {
               // When calculating estimated_compaction_needed_bytes, we assume
               // L0 is qualified as pending compactions. We will need to make
@@ -3479,8 +3835,9 @@ void VersionStorageInfo::ComputeCompactionScore(
               // It might be guaranteed by logic below anyway, but we are
               // explicit here to make sure we don't stop writes with no
               // compaction scheduled.
-              score = std::max(score, 1.01);
+              score = std::max(score, 1.01);  // 确保分数 > 1.0
             }
+            // 如果 L0 大小 > base level 的实际最大字节数，提高 L0 分数
             if (total_size > level_max_bytes_[base_level_]) {
               // In this case, we compare L0 size with actual LBase size and
               // make sure score is more than 1.0 (10.0 after scaled) if L0 is
@@ -3489,40 +3846,52 @@ void VersionStorageInfo::ComputeCompactionScore(
               // total_downcompact_bytes = total_size > LBase size,
               // LBase score is lower than 10.0. So L0->LBase is prioritized
               // over LBase -> LBase+1.
+              // 计算 base level 的实际大小
               uint64_t base_level_size = 0;
               for (auto f : files_[base_level_]) {
                 base_level_size += f->compensated_file_size;
               }
+              // L0 分数 = max(当前分数, L0大小 / max(base level大小, base level目标大小))
               score = std::max(score, static_cast<double>(total_size) /
                                           static_cast<double>(std::max(
                                               base_level_size,
                                               level_max_bytes_[base_level_])));
             }
+            // 如果分数 > 1.0，乘以 kScoreScale 以提高优先级
             if (score > 1.0) {
               score *= kScoreScale;
             }
           } else {
+            // 静态模式：L0 分数 = max(文件数分数, L0大小 / base level目标大小)
             score = std::max(score,
                              static_cast<double>(total_size) /
                                  mutable_cf_options.max_bytes_for_level_base);
           }
         }
       }
-    } else {  // level > 0
+    } else {  // level > 0，处理 L1 及以上层级
       // Compute the ratio of current size to size limit.
-      uint64_t level_bytes_no_compacting = 0;
-      uint64_t level_total_bytes = 0;
+      // 计算当前大小与大小限制的比率（核心的Level层满逻辑）
+      uint64_t level_bytes_no_compacting = 0; // 该层未在压缩中的文件总大小
+      uint64_t level_total_bytes = 0; // 该层文件总大小
+      // 遍历该层所有文件
       for (auto f : files_[level]) {
+        // 累计文件总大小（包括正在压缩的文件）
         level_total_bytes += f->fd.GetFileSize();
+        // 累计未在压缩中的文件大小（用于计算分数）
         if (!f->being_compacted) {
           level_bytes_no_compacting += f->compensated_file_size;
         }
       }
+      // 静态字节模式
       if (!immutable_options.level_compaction_dynamic_level_bytes) {
+        // 非动态模式：分数 = 实际大小 / 目标大小，当分数>=1时触发Compaction
         score = static_cast<double>(level_bytes_no_compacting) /
                 MaxBytesForLevel(level);
       } else {
+        // 动态字节模式：考虑正在从上层传来的数据
         if (level_bytes_no_compacting < MaxBytesForLevel(level)) {
+          // 如果未达到目标大小，正常计算分数
           score = static_cast<double>(level_bytes_no_compacting) /
                   MaxBytesForLevel(level);
         } else {
@@ -3531,6 +3900,8 @@ void VersionStorageInfo::ComputeCompactionScore(
           // a level where the incoming data would be a large ratio. We do
           // it by dividing level size not by target level size, but
           // the target size and the incoming compaction bytes.
+          // 如果有大量数据即将压缩到该层，降低该层的优先级
+          // 分数 = 层大小 / (目标大小 + 传入数据) * kScoreScale
           score = static_cast<double>(level_bytes_no_compacting) /
                   (MaxBytesForLevel(level) + total_downcompact_bytes) *
                   kScoreScale;
@@ -3538,52 +3909,67 @@ void VersionStorageInfo::ComputeCompactionScore(
         // Drain unnecessary levels, but with lower priority compared to
         // when L0 is eligible. Only non-empty levels can be unnecessary.
         // If there is no unnecessary levels, lowest_unnecessary_level_ = -1.
+        // 逐步降低不必要的层级（L0 有资格时优先级更高）
         if (level_bytes_no_compacting > 0 &&
             level <= lowest_unnecessary_level_) {
+          // 为不必要的层级设置一个高于 1.0 的分数，但越低层分数越高
           score = std::max(
               score, kScoreScale *
                          (1.001 + 0.001 * (lowest_unnecessary_level_ - level)));
         }
       }
+      // 累计 total_downcompact_bytes，用于动态模式调整后续层的分数
       if (level <= lowest_unnecessary_level_) {
+        // 如果是不必要的层级，累计所有数据
         total_downcompact_bytes += level_total_bytes;
       } else if (level_total_bytes > MaxBytesForLevel(level)) {
+        // 如果是必要层级但超过目标大小，累计超出的部分
         total_downcompact_bytes +=
             static_cast<double>(level_total_bytes - MaxBytesForLevel(level));
       }
+      }
     }
+    // 保存该层的层级号到 compaction_level_ 数组
     compaction_level_[level] = level;
+    // 保存该层的 compaction 分数到 compaction_score_ 数组
     compaction_score_[level] = score;
   }
 
   // sort all the levels based on their score. Higher scores get listed
   // first. Use bubble sort because the number of entries are small.
+  // 使用冒泡排序对层级按分数降序排列（层级数少，冒泡排序足够高效）
   for (int i = 0; i < num_levels() - 2; i++) {
     for (int j = i + 1; j < num_levels() - 1; j++) {
+      // 如果前一个分数 < 后一个分数，则交换（降序排序）
       if (compaction_score_[i] < compaction_score_[j]) {
-        double score = compaction_score_[i];
-        int level = compaction_level_[i];
-        compaction_score_[i] = compaction_score_[j];
-        compaction_level_[i] = compaction_level_[j];
-        compaction_score_[j] = score;
-        compaction_level_[j] = level;
+        double score = compaction_score_[i];  // 临时保存分数
+        int level = compaction_level_[i];    // 临时保存层级号
+        compaction_score_[i] = compaction_score_[j];  // 交换分数
+        compaction_level_[i] = compaction_level_[j];  // 交换层级号
+        compaction_score_[j] = score;  // 恢复分数
+        compaction_level_[j] = level;  // 恢复层级号
       }
     }
   }
+  // 计算被标记为需要 compaction 的文件
   ComputeFilesMarkedForCompaction(max_output_level);
+  // 如果不允许 ingest_behind，则计算底层需要 compaction 的文件
   if (!immutable_options.allow_ingest_behind) {
     ComputeBottommostFilesMarkedForCompaction();
   }
+  // 如果配置了 TTL 且使用 Level compaction，计算过期的 TTL 文件
   if (mutable_cf_options.ttl > 0 &&
       compaction_style_ == kCompactionStyleLevel) {
     ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
   }
+  // 如果配置了周期性 compaction，计算需要周期性 compact 的文件
   if (mutable_cf_options.periodic_compaction_seconds > 0) {
     ComputeFilesMarkedForPeriodicCompaction(
         immutable_options, mutable_cf_options.periodic_compaction_seconds,
         max_output_level);
   }
 
+  // 如果启用了 Blob 垃圾回收且满足条件，计算需要强制 Blob GC 的文件
   if (mutable_cf_options.enable_blob_garbage_collection &&
       mutable_cf_options.blob_garbage_collection_age_cutoff > 0.0 &&
       mutable_cf_options.blob_garbage_collection_force_threshold < 1.0) {
@@ -3592,6 +3978,7 @@ void VersionStorageInfo::ComputeCompactionScore(
         mutable_cf_options.blob_garbage_collection_force_threshold);
   }
 
+  // 估计需要 compaction 的字节数（用于写停止控制）
   EstimateCompactionBytesNeeded(mutable_cf_options);
 }
 
@@ -3618,25 +4005,240 @@ void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
   }
 }
 
+/**
+ * @brief 计算哪些文件因 TTL（Time To Live）过期而需要压缩
+ *
+ * 本函数的作用：
+ * 1. 根据 TTL 配置，标记包含过期数据的文件
+ * 2. TTL 是一种基于数据生存时间的自动数据过期机制
+ * 3. 过期数据会通过压缩被删除或重写
+ *
+ * 核心概念：
+ *
+ * 1. TTL（Time To Live）：
+ *    - 定义：数据的生存时间，超过此时间的数据被视为过期
+ *    - 单位：秒（seconds）
+ *    - 作用：
+ *      a. 自动清理过期数据
+ *      b. 减少存储空间占用
+ *      c. 提高查询性能（减少需要扫描的数据量）
+ *      d. 实现数据生命周期管理
+ *    - 配置：通过 ColumnFamilyOptions.ttl 设置
+ *    - 默认值：0（禁用）
+ *
+ * 2. TTL vs Periodic Compaction：
+ *    - TTL：基于数据插入时间的生存期，数据真正过期后才删除
+ *      a. 关注点：数据的有效性
+ *      b. 目的：清理不再有效的数据
+ *      c. 适用场景：有时间敏感性的数据（如日志、临时数据）
+ *    - Periodic Compaction：基于文件年龄的定期压缩，无论数据是否过期
+ *      a. 关注点：文件的年龄
+ *      b. 目的：回收空间、优化布局
+ *      c. 适用场景：通用场景，确保文件定期重写
+ *    - 关键区别：
+ *      a. TTL：数据真的过期了（插入时间 + TTL < 当前时间）
+ *      b. Periodic：文件老了（创建时间 + 间隔 < 当前时间），但数据可能仍有效
+ *
+ * 3. oldest_ancester_time（最祖先文件时间）：
+ *    - 定义：文件来源的最原始文件的创建时间
+ *    - 作用：追踪文件的历史和数据链
+ *    - 特点：
+ *      a. 如果文件是通过 compaction 产生的，这个时间保持不变
+ *      b. 可以追溯到数据的最初插入时间
+ *      c. 即使文件经过多次 compaction，时间戳不变
+ *    - 与 TTL 的关系：
+ *      a. TTL 是基于数据插入时间的
+ *      b. oldest_ancester_time 保留了最初的插入时间
+ *      c. 可以准确判断数据是否过期
+ *
+ * 4. 为什么使用 oldest_ancester_time：
+ *    a. 准确性：
+ *       - 保留数据的最初插入时间
+ *       - 即使经过多次 compaction，也能准确判断过期
+ *    b. 一致性：
+ *       - 同一批次的数据有相同的 oldest_ancester_time
+ *       - 确保过期判断的一致性
+ *    c. 效率：
+ *       - 存储在 table properties 中，读取快速
+ *       - 不需要额外的 I/O 操作
+ *
+ * 5. 为什么只处理非最底层（num_levels() - 1）：
+ *    a. 最底层（bottom level）的特性：
+ *       - 数据不会被更底层的文件覆盖
+ *       - 是数据的最终存储位置
+ *       - 通常不会被再次 compaction（除非满足其他条件）
+ *    b. 非最底层：
+ *       - 数据会被移动到更底层
+ *       - 过期数据会在后续的 compaction 中自然删除
+ *       - 不需要专门的 TTL 压缩
+ *    c. 性能考虑：
+ *       - 减少需要标记的文件数量
+ *       - 避免不必要的压缩
+ *       - 让正常的 compaction 流程处理过期数据
+ *
+ * 6. TTL 压缩与 Leveled Compaction 的关系：
+ *    - Leveled compaction 的特性：
+ *      a. 数据从上层移动到下层
+ *      b. 每一层都有大小限制
+ *      c. 压缩会自然地移动过期数据
+ *    - TTL 压缩的作用：
+ *      a. 加速过期数据的清理
+ *      b. 在非最底层触发压缩，将过期数据向下移动
+ *      c. 最终在最底层被删除
+ *    - 级联效果：
+ *      a. 上层文件被压缩
+ *      b. 过期数据移动到下层
+ *      c. 下层也可能被触发 TTL 压缩
+ *      d. 最终过期数据到达最底层并被删除
+ *
+ * 7. being_compacted 的检查：
+ *    - 如果文件正在被压缩，不能再次标记
+ *    - 避免重复压缩同一个文件
+ *    - 等待当前压缩完成后再次检查
+ *
+ * 算法流程：
+ * 1. 清空已标记文件列表
+ * 2. 断言 TTL > 0（确保 TTL 有效）
+ * 3. 获取当前时间（从系统时钟）
+ * 4. 如果获取时间失败，直接返回
+ * 5. 计算过期阈值：current_time - ttl
+ *    - 如果 oldest_ancester_time < 过期阈值，说明数据过期
+ * 6. 遍历所有层级（除了最底层）：
+ *    a. 遍历当前层级的所有文件
+ *    b. 跳过正在压缩的文件
+ *    c. 获取文件的 oldest_ancester_time
+ *    d. 如果 oldest_ancester_time > 0 且 < 过期阈值，标记为过期
+ * 7. 完成后，expired_ttl_files_ 包含所有包含过期数据的文件
+ *
+ * 应用场景：
+ * 1. 时间敏感数据：
+ *    - 日志数据：只保留最近 N 天
+ *    - 临时数据：过期后自动删除
+ *    - 缓存数据：有固定的生存时间
+ *
+ * 2. 存储空间管理：
+ *    - 自动清理不再需要的数据
+ *    - 减少磁盘占用
+ *    - 降低存储成本
+ *
+ * 3. 数据生命周期管理：
+ *    - 确保数据不会永久存储
+ *    - 符合数据保留策略
+ *    - 满足合规性要求（如 GDPR）
+ *
+ * 4. 性能优化：
+ *    - 减少需要扫描的数据量
+ *    - 提高查询速度
+ *    - 降低 I/O 开销
+ *
+ * 性能考虑：
+ * 1. 最底层不处理：
+ *    - 减少需要标记的文件数量
+ *    - 让正常的 compaction 流程处理
+ *    - 避免不必要的压缩
+ *
+ * 2. 批量计算：
+ *    - 在 VersionStorageInfo 初始化时一次性计算
+ *    - 避免频繁计算
+ *    - 提高效率
+ *
+ * 3. 快速时间获取：
+ *    - 使用 table properties 中的 oldest_ancester_time
+ *    - 避免系统调用
+ *    - 提高性能
+ *
+ * 注意事项：
+ * 1. 时钟同步：
+ *    - 依赖系统时钟的准确性
+ *    - NTP 同步可能导致时间跳变
+ *    - 需要处理时间跳变的情况
+ *
+ * 2. TTL 的范围：
+ *    - 只影响非最底层
+ *    - 最底层的过期数据需要其他方式处理
+ *    - 可以通过 periodic compaction 或 manual compaction
+ *
+ * 3. 数据一致性：
+ *    - oldest_ancester_time 保持不变，即使经过多次 compaction
+ *    - 确保过期判断的准确性
+ *    - 避免数据意外删除
+ *
+ * 4. 配置建议：
+ *    - TTL 应该根据业务需求设置
+ *    - 过短：频繁压缩，影响性能
+ *    - 过长：数据堆积，占用空间
+ *    - 建议值：7-30 天（取决于业务场景）
+ *
+ * 5. 与其他压缩策略的配合：
+ *    - TTL 压缩可以与 size-based compaction 配合
+ *    - 优先级：size-based > TTL > periodic
+ *    - 确保多种压缩策略协同工作
+ *
+ * @param ioptions 不可变选项（包含时钟、环境、日志等）
+ * @param ttl 生存时间（秒），表示数据的最大生存期
+ *
+ * @note TTL 是可选的，通过配置启用
+ * @note 只处理非最底层（num_levels() - 1）的文件
+ * @note 过期数据会在 compaction 中被删除或重写
+ * @note 此函数在 VersionStorageInfo 初始化时调用
+ * @see expired_ttl_files_ 过期文件列表
+ * @see ttl TTL 配置参数
+ * @see oldest_ancester_time 最祖先文件时间
+ */
 void VersionStorageInfo::ComputeExpiredTtlFiles(
     const ImmutableOptions& ioptions, const uint64_t ttl) {
+  // 断言 TTL 必须大于 0
+  // 如果 TTL = 0，表示禁用 TTL，不应该调用此函数
   assert(ttl > 0);
 
+  // 清空之前计算的过期文件列表
+  // 每次重新计算时，先清空结果
   expired_ttl_files_.clear();
 
+  // 获取当前时间（从系统时钟）
+  // ioptions.clock 是一个时钟接口，可以获取当前时间
+  // int64_t 类型，用于存储 Unix 时间戳（秒）
   int64_t _current_time;
+  // 调用时钟接口获取当前时间
   auto status = ioptions.clock->GetCurrentTime(&_current_time);
+  // 如果获取时间失败，直接返回
+  // 可能的原因：时钟接口错误、系统问题等
   if (!status.ok()) {
     return;
   }
+  // 将时间转换为 uint64_t 类型，用于后续计算
   const uint64_t current_time = static_cast<uint64_t>(_current_time);
 
+  // 遍历所有层级（除了最底层）
+  // num_levels() - 1 表示不处理最底层
+  // 原因：
+  // 1. 最底层的数据不会被更底层的文件覆盖
+  // 2. 过期数据会在正常的 compaction 流程中自然删除
+  // 3. 减少需要标记的文件数量，提高效率
   for (int level = 0; level < num_levels() - 1; level++) {
+    // 遍历当前层级的所有文件
     for (FileMetaData* f : files_[level]) {
+      // 检查文件是否正在被压缩
+      // 如果正在被压缩，跳过该文件，避免重复压缩
       if (!f->being_compacted) {
+        // 获取文件的最祖先时间（oldest_ancester_time）
+        // oldest_ancester_time 表示数据最初插入的时间
+        // 即使文件经过多次 compaction，这个时间保持不变
+        // 用于准确判断数据是否过期
         uint64_t oldest_ancester_time = f->TryGetOldestAncesterTime();
+        // 检查数据是否过期
+        // 条件 1：oldest_ancester_time > 0
+        //   - 确保时间戳有效（不为 0）
+        //   - 0 表示未知时间，不应该被标记
+        // 条件 2：oldest_ancester_time < (current_time - ttl)
+        //   - 数据的插入时间 < 当前时间 - TTL
+        //   - 即：插入时间 + TTL < 当前时间
+        //   - 说明数据已经过期
         if (oldest_ancester_time > 0 &&
             oldest_ancester_time < (current_time - ttl)) {
+          // 将文件添加到过期列表中
+          // 记录层级和文件元数据指针
+          // 这个列表将被 CompactionPicker 使用，选择需要 TTL 压缩的文件
           expired_ttl_files_.emplace_back(level, f);
         }
       }
@@ -3644,31 +4246,187 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
   }
 }
 
+/**
+ * @brief 计算哪些文件需要周期性压缩（Periodic Compaction）
+ *
+ * 本函数的作用：
+ * 1. 根据文件的创建时间或修改时间，标记需要压缩的文件
+ * 2. 周期性压缩是一种基于时间的压缩策略，确保文件定期被重写
+ * 3. 即使文件没有被覆盖或删除，也会被压缩以回收空间
+ *
+ * 核心概念：
+ *
+ * 1. 周期性压缩（Periodic Compaction）：
+ *    - 定义：按照固定的时间间隔对文件进行压缩
+ *    - 目的：
+ *      a. 确保文件定期被重写，避免文件过大
+ *      b. 回收磁盘空间（即使文件没有被覆盖）
+ *      c. 优化文件布局和压缩比
+ *      d. 清除过期的 tombstone（标记删除）
+ *    - 配置：通过 periodic_compaction_seconds 参数设置
+ *
+ * 2. 文件修改时间的确定顺序（优先级从高到低）：
+ *    a. file_creation_time（文件创建时间）：
+ *       - 存储在 table properties 中
+ *       - RocksDB 6.18+ 开始支持
+ *       - 记录文件实际创建的 Unix 时间戳
+ *       - 精度：秒级
+ *
+ *    b. oldest_ancester_time（最祖先文件时间）：
+ *       - 记录文件来源的最原始文件的创建时间
+ *       - 用于追踪文件的历史
+ *       - 如果文件是通过 compaction 产生的，这个时间保持不变
+ *
+ *    c. 文件系统修改时间（mtime）：
+ *       - 从文件系统获取（通过 env->GetFileModificationTime）
+ *       - 可能耗时（系统调用）
+ *       - 可能不准确（文件移动、复制等操作）
+ *
+ * 3. 为什么要优先使用 table properties 中的时间：
+ *    a. 性能：避免系统调用
+ *    b. 准确性：不受文件操作（移动、复制）影响
+ *    c. 一致性：即使文件被压缩，时间戳保持不变
+ *
+ * 4. being_compacted 的检查：
+ *    - 如果文件正在被压缩，不能再次标记
+ *    - 避免重复压缩同一个文件
+ *    - 防止资源浪费和冲突
+ *
+ * 5. 为什么需要检查 periodic_compaction_seconds > current_time：
+ *    - 避免 uint64_t 下溢（current_time - periodic_compaction_seconds）
+ *    - 系统时钟可能被调整（如 NTP 同步）
+ *    - 这种情况下，暂时跳过周期性压缩
+ *
+ * 算法流程：
+ * 1. 清空已标记文件列表
+ * 2. 获取当前时间（从系统时钟）
+ * 3. 计算时间阈值：current_time - periodic_compaction_seconds
+ * 4. 遍历指定层级（0 到 last_level）的所有文件：
+ *    a. 跳过正在压缩的文件
+ *    b. 按优先级获取文件修改时间：
+ *       - 首先尝试 file_creation_time
+ *       - 然后尝试 oldest_ancester_time
+ *       - 最后从文件系统获取 mtime
+ *    c. 如果获取失败，跳过该文件
+ *    d. 如果文件修改时间 > 0 且 < 时间阈值，标记为需要压缩
+ * 5. 完成后，files_marked_for_periodic_compaction_ 包含所有需要压缩的文件
+ *
+ * 应用场景：
+ * 1. 回收过期数据：
+ *    - 即使文件没有被覆盖，周期性压缩也会重写文件
+ *    - 可以删除过期的 tombstone（标记删除）
+ *    - 可以应用新的压缩算法或配置
+ *
+ * 2. 防止文件无限增长：
+ *    - 即使写入量很小，文件也会定期被重写
+ *    - 避免文件变得过大
+ *    - 保持文件大小合理
+ *
+ * 3. 优化压缩比：
+ *    - 随着时间推移，数据分布可能变化
+ *    - 重新压缩可能获得更好的压缩比
+ *    - 特别是使用新的压缩算法时
+ *
+ * 4. 磁盘空间回收：
+ *    - SSTable 文件可能有空洞（被删除的数据）
+ *    - 周期性压缩可以回收这些空间
+ *    - 即使没有新数据覆盖旧数据
+ *
+ * 性能考虑：
+ * 1. 优先使用 table properties 中的时间：
+ *    - 避免系统调用
+ *    - 提高查找速度
+ *    - 减少 I/O 开销
+ *
+ * 2. 只在需要时获取文件系统时间：
+ *    - 前两种方式失败时才使用
+ *    - 减少系统调用次数
+ *    - 提高性能
+ *
+ * 3. 批量计算：
+ *    - 在 VersionStorageInfo 初始化时一次性计算
+ *    - 避免频繁计算
+ *    - 提高效率
+ *
+ * 注意事项：
+ * 1. 时钟同步：
+ *    - 依赖系统时钟的准确性
+ *    - NTP 同步可能导致时间跳变
+ *    - 需要处理时间跳变的情况
+ *
+ * 2. 文件系统时间：
+ *    - 可能不准确（文件移动、复制等操作）
+ *    - 系统调用可能耗时
+ *    - 不同文件系统可能表现不同
+ *
+ * 3. 周期性压缩的代价：
+ *    - 会消耗 CPU 和 I/O 资源
+ *    - 即使文件没有被覆盖，也会被压缩
+ *    - 需要合理设置 periodic_compaction_seconds
+ *
+ * @param ioptions 不可变选项（包含时钟、环境、日志等）
+ * @param periodic_compaction_seconds 周期性压缩的时间间隔（秒）
+ * @param last_level 需要检查的最高层级
+ *
+ * @note 周期性压缩是可选的，通过配置启用
+ * @note 即使文件没有达到 size-based 压缩条件，也会被压缩
+ * @note 此函数在 VersionStorageInfo 初始化时调用
+ * @see files_marked_for_periodic_compaction_ 标记文件列表
+ * @see periodic_compaction_seconds 配置参数
+ */
 void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
     const ImmutableOptions& ioptions,
     const uint64_t periodic_compaction_seconds, int last_level) {
+  // 断言周期性压缩间隔必须大于 0
+  // 如果为 0，表示不启用周期性压缩，不应该调用此函数
   assert(periodic_compaction_seconds > 0);
 
+  // 清空之前计算的标记文件列表
+  // 每次重新计算时，先清空结果
   files_marked_for_periodic_compaction_.clear();
 
+  // 获取当前时间（从系统时钟）
+  // ioptions.clock 是一个时钟接口，可以获取当前时间
+  // int64_t 类型，用于存储 Unix 时间戳（秒）
   int64_t temp_current_time;
+  // 调用时钟接口获取当前时间
   auto status = ioptions.clock->GetCurrentTime(&temp_current_time);
+  // 如果获取时间失败，直接返回
+  // 可能的原因：时钟接口错误、系统问题等
   if (!status.ok()) {
     return;
   }
+  // 将时间转换为 uint64_t 类型，用于后续计算
   const uint64_t current_time = static_cast<uint64_t>(temp_current_time);
 
   // If periodic_compaction_seconds is larger than current time, periodic
   // compaction can't possibly be triggered.
+  // 检查周期性压缩间隔是否大于当前时间
+  // 如果 periodic_compaction_seconds > current_time，说明：
+  // a. current_time - periodic_compaction_seconds 会下溢（变成很大的数）
+  // b. 这种情况下无法正确判断哪些文件需要压缩
+  // c. 可能的原因：系统时钟被调整（如 NTP 同步）
+  // 直接返回，不进行标记
   if (periodic_compaction_seconds > current_time) {
     return;
   }
 
+  // 计算允许的时间阈值
+  // 文件修改时间 < allowed_time_limit 的文件需要被压缩
+  // 即：文件的年龄 > periodic_compaction_seconds
+  // 示例：current_time = 1000, periodic_compaction_seconds = 300
+  //       allowed_time_limit = 1000 - 300 = 700
+  //       修改时间为 500 的文件需要被压缩（500 < 700）
+  //       修改时间为 800 的文件不需要被压缩（800 >= 700）
   const uint64_t allowed_time_limit =
       current_time - periodic_compaction_seconds;
 
+  // 遍历所有层级（从 L0 到 last_level）
   for (int level = 0; level <= last_level; level++) {
+    // 遍历当前层级的所有文件
     for (auto f : files_[level]) {
+      // 检查文件是否正在被压缩
+      // 如果正在被压缩，跳过该文件，避免重复压缩
       if (!f->being_compacted) {
         // Compute a file's modification time in the following order:
         // 1. Use file_creation_time table property if it is > 0.
@@ -3676,24 +4434,58 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
         // 3. Use file's mtime metadata if the above two table properties are 0.
         // Don't consider the file at all if the modification time cannot be
         // correctly determined based on the above conditions.
+        // 获取文件修改时间（优先级 1：file_creation_time）
+        // file_creation_time 存储在 table properties 中
+        // 这是文件实际创建的 Unix 时间戳
         uint64_t file_modification_time = f->TryGetFileCreationTime();
+
+        // 如果 file_creation_time 未知（kUnknownFileCreationTime = 0）
+        // 尝试获取 oldest_ancester_time（优先级 2）
+        // oldest_ancester_time 记录文件来源的最原始文件的创建时间
+        // 用于追踪文件的历史，即使在 compaction 后也保持不变
         if (file_modification_time == kUnknownFileCreationTime) {
           file_modification_time = f->TryGetOldestAncesterTime();
         }
+
+        // 如果 oldest_ancester_time 也未知（kUnknownOldestAncesterTime = 0）
+        // 尝试从文件系统获取修改时间（优先级 3）
+        // 这是最不推荐的方式，因为：
+        // a. 需要系统调用，性能开销大
+        // b. 可能不准确（文件移动、复制等操作会改变 mtime）
+        // c. 不同文件系统可能表现不同
         if (file_modification_time == kUnknownOldestAncesterTime) {
+          // 构造文件路径
+          // TableFileName() 根据 cf_paths、文件号、路径 ID 生成完整路径
           auto file_path = TableFileName(ioptions.cf_paths, f->fd.GetNumber(),
                                          f->fd.GetPathId());
+          // 调用环境接口获取文件修改时间
+          // 这是一个系统调用，可能耗时
           status = ioptions.env->GetFileModificationTime(
               file_path, &file_modification_time);
+          // 如果获取失败，记录警告并跳过该文件
           if (!status.ok()) {
+            // 记录警告日志：无法获取文件修改时间
+            // 包括文件路径和错误信息
             ROCKS_LOG_WARN(ioptions.logger,
                            "Can't get file modification time: %s: %s",
                            file_path.c_str(), status.ToString().c_str());
+            // 跳过该文件，继续检查下一个文件
             continue;
           }
         }
+
+        // 检查文件是否需要周期性压缩
+        // 条件 1：file_modification_time > 0
+        //   - 确保时间戳有效（不为 0）
+        //   - 0 表示未知时间，不应该被压缩
+        // 条件 2：file_modification_time < allowed_time_limit
+        //   - 文件的年龄大于 periodic_compaction_seconds
+        //   - 即文件创建时间早于阈值时间
         if (file_modification_time > 0 &&
             file_modification_time < allowed_time_limit) {
+          // 将文件添加到标记列表中
+          // 记录层级和文件元数据指针
+          // 这个列表将被 CompactionPicker 使用，选择需要压缩的文件
           files_marked_for_periodic_compaction_.emplace_back(level, f);
         }
       }
@@ -3701,18 +4493,224 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
   }
 }
 
+/**
+ * @brief 计算哪些 SSTable 文件需要强制 Blob 垃圾回收（GC）
+ *
+ * 本函数的作用：
+ * 1. 根据 Blob 文件的垃圾比例和年龄，标记需要强制 GC 的 SSTable 文件
+ * 2. Blob GC 可以回收 Blob 文件中被删除的 Blob 数据
+ * 3. 通过压缩引用 Blob 文件的 SSTable，触发 Blob GC
+ *
+ * 核心概念：
+ *
+ * 1. Blob 文件（Blob File）：
+ *    - 定义：存储大值（large value）的独立文件
+ *    - 目的：减少 SSTable 文件的大小，提高压缩效率
+ *    - 使用：当 value 大小超过 blob_garbage_collection_age_cutoff 时，存储到 Blob 文件
+ *    - 引用：SSTable 文件包含指向 Blob 文件的引用
+ *
+ * 2. Blob 垃圾回收（Blob GC）：
+ *    - 定义：回收 Blob 文件中被删除的 Blob 数据
+ *    - 原因：
+ *      a. 当 key 被删除或覆盖时，对应的 Blob 数据变成垃圾
+ *      b. 这些垃圾数据占用磁盘空间，但不会被读取
+ *      c. 需要通过 GC 回收这些空间
+ *    - 触发方式：
+ *      a. 自动 GC：根据垃圾比例自动触发
+ *      b. 强制 GC：通过压缩 SSTable 强制触发
+ *
+ * 3. Linked SST（关联的 SSTable）：
+ *    - 定义：引用某个 Blob 文件的 SSTable 文件集合
+ *    - 作用：追踪哪些 SSTable 引用了哪些 Blob 文件
+ *    - 数据结构：LinkedSsts = std::unordered_set<uint64_t>
+ *    - 示例：Blob 文件 10 被 SST 文件 1 和 2 引用，LinkedSsts = {1, 2}
+ *
+ * 4. Blob Batch（Blob 批次）：
+ *    - 定义：被同一组 SSTable 引用的 Blob 文件集合
+ *    - 特点：
+ *      a. 同一批次的 Blob 文件可以被一起 GC
+ *      b. 通过压缩引用这批 Blob 文件的所有 SSTable 触发
+ *      c. 确保所有相关的 Blob 数据都被处理
+ *    - 示例：
+ *      - Blob 文件 10 和 11 都被 SST 1 和 2 引用
+ *      - 它们属于同一个批次
+ *      - 压缩 SST 1 和 2 可以同时 GC Blob 文件 10 和 11
+ *
+ * 5. 垃圾比例（Garbage Ratio）：
+ *    - 定义：垃圾字节数 / 总字节数
+ *    - 计算公式：garbage_blob_bytes / total_blob_bytes
+ *    - 阈值：blob_garbage_collection_force_threshold（如 0.5 表示 50%）
+ *    - 作用：决定是否需要强制 GC
+ *
+ * 6. 年龄截止（Age Cutoff）：
+ *    - 定义：Blob 文件的最老部分比例
+ *    - 参数：blob_garbage_collection_age_cutoff（如 0.25 表示最老的 25%）
+ *    - 计算：cutoff_count = age_cutoff * blob_files_.size()
+ *    - 作用：限制 GC 只影响最老的 Blob 文件
+ *
+ * 为什么使用 Batch 概念：
+ * 1. 一致性：
+ *    - 确保 Blob 数据和 SSTable 数据的一致性
+ *    - 避免部分 GC 导致的数据不一致
+ *
+ * 2. 效率：
+ *    - 一次性压缩多个 SSTable，比逐个压缩更高效
+ *    - 减少 I/O 和 CPU 开销
+ *
+ * 3. 完整性：
+ *    - 确保所有相关的 Blob 数据都被处理
+ *    - 避免遗漏某些 Blob 文件
+ *
+ * 算法流程：
+ * 1. 清空已标记文件列表
+ * 2. 检查是否有 Blob 文件，如果没有，直接返回
+ * 3. 计算年龄截止：cutoff_count = age_cutoff * blob_files_count
+ * 4. 如果 cutoff_count = 0，说明没有文件满足年龄条件，直接返回
+ * 5. 找到最老的 Blob 批次：
+ *    a. 从最老的 Blob 文件开始
+ *    b. 如果下一个 Blob 文件的 LinkedSsts 不为空，说明是新批次的开始
+ *    c. 统计当前批次的 total_blob_bytes 和 garbage_blob_bytes
+ *    d. 如果当前批次的文件数 >= cutoff_count，停止
+ * 6. 检查是否所有文件都满足年龄条件：
+ *    a. 如果当前批次的文件数 < cutoff_count
+ *    b. 且下一个 Blob 文件的 LinkedSsts 不为空
+ *    c. 说明新批次的文件也满足年龄条件，无法确定边界
+ *    d. 直接返回，不标记任何文件
+ * 7. 检查垃圾比例：
+ *    a. 计算 ratio = garbage_blob_bytes / total_blob_bytes
+ *    b. 如果 ratio < blob_garbage_collection_force_threshold
+ *    c. 说明垃圾比例不够高，不需要强制 GC
+ *    d. 直接返回，不标记任何文件
+ * 8. 标记需要压缩的 SSTable：
+ *    a. 遍历最老批次的 LinkedSsts
+ *    b. 查找每个 SSTable 的位置（层级和位置）
+ *    c. 跳过正在压缩的 SSTable
+ *    d. 将满足条件的 SSTable 添加到标记列表
+ * 9. 完成后，files_marked_for_forced_blob_gc_ 包含所有需要压缩的 SSTable
+ *
+ * Batch 的判断逻辑：
+ * - Blob 文件按创建时间排序（blob_files_）
+ * - LinkedSsts 为空表示该 Blob 文件没有被 SSTable 引用（已被 GC）
+ * - LinkedSsts 不为空表示该 Blob 文件被某些 SSTable 引用
+ * - 同一批次的 Blob 文件有相同的 LinkedSsts
+ * - 新批次的开始：LinkedSsts 从空变为非空，或者内容发生变化
+ *
+ * 示例说明：
+ * 假设有 4 个 Blob 文件（10, 11, 12, 13）和 3 个 SST 文件（1, 2, 3）
+ *
+ * SST → Blob 映射：
+ *   SST 1 引用 Blob 文件 10, 11
+ *   SST 2 引用 Blob 文件 10, 11
+ *   SST 3 引用 Blob 文件 12, 13
+ *
+ * Blob → SST 映射（LinkedSsts）：
+ *   Blob 10: {1, 2}
+ *   Blob 11: {1, 2}  （与 Blob 10 相同，属于同一批次）
+ *   Blob 12: {3}       （不同的 LinkedSsts，新批次的开始）
+ *   Blob 13: {3}       （与 Blob 12 相同，属于同一批次）
+ *
+ * 情况 1：blob_garbage_collection_age_cutoff = 0.5（50%）
+ *   cutoff_count = 0.5 * 4 = 2
+ *   最老批次包含 Blob 10 和 11（count = 2）
+ *   Blob 12 的 LinkedSsts = {3} 不为空，是新批次的开始
+ *   停止统计，count = 2
+ *   检查垃圾比例，如果满足阈值，标记 SST 1 和 2
+ *
+ * 情况 2：blob_garbage_collection_age_cutoff = 0.75（75%）
+ *   cutoff_count = 0.75 * 4 = 3
+ *   统计 Blob 10, 11, 12（count = 3）
+ *   Blob 13 的 LinkedSsts = {3} 不为空，是新批次的开始
+ *   停止统计，count = 3
+ *   但是 Blob 12 和 13 属于同一个批次（LinkedSsts 相同）
+ *   意味着新批次的开始（Blob 12）也满足年龄条件
+ *   无法确定批次边界，直接返回，不标记任何文件
+ *
+ * 应用场景：
+ * 1. 回收大量 Blob 垃圾：
+ *    - 当 Blob 文件中有大量被删除的数据时
+ *    - 垃圾比例超过阈值
+ *    - 强制 GC 可以显著减少磁盘占用
+ *
+ * 2. 优化存储空间：
+ *    - Blob 文件可能包含大量无效数据
+ *    - 通过 GC 回收这些空间
+ *    - 提高磁盘利用率
+ *
+ * 3. 避免自动 GC 的延迟：
+ *    - 自动 GC 可能等待垃圾比例更高
+ *    - 强制 GC 可以提前触发
+ *    - 及时回收空间
+ *
+ * 性能考虑：
+ * 1. 批量 GC：
+ *    - 一次性处理整个批次的 Blob 文件
+ *    - 减少压缩次数
+ *    - 提高效率
+ *
+ * 2. 年龄限制：
+ *    - 只处理最老的 Blob 文件
+ *    - 避免频繁 GC
+ *    - 减少对性能的影响
+ *
+ * 3. 垃圾比例阈值：
+ *    - 确保只在垃圾比例足够高时才 GC
+ *    - 避免 GC 的开销超过收益
+ *
+ * 注意事项：
+ * 1. Batch 的完整性：
+ *    - 确保同一批次的 Blob 文件被一起 GC
+ *    - 避免部分 GC 导致的数据不一致
+ *
+ * 2. 年龄边界的确定：
+ *    - 如果新批次的开始也满足年龄条件
+ *    - 无法确定批次边界
+ *    - 暂时不标记任何文件，等待下次计算
+ *
+ * 3. 垃圾比例的计算：
+ *    - 使用整个批次的平均垃圾比例
+ *    - 而不是单个 Blob 文件的垃圾比例
+ *    - 确保整体的收益
+ *
+ * 4. 正在压缩的 SSTable：
+ *    - 如果 SSTable 正在被压缩，不能再次标记
+ *    - 避免重复压缩
+ *    - 等待当前压缩完成后再次检查
+ *
+ * @param blob_garbage_collection_age_cutoff 年龄截止比例（0.0 - 1.0）
+ * @param blob_garbage_collection_force_threshold 垃圾比例阈值（0.0 - 1.0）
+ *
+ * @note Blob GC 是可选的，通过配置启用
+ * @note 强制 GC 通过压缩 SSTable 触发，而不是直接操作 Blob 文件
+ * @note 此函数在 VersionStorageInfo 初始化时调用
+ * @see files_marked_for_forced_blob_gc_ 标记文件列表
+ * @see blob_files_ Blob 文件列表（按创建时间排序）
+ * @see BlobFileMetaData Blob 文件元数据
+ */
 void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
     double blob_garbage_collection_age_cutoff,
     double blob_garbage_collection_force_threshold) {
+  // 清空之前计算的标记文件列表
+  // 每次重新计算时，先清空结果
   files_marked_for_forced_blob_gc_.clear();
 
+  // 检查是否有 Blob 文件
+  // blob_files_ 是一个包含所有 Blob 文件元数据的向量
+  // 如果为空，说明没有 Blob 文件，直接返回
   if (blob_files_.empty()) {
     return;
   }
 
   // Number of blob files eligible for GC based on age
+  // 计算基于年龄符合 GC 条件的 Blob 文件数量
+  // cutoff_count = age_cutoff * total_blob_files_count
+  // 示例：如果有 100 个 Blob 文件，age_cutoff = 0.25
+  //       cutoff_count = 0.25 * 100 = 25
+  //       表示最老的 25 个 Blob 文件符合年龄条件
   const size_t cutoff_count = static_cast<size_t>(
       blob_garbage_collection_age_cutoff * blob_files_.size());
+  // 如果 cutoff_count = 0，说明没有文件满足年龄条件
+  // 可能的原因：age_cutoff = 0 或者 blob_files_.size() = 0
+  // 直接返回，不标记任何文件
   if (!cutoff_count) {
     return;
   }
@@ -3747,62 +4745,133 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
   // blob_garbage_collection_force_threshold and the entire batch has to be
   // eligible for GC according to blob_garbage_collection_age_cutoff in order
   // for us to schedule any compactions.
+  // 获取最老的 Blob 文件元数据
+  // blob_files_ 按创建时间排序，front() 是最老的
   const auto& oldest_meta = blob_files_.front();
+  // 断言 oldest_meta 不为空
   assert(oldest_meta);
 
+  // 获取最老 Blob 文件的关联 SSTable 集合
+  // LinkedSsts 是一个 unordered_set<uint64_t>，包含所有引用该 Blob 文件的 SSTable 编号
+  // 示例：{1, 2} 表示 SSTable 文件 1 和 2 引用这个 Blob 文件
   const auto& linked_ssts = oldest_meta->GetLinkedSsts();
+  // 断言 LinkedSsts 不为空
+  // 如果为空，说明该 Blob 文件没有被任何 SSTable 引用
+  // 不应该标记任何文件
   assert(!linked_ssts.empty());
 
+  // 初始化计数器（从 1 开始，已经包含了最老的 Blob 文件）
   size_t count = 1;
+  // 累计最老批次的所有 Blob 文件的总字节数
+  // 初始值：最老 Blob 文件的总字节数
   uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
+  // 累计最老批次的所有 Blob 文件的垃圾字节数
+  // 初始值：最老 Blob 文件的垃圾字节数
   uint64_t sum_garbage_blob_bytes = oldest_meta->GetGarbageBlobBytes();
 
+  // 断言 cutoff_count 不超过 Blob 文件总数
+  // 这是一个基本的安全检查
   assert(cutoff_count <= blob_files_.size());
 
+  // 从第二个 Blob 文件开始遍历，寻找最老批次
+  // 停止条件：
+  // 1. count >= cutoff_count：已经找到足够的文件
+  // 2. 找到新批次的开始（LinkedSsts 不为空）
   for (; count < cutoff_count; ++count) {
+    // 获取当前 Blob 文件的元数据
     const auto& meta = blob_files_[count];
+    // 断言 meta 不为空
     assert(meta);
 
+    // 检查当前 Blob 文件是否有关联的 SSTable
+    // 如果 LinkedSsts 不为空，说明：
+    // a. 该 Blob 文件被某些 SSTable 引用
+    // b. 这些 SSTable 与最老的 Blob 文件的 SSTable 不同
+    // c. 这是新批次的开始
+    // 停止遍历
     if (!meta->GetLinkedSsts().empty()) {
       // Found the beginning of the next batch of blob files
+      // 找到下一个 Blob 批次的开始，停止统计
       break;
     }
 
+    // 如果 LinkedSsts 为空，说明该 Blob 文件与最老的 Blob 文件属于同一批次
+    // 累加总字节数和垃圾字节数
     sum_total_blob_bytes += meta->GetTotalBlobBytes();
     sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
   }
 
+  // 检查是否所有文件都满足年龄条件
+  // 如果 count < blob_files_.size()，说明还有更多的 Blob 文件
   if (count < blob_files_.size()) {
+    // 获取下一个 Blob 文件的元数据
     const auto& meta = blob_files_[count];
+    // 断言 meta 不为空
     assert(meta);
 
+    // 检查下一个 Blob 文件的 LinkedSsts 是否为空
+    // 如果不为空，说明：
+    // a. 下一个 Blob 文件属于新批次
+    // b. 新批次的开始（count 位置）也满足年龄条件（count < cutoff_count）
+    // c. 无法确定批次边界，不知道应该包含哪些文件
+    // 这种情况下，不能安全地进行 GC，直接返回
     if (meta->GetLinkedSsts().empty()) {
       // Some files in the oldest batch are not eligible for GC
+      // 最老批次中的一些文件不符合 GC 条件
+      // 无法确定批次边界，直接返回，不标记任何文件
       return;
     }
   }
 
+  // 检查垃圾比例是否超过阈值
+  // 计算公式：garbage_blob_bytes / total_blob_bytes
+  // 条件：garbage_blob_bytes >= force_threshold * total_blob_bytes
+  // 示例：
+  //   total_blob_bytes = 1000
+  //   garbage_blob_bytes = 600
+  //   force_threshold = 0.5
+  //   600 >= 0.5 * 1000 = 500，满足条件
   if (sum_garbage_blob_bytes <
       blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
+    // 垃圾比例不够高，GC 的收益不足以覆盖成本
+    // 直接返回，不标记任何文件
     return;
   }
 
+  // 遍历最老批次的所有关联 SSTable
+  // linked_ssts 是最老 Blob 文件的 LinkedSsts
+  // 包含所有引用该批次 Blob 文件的 SSTable 编号
   for (uint64_t sst_file_number : linked_ssts) {
+    // 根据 SSTable 文件号查找文件位置
+    // FileLocation 包含层级（level）和位置（position）
     const FileLocation location = GetFileLocation(sst_file_number);
+    // 断言位置有效
     assert(location.IsValid());
 
+    // 获取 SSTable 所在的层级
     const int level = location.GetLevel();
+    // 断言层级 >= 0
     assert(level >= 0);
 
+    // 获取 SSTable 在该层级中的位置索引
     const size_t pos = location.GetPosition();
 
+    // 获取 SSTable 的元数据指针
+    // files_[level] 是该层级的所有文件列表
+    // files_[level][pos] 是指定位置的文件
     FileMetaData* const sst_meta = files_[level][pos];
+    // 断言元数据不为空
     assert(sst_meta);
 
+    // 检查 SSTable 是否正在被压缩
+    // 如果正在被压缩，跳过该文件，避免重复压缩
     if (sst_meta->being_compacted) {
       continue;
     }
 
+    // 将 SSTable 添加到标记列表中
+    // 记录层级和文件元数据指针
+    // 这个列表将被 CompactionPicker 使用，选择需要强制 Blob GC 的 SSTable
     files_marked_for_forced_blob_gc_.emplace_back(level, sst_meta);
   }
 }
@@ -4019,38 +5088,117 @@ void SortFileByRoundRobin(const InternalKeyComparator& icmp,
 }
 }  // anonymous namespace
 
+/**
+ * @brief 根据 compaction 优先级策略更新各层文件的排序顺序
+ *
+ * 本函数是 Level Compaction 中文件选择机制的核心，负责：
+ * 1. 按照 compaction_pri 配置的优先级策略，对每层的文件进行排序
+ * 2. 将排序结果保存到 files_by_compaction_pri_ 数组中
+ * 3. 重置每层的 compact 游标为 0
+ *
+ * 调用时机：
+ * - 每次创建新的 Version 时（VersionSet::AppendVersion）
+ * - 在 Compaction 阶段使用文件选择时，会读取此排序结果
+ *
+ * 为什么需要排序？
+ * - 不同层级的文件选择策略不同（大小、序号、重叠率等）
+ * - 排序后，PickCompaction 可以从最优的文件开始选择
+ * - 避免每次 compaction 都要重新排序，提高性能
+ *
+ * Compaction 优先级策略（compaction_pri）：
+ * 1. kByCompensatedSize（默认）：按补偿大小降序（最大文件优先）
+ * 2. kOldestLargestSeqFirst：按最大序号升序（最旧数据优先）
+ * 3. kOldestSmallestSeqFirst：按最小序号升序（最早数据优先）
+ * 4. kMinOverlappingRatio：按与下一层的重叠率升序（重叠率低优先）
+ * 5. kRoundRobin：轮询选择，避免重复选择同一文件
+ *
+ * 排序范围：
+ * - kByCompensatedSize：只对前 kNumberFilesToSort（50）个文件排序
+ * - 其他策略：对所有文件排序
+ * - 原因：部分排序足够找到最大文件，避免全排序开销
+ *
+ * 数据结构：
+ * - Fsize：临时结构体，保存文件在原列表中的索引和文件指针
+ * - files_by_compaction_pri_[level]：保存排序后的索引数组
+ * - next_file_to_compact_by_size_[level]：下次选择的起始索引
+ *
+ * @param ioptions 不可变配置（包含 compaction_pri 策略）
+ * @param options 可变配置（包含 ttl 等）
+ *
+ * @note 只对 Level Compaction 有效：
+ *   - FIFO：只基于文件大小和 TTL，不需要排序
+ *   - Universal：只基于文件序号，不需要排序
+ *   - None：不进行 compaction
+ *
+ * @note 不排序最高层：
+ *   - 最高层永远不会被压缩（没有输出层）
+ *   - 排序无意义且浪费 CPU
+ *
+ * @note kNumberFilesToSort = 50：
+ *   - 只需要找到最大的几个文件即可
+ *   - partial_sort 的时间复杂度：O(n log k)，k=50
+ *   - 全排序的时间复杂度：O(n log n)
+ *   - 当 n 很大时，部分排序显著更快
+ *
+ * @note files_by_compaction_pri_ 的含义：
+ *   - 这是一个索引数组，不是文件指针数组
+ *   - 值：files_[level][index]，即原文件列表中的索引
+ *   - 顺序：按 compaction 优先级降序排列（优先级高的在前）
+ *
+ * @see kByCompensatedSize 按文件大小降序，大文件优先
+ * @see kOldestLargestSeqFirst 按最大序号升序，最旧数据优先
+ * @see kOldestSmallestSeqFirst 按最小序号升序，最早数据优先
+ * @see kMinOverlappingRatio 按重叠率升序，低重叠率优先
+ * @see kRoundRobin 轮询选择，避免重复
+ */
 void VersionStorageInfo::UpdateFilesByCompactionPri(
     const ImmutableOptions& ioptions, const MutableCFOptions& options) {
+  // 检查 compaction 风格，只处理 Level Compaction
   if (compaction_style_ == kCompactionStyleNone ||
       compaction_style_ == kCompactionStyleFIFO ||
       compaction_style_ == kCompactionStyleUniversal) {
     // don't need this
+    // FIFO、Universal、None 不需要排序，直接返回
     return;
   }
   // No need to sort the highest level because it is never compacted.
+  // 遍历所有层级，除了最高层（最高层不会被压缩）
   for (int level = 0; level < num_levels() - 1; level++) {
+    // 获取该层所有文件的原始列表
     const std::vector<FileMetaData*>& files = files_[level];
+    // 获取该层的排序结果索引数组（输出）
     auto& files_by_compaction_pri = files_by_compaction_pri_[level];
+    // 确保排序结果数组是空的（未初始化状态）
     assert(files_by_compaction_pri.size() == 0);
 
     // populate a temp vector for sorting based on size
+    // 创建临时向量，用于基于 compaction 优先级排序
+    // Fsize 结构体保存文件在原列表中的索引和文件指针
     std::vector<Fsize> temp(files.size());
+    // 填充临时向量，保存每个文件的原索引
     for (size_t i = 0; i < files.size(); i++) {
-      temp[i].index = i;
-      temp[i].file = files[i];
+      temp[i].index = i;  // 保存原索引
+      temp[i].file = files[i];  // 保存文件指针
     }
 
     // sort the top number_of_files_to_sort_ based on file size
-    size_t num = VersionStorageInfo::kNumberFilesToSort;
+    // 确定需要排序的文件数量（只对前 kNumberFilesToSort 个文件排序）
+    // 对于 kByCompensatedSize 策略，部分排序即可
+    size_t num = VersionStorageInfo::kNumberFilesToSort; //最多前50个文件排序
     if (num > temp.size()) {
-      num = temp.size();
+      num = temp.size();  // 如果文件总数少于 kNumberFilesToSort，则全部排序
     }
+    // 根据 compaction_pri 策略，选择不同的排序方法
     switch (ioptions.compaction_pri) {
       case kByCompensatedSize:
+        // 按补偿大小降序排序（最大的文件优先）
+        // 使用 partial_sort，只对前 num 个文件排序，提高性能
         std::partial_sort(temp.begin(), temp.begin() + num, temp.end(),
                           CompareCompensatedSizeDescending);
         break;
       case kOldestLargestSeqFirst:
+        // 按最大序号升序排序（序号越小，数据越旧）
+        // 这样最旧的数据会优先被压缩
         std::sort(temp.begin(), temp.end(),
                   [](const Fsize& f1, const Fsize& f2) -> bool {
                     return f1.file->fd.largest_seqno <
@@ -4058,6 +5206,8 @@ void VersionStorageInfo::UpdateFilesByCompactionPri(
                   });
         break;
       case kOldestSmallestSeqFirst:
+        // 按最小序号升序排序（序号越小，数据越旧）
+        // 这样最早的数据会优先被压缩
         std::sort(temp.begin(), temp.end(),
                   [](const Fsize& f1, const Fsize& f2) -> bool {
                     return f1.file->fd.smallest_seqno <
@@ -4065,24 +5215,34 @@ void VersionStorageInfo::UpdateFilesByCompactionPri(
                   });
         break;
       case kMinOverlappingRatio:
+        // 按与下一层的重叠率升序排序（重叠率低的优先）
+        // 这样可以减少 compaction 的工作量（重叠少，读取输出层数据少）
         SortFileByOverlappingRatio(*internal_comparator_, files_[level],
                                    files_[level + 1], ioptions.clock, level,
                                    num_non_empty_levels_, options.ttl, &temp);
         break;
       case kRoundRobin:
+        // 轮询排序，避免重复选择同一文件
+        // 使用 compact_cursor_ 来记录上次选择的文件位置
         SortFileByRoundRobin(*internal_comparator_, &compact_cursor_,
                              level0_non_overlapping_, level, &temp);
         break;
       default:
+        // 不应该到达这里
         assert(false);
     }
+    // 确保临时向量的大小与原文件列表一致
     assert(temp.size() == files.size());
 
     // initialize files_by_compaction_pri_
+    // 将排序结果转换为索引数组，保存到 files_by_compaction_pri_
     for (size_t i = 0; i < temp.size(); i++) {
+      // 保存排序后的原索引
       files_by_compaction_pri.push_back(static_cast<int>(temp[i].index));
     }
+    // 重置该层的 compact 游标为 0，表示下次从第一个文件开始选择
     next_file_to_compact_by_size_[level] = 0;
+    // 确保索引数组的大小与文件列表的大小一致
     assert(files_[level].size() == files_by_compaction_pri_[level].size());
   }
 }
@@ -4169,18 +5329,135 @@ void VersionStorageInfo::UpdateOldestSnapshot(SequenceNumber seqnum) {
   }
 }
 
+/**
+ * @brief 计算哪些最底层文件应该被标记为需要压缩
+ *
+ * 本函数的作用：
+ * 1. 从最底层文件（bottommost_files_）中筛选出需要压缩的文件
+ * 2. 基于快照和序列号判断文件是否包含可回收空间
+ * 3. 更新 bottommost_files_mark_threshold_ 以便后续快速判断
+ *
+ * 核心概念：
+ *
+ * 1. 最底层文件（Bottommost Files）：
+ *    - 定义：在 LSM 树的最底层，且没有更低层文件的文件
+ *    - 特点：这些文件的数据不会被更底层的文件覆盖
+ *    - 重要性：是回收空间的最后机会
+ *
+ * 2. largest_seqno（文件中的最大序列号）：
+ *    - 表示文件中所有 key 的最大序列号
+ *    - 序列号越小，表示数据越旧
+ *    - 如果 largest_seqno < oldest_snapshot_seqnum_，说明：
+ *      a. 文件中的所有数据都早于最旧的快照
+ *      b. 不会被任何快照引用
+ *      c. 可以安全地删除覆盖的数据（回收空间）
+ *
+ * 3. being_compacted（是否正在被压缩）：
+ *    - 如果文件正在被压缩，不能再次标记
+ *    - 避免重复压缩同一个文件
+ *
+ * 4. largest_seqno == 0 的特殊情况：
+ *    - largest_seqno 为 0 表示文件可能是空的或没有有效的序列号
+ *    - 这种情况通常出现在特殊场景（如某些边界情况）
+ *    - 这种文件不能简单地判断是否可以回收空间，因此跳过
+ *
+ * 5. 为什么使用 largest_seqno < oldest_snapshot_seqnum_：
+ *    - oldest_snapshot_seqnum_ 是所有快照中的最小序列号
+ *    - 如果文件的最大序列号小于这个值，说明：
+ *      a. 文件中的所有数据都早于最旧的快照
+ *      b. 这些数据不会被任何快照读取
+ *      c. 可以安全地删除这些数据（如果被覆盖）
+ *    - 反之，如果 largest_seqno >= oldest_snapshot_seqnum_，说明：
+ *      a. 文件中可能还有数据被快照引用
+ *      b. 不能安全地回收空间
+ *      c. 需要等待快照释放
+ *
+ * 6. bottommost_files_mark_threshold_ 的作用：
+ *    - 记录未标记文件中最小的 largest_seqno
+ *    - 当释放快照时，检查 oldest_snapshot_seqnum_ 是否超过这个阈值
+ *    - 如果超过，需要重新计算哪些文件可以被标记
+ *    - 这样可以避免每次释放快照都遍历所有文件
+ *
+ * 算法流程：
+ * 1. 清空已标记文件列表
+ * 2. 初始化阈值为最大序列号（表示所有文件都需要检查）
+ * 3. 遍历所有最底层文件：
+ *    a. 跳过正在压缩的文件
+ *    b. 跳过 largest_seqno 为 0 的文件
+ *    c. 如果 largest_seqno < oldest_snapshot_seqnum_，标记为需要压缩
+ *    d. 否则，更新阈值（取最小值）
+ * 4. 完成后，bottommost_files_marked_for_compaction_ 包含所有需要压缩的文件
+ *
+ * 应用场景：
+ * 1. 释放快照后，判断是否有新的文件可以被压缩
+ *    - UpdateOldestSnapshot() 会检查阈值，决定是否需要重新计算
+ * 2. 压缩选择器（CompactionPicker）使用这个列表选择压缩任务
+ *    - PickFilesMarkedForCompaction() 会优先选择这些文件
+ *
+ * 为什么需要这个函数：
+ * 1. 最底层文件的压缩可以回收大量空间
+ *    - 包含大量被覆盖或删除的数据
+ *    - 压缩后可以显著减少存储空间
+ * 2. 基于快照的生命周期管理
+ *    - 确保不会删除快照需要的数据
+ *    - 在快照释放后及时回收空间
+ * 3. 提高压缩效率
+ *    - 只选择真正可以回收空间的文件
+ *    - 避免无效的压缩（文件中所有数据都被引用）
+ *
+ * 性能优化：
+ * 1. 使用 bottommost_files_mark_threshold_ 避免频繁重新计算
+ * 2. 只在必要时调用（释放快照时检查阈值）
+ * 3. 使用 autovector 存储结果，避免频繁内存分配
+ *
+ * @note 此函数在 VersionStorageInfo 初始化时调用，也在释放快照时调用
+ * @note bottommost_files_ 由 GenerateBottommostFiles() 生成
+ * @see GenerateBottommostFiles() 生成最底层文件列表
+ * @see UpdateOldestSnapshot() 更新最旧快照序列号并触发重新计算
+ */
 void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction() {
+  // 清空之前计算的标记文件列表
+  // 每次重新计算时，先清空结果
   bottommost_files_marked_for_compaction_.clear();
+  // 初始化阈值为最大序列号（64 位无符号整数的最大值）
+  // kMaxSequenceNumber = (0x1ull << 56) - 1，即 2^56 - 1
+  // 初始值表示没有文件需要阈值检查（所有文件都可能被标记）
   bottommost_files_mark_threshold_ = kMaxSequenceNumber;
+
+  // 遍历所有最底层文件
+  // level_and_file 是一个 pair<int, FileMetaData*>
+  // first：文件所在的层级
+  // second：文件的元数据指针
   for (auto& level_and_file : bottommost_files_) {
+    // 检查文件是否正在被压缩（being_compacted）
+    // 如果正在被压缩，跳过该文件，避免重复压缩
+    // 检查文件的最大序列号是否为 0
+    // largest_seqno == 0 表示文件可能有特殊情况（如空文件）
+    // 这种文件不能简单地判断是否可以回收空间，因此跳过
     if (!level_and_file.second->being_compacted &&
         level_and_file.second->fd.largest_seqno != 0) {
       // largest_seqno might be nonzero due to containing the final key in an
       // earlier compaction, whose seqnum we didn't zero out. Multiple deletions
       // ensures the file really contains deleted or overwritten keys.
+      // 检查文件的最大序列号是否小于最旧快照的序列号
+      // 如果 largest_seqno < oldest_snapshot_seqnum_，说明：
+      // 1. 文件中的所有数据都早于最旧的快照
+      // 2. 这些数据不会被任何快照引用
+      // 3. 压缩这个文件可以安全地回收空间
       if (level_and_file.second->fd.largest_seqno < oldest_snapshot_seqnum_) {
+        // 将文件添加到标记列表中
+        // 这个列表将被 CompactionPicker 使用，选择需要压缩的文件
         bottommost_files_marked_for_compaction_.push_back(level_and_file);
+      // 否则（文件的最大序列号 >= 最旧快照的序列号）
+      // 说明文件中可能还有数据被快照引用，暂时不能压缩
       } else {
+        // 更新阈值为当前文件的最大序列号和已有阈值的较小值
+        // bottommost_files_mark_threshold_ 记录未标记文件中最小的 largest_seqno
+        // 作用：
+        // 1. 当释放快照时，检查 oldest_snapshot_seqnum_ 是否超过这个阈值
+        // 2. 如果超过，说明可能有新的文件满足压缩条件
+        // 3. 此时需要重新调用本函数，更新标记列表
+        // 使用 std::min 确保阈值是最小的 largest_seqno
         bottommost_files_mark_threshold_ =
             std::min(bottommost_files_mark_threshold_,
                      level_and_file.second->fd.largest_seqno);
@@ -4204,10 +5481,46 @@ bool Version::Unref() {
 bool VersionStorageInfo::OverlapInLevel(int level,
                                         const Slice* smallest_user_key,
                                         const Slice* largest_user_key) {
+  // ==================== 参数说明 ====================
+  // @param level           要检查的层号（0 = L0, 1 = L1, ..., 6 = L6）
+  // @param smallest_user_key 要检查范围的起始键（可以为 nullptr 表示没有下界）
+  // @param largest_user_key  要检查范围的结束键（可以为 nullptr 表示没有上界）
+  //
+  // ==================== 函数功能 ====================
+  // 判断指定层中是否存在文件与给定的用户键范围 [smallest_user_key, largest_user_key] 重叠
+  //
+  // ==================== 返回值 ====================
+  // @return true  - 该层存在文件与给定范围重叠
+  // @return false - 该层没有文件与给定范围重叠（包括该层为空的情况）
+  //
+  // ==================== 使用场景 ====================
+  // 1. CompactionPicker::CompactRange: 查找与压缩范围重叠的文件
+  // 2. RangeMightExistAfterSortedRun: 判断输出范围之后是否有重叠文件
+  // 3. GetOverlappingInputs: 查找所有与范围重叠的输入文件
+  //
+  // ==================== 实现逻辑 ====================
+  // L0 层（level == 0）：
+  //   - 文件之间可能重叠（disjoint_sorted_files = false）
+  //   - 使用线性扫描 O(n) 检查所有文件
+  //
+  // L1+ 层（level > 0）：
+  //   - 文件之间不重叠且有序（disjoint_sorted_files = true）
+  //   - 使用二分查找 O(log n) 快速定位
+  //
+  // ==================== 性能优化 ====================
+  // 早期检查：如果层号 >= num_non_empty_levels_，直接返回 false
+  // 这避免了不必要的函数调用，因为该层必然为空
   if (level >= num_non_empty_levels_) {
-    // empty level, no overlap
+    // 该层为空，不可能有重叠
     return false;
   }
+  // 调用底层函数进行重叠检查
+  // 参数说明：
+  //   *internal_comparator_ - 内部键比较器（考虑了 sequence number）
+  //   (level > 0)           - 层号 > 0 表示 L1+ 层，文件不重叠，可用二分查找
+  //   level_files_brief_[level] - 该层的文件元数据简表
+  //   smallest_user_key     - 范围下界
+  //   largest_user_key      - 范围上界
   return SomeFileOverlapsRange(*internal_comparator_, (level > 0),
                                level_files_brief_[level], smallest_user_key,
                                largest_user_key);
@@ -4217,76 +5530,251 @@ bool VersionStorageInfo::OverlapInLevel(int level,
 // If hint_index is specified, then it points to a file in the
 // overlapping range.
 // The file_index returns a pointer to any file in an overlapping range.
+/**
+ * @brief 查找指定层级中与给定范围 [begin, end] 重叠的文件
+ *
+ * 本函数是 RocksDB compaction 的核心工具函数，用于：
+ * 1. 查找与指定 key 范围重叠的所有文件
+ * 2. 支持 L0 和 L1+ 层的不同处理逻辑
+ * 3. 支持范围扩展（expand_range）用于 Clean Cut
+ * 4. 提供 next_smallest 输出，用于后续判断 trivial move
+ *
+ * L0 层与 L1+ 层的区别：
+ * L0 层：
+ * - 文件之间可能有 key 重叠
+ * - 使用线性扫描 + 范围扩展算法
+ * - 需要迭代扩展范围，直到稳定
+ * - next_smallest 设为 nullptr（因为文件重叠，无法确定下一个）
+ *
+ * L1+ 层：
+ * - 文件之间无 key 重叠（按范围排序）
+ * - 使用二分查找算法快速定位
+ * - 直接返回重叠范围，无需迭代
+ * - next_smallest 返回范围之后的第一个 key（用于 trivial move）
+ *
+ * 为什么 L0 和 L1+ 使用不同算法？
+ * L0 层：
+ * - 文件重叠，无法简单的二分查找
+ * - 线性扫描可以找到所有重叠文件
+ * - 范围扩展算法确保找到传递的重叠文件
+ *
+ * L1+ 层：
+ * - 文件不重叠，可以高效二分查找
+ * - 时间复杂度：O(log n) vs O(n)
+ * - 性能显著提升
+ *
+ * 范围扩展（expand_range）的作用：
+ * - 当 expand_range = true 时，每找到一个重叠文件就扩展范围
+ * - 初始范围：[user_begin, user_end]
+ * - 每次找到重叠文件后，扩展为：[min(user_begin, file_start), max(user_end, file_limit)]
+ * - 用于 ExpandInputsToCleanCut，确保找到所有传递的重叠文件
+ *
+ * hint_index 的作用：
+ * - 优化查找性能的提示索引
+ * - L1+：用于二分查找的起始位置
+ * - L0：未使用（线性扫描不需要）
+ * - 避免每次从头遍历，提高性能
+ *
+ * file_index 的作用：
+ * - 输出参数，返回找到的任何重叠文件的索引
+ * - 只记录第一个找到的文件索引
+ * - 用于后续优化查找（循环调用时传递）
+ *
+ * next_smallest 的作用：
+ * - 输出参数，范围之后的第一个 key
+ * - L0：总是 nullptr（文件重叠，无法确定）
+ * - L1+：返回范围之后的文件的最小 key
+ * - 用于判断是否可以 trivial move（无重叠则可以移动）
+ *
+ * 算法详解：
+ *
+ * L0 层算法（线性扫描 + 范围扩展）：
+ * 1. 将所有文件索引放入待检查列表（index）
+ * 2. 初始化查找范围：[user_begin, user_end]
+ * 3. 遍历待检查列表：
+ *    a. 跳过完全在范围左边的文件
+ *    b. 跳过完全在范围右边的文件
+ *    c. 如果重叠：
+ *       - 添加到 inputs
+ *       - 记录第一个文件的索引到 file_index
+ *       - 从待检查列表中移除
+ *       - 如果 expand_range，扩展查找范围
+ * 4. 重复步骤 3，直到找不到重叠文件
+ *
+ * 判断重叠的条件：
+ * - 文件在范围左边：file_limit < user_begin
+ * - 文件在范围右边：file_start > user_end
+ * - 重叠：否则（部分或完全包含）
+ *
+ * L1+ 层算法（二分查找）：
+ * - 调用 GetOverlappingInputsRangeBinarySearch
+ * - 使用 std::lower_bound 和 std::upper_bound
+ * - 时间复杂度：O(log n)
+ * - 详见该函数的注释
+ *
+ * 为什么 L0 使用 std::list 而不是 std::vector？
+ * - L0 需要频繁删除元素（找到重叠文件后移除）
+ * - std::list::erase 是 O(1)，std::vector::erase 是 O(n)
+ * - 虽然文件数量少，但使用 list 更高效
+ *
+ * 为什么 CompareWithoutTimestamp 而不是 Compare？
+ * - L0 层的文件排序基于 InternalKey（包含 seqno 和 type）
+ * - user key 比较忽略 seqno 和 type，只比较 user_key
+ * - 这样可以正确找到所有 user key 重叠的文件
+ * - 避免因为 seqno 或 type 导致的误判
+ *
+ * @param level 查找的层级（0 = L0, 1 = L1, ...）
+ * @param begin 查找范围的起始 key（可为 null，表示无下限）
+ * @param end 查找范围的结束 key（可为 null，表示无上限）
+ * @param inputs 输出参数：找到的重叠文件列表（会被清空）
+ * @param hint_index 优化查找的提示索引（L1+ 使用）
+ * @param file_index 输出参数：找到的第一个重叠文件的索引（可为 null）
+ * @param expand_range 是否扩展查找范围（true：每找到文件就扩展范围）
+ * @param next_smallest 输出参数：范围之后的第一个 key（用于 trivial move）
+ *
+ * @note 输入参数 begin 和 end 的类型是 InternalKey：
+ *   - InternalKey 包含：user_key, sequence_number, value_type
+ *   - 比较时使用 ExtractUserKey 获取纯 user_key 部分
+ *   - 这确保比较基于 user key，忽略 seqno 和 type
+ *
+ * @note L0 和 L1+ 的处理差异：
+ *   - L0：线性扫描，文件可能重叠，next_smallest = nullptr
+ *   - L1+：二分查找，文件不重叠，next_smallest 有效
+ *
+ * @note expand_range 的作用：
+ *   - 扩展查找范围，确保找到所有传递的重叠文件
+ *   - 用于 ExpandInputsToCleanCut 实现 Clean Cut
+ *   - 示例：范围 [a, c]，文件 [b, d] 也重叠
+ *           （因为文件 [b, d] 与范围 [a, c] 重叠）
+ *           扩展后范围变为 [a, d]，找到文件 [b, d]
+ *
+ * @note 为什么使用 CompareWithoutTimestamp：
+ *   - 只比较 user_key，忽略 timestamp（如果启用）
+ *   - timestamp 是 user_key 的一部分，但在比较时忽略
+ *   - 确保找到所有相同 user key 的文件，无论 timestamp
+ *
+ * @see GetOverlappingInputsRangeBinarySearch L1+ 的二分查找实现
+ * @see ExpandInputsToCleanCut 使用此函数实现 Clean Cut
+ * @see level_files_brief_ 紧凑的文件元数据结构
+ */
 void VersionStorageInfo::GetOverlappingInputs(
     int level, const InternalKey* begin, const InternalKey* end,
     std::vector<FileMetaData*>* inputs, int hint_index, int* file_index,
     bool expand_range, InternalKey** next_smallest) const {
+  // 检查指定层级是否存在（是否为空层）
+  // 如果层级大于等于非空层数，说明该层是空的，直接返回
   if (level >= num_non_empty_levels_) {
     // this level is empty, no overlapping inputs
     return;
   }
 
+  // 清空输出参数 inputs，确保之前的内容不影响结果
   inputs->clear();
+  // 如果 file_index 不为空，初始化为 -1（表示未找到文件）
+  // file_index 用于记录找到的第一个重叠文件的索引
   if (file_index) {
     *file_index = -1;
   }
+  // 获取用户比较器（用于比较 user key）
   const Comparator* user_cmp = user_comparator_;
+  // 如果层级大于 0（L1+ 层），使用二分查找算法
+  // L1+ 层的文件之间没有 key 重叠，可以使用二分查找快速定位
   if (level > 0) {
+    // 调用二分查找函数查找重叠文件
+    // L1+ 层使用二分查找，时间复杂度 O(log n)
     GetOverlappingInputsRangeBinarySearch(level, begin, end, inputs, hint_index,
                                           file_index, false, next_smallest);
+    // 查找完成，直接返回
     return;
   }
 
+  // L0 层的处理
+  // 如果 next_smallest 不为空，设为 nullptr
+  // next_smallest 只对非 L0 层有意义（因为 L0 文件重叠，无法确定下一个最小 key）
   if (next_smallest) {
     // next_smallest key only makes sense for non-level 0, where files are
     // non-overlapping
     *next_smallest = nullptr;
   }
 
+// L0 层的处理：文件可能重叠，使用线性扫描算法
+  // 定义查找范围的起止 user key
   Slice user_begin, user_end;
+  // 如果 begin 不为空，再次提取 user_key（上面的重复代码保留原样）
   if (begin != nullptr) {
     user_begin = begin->user_key();
   }
+  // 如果 end 不为空，再次提取 user_key（重复代码，保持原样）
   if (end != nullptr) {
     user_end = end->user_key();
   }
 
   // index stores the file index need to check.
+  // 将 L0 层所有文件的索引添加到待检查列表中
   std::list<size_t> index;
+  // 遍历 L0 层的所有文件，将其索引添加到 index 列表中
   for (size_t i = 0; i < level_files_brief_[level].num_files; i++) {
+    // 将文件索引添加到待检查列表末尾
     index.emplace_back(i);
   }
 
+  // 主循环：不断检查待检查列表中的文件，直到找不到重叠文件
+  // 这个循环是范围扩展算法的核心
+  // 每次找到重叠文件后，如果 expand_range=true，会扩展查找范围
+  // 然后重新扫描待检查列表，直到没有新的重叠文件
   while (!index.empty()) {
+    // 标记本次循环是否找到重叠文件
     bool found_overlapping_file = false;
+    // 从待检查列表的开头开始遍历
     auto iter = index.begin();
+    // 遍历待检查列表中的每个文件索引
     while (iter != index.end()) {
+      // 获取文件元数据指针（FdWithKeyRange 是紧凑的文件元数据结构）
       FdWithKeyRange* f = &(level_files_brief_[level].files[*iter]);
+      // 提取文件的最小 key 的 user key 部分
       const Slice file_start = ExtractUserKey(f->smallest_key);
+      // 提取文件的最大 key 的 user key 部分
       const Slice file_limit = ExtractUserKey(f->largest_key);
+      // 如果查找范围有下限，且文件的最大 key 小于查找范围的下限
+      // 说明文件完全在查找范围的左边，不需要合并
       if (begin != nullptr &&
           user_cmp->CompareWithoutTimestamp(file_limit, user_begin) < 0) {
         // "f" is completely before specified range; skip it
+        // 文件在查找范围左边，跳过，检查下一个文件
         iter++;
+      // 如果查找范围有上限，且文件的最小 key 大于查找范围的上限
+      // 说明文件完全在查找范围的右边，不需要合并
       } else if (end != nullptr &&
                  user_cmp->CompareWithoutTimestamp(file_start, user_end) > 0) {
         // "f" is completely after specified range; skip it
+        // 文件在查找范围右边，跳过，检查下一个文件
         iter++;
+      // 否则，文件与查找范围有重叠（或包含关系）
       } else {
         // if overlap
+        // 将文件添加到输出列表 inputs
         inputs->emplace_back(files_[level][*iter]);
+        // 标记找到了重叠文件
         found_overlapping_file = true;
         // record the first file index.
+        // 如果是第一个找到的文件，且 file_index 不为空，记录文件索引
         if (file_index && *file_index == -1) {
           *file_index = static_cast<int>(*iter);
         }
         // the related file is overlap, erase to avoid checking again.
+        // 将找到的文件从待检查列表中删除，避免重复检查
         iter = index.erase(iter);
+        // 如果启用了范围扩展
+        // 扩展查找范围，确保找到所有传递的重叠文件
         if (expand_range) {
+          // 如果文件的最小 key 小于当前查找范围的下限
+          // 扩展查找范围的下限到文件的最小 key
           if (begin != nullptr &&
               user_cmp->CompareWithoutTimestamp(file_start, user_begin) < 0) {
             user_begin = file_start;
           }
+          // 如果文件的最大 key 大于当前查找范围的上限
+          // 扩展查找范围的上限到文件的最大 key
           if (end != nullptr &&
               user_cmp->CompareWithoutTimestamp(file_limit, user_end) > 0) {
             user_end = file_limit;
@@ -4295,6 +5783,8 @@ void VersionStorageInfo::GetOverlappingInputs(
       }
     }
     // if all the files left are not overlap, break
+    // 如果本次循环没有找到任何重叠文件，说明已经找到所有传递的重叠文件
+    // 退出外层循环，避免无效的迭代
     if (!found_overlapping_file) {
       break;
     }
@@ -4336,97 +5826,162 @@ void VersionStorageInfo::GetOverlappingInputsRangeBinarySearch(
     int level, const InternalKey* begin, const InternalKey* end,
     std::vector<FileMetaData*>* inputs, int hint_index, int* file_index,
     bool within_interval, InternalKey** next_smallest) const {
+  // 断言层级必须大于 0
+  // 这个函数只用于 L1+ 层，L0 层使用线性扫描算法
   assert(level > 0);
 
+  // 获取用户比较器（用于比较 InternalKey）
   auto user_cmp = user_comparator_;
+  // 获取指定层级的文件数组（紧凑的文件元数据结构）
   const FdWithKeyRange* files = level_files_brief_[level].files;
+  // 获取该层级的文件数量（转换为 int 类型）
   const int num_files = static_cast<int>(level_files_brief_[level].num_files);
 
   // begin to use binary search to find lower bound
   // and upper bound.
+  // 初始化查找范围的起始索引（默认为 0）
   int start_index = 0;
+  // 初始化查找范围的结束索引（默认为文件总数）
   int end_index = num_files;
 
+  // 如果查找范围有下限（begin 不为空）
+  // 使用二分查找确定 start_index
   if (begin != nullptr) {
     // if within_interval is true, with file_key would find
     // not overlapping ranges in std::lower_bound.
+    // 定义比较函数，用于 std::lower_bound
+    // 根据是否使用 within_interval 模式，选择比较文件的最大 key 或最小 key
     auto cmp = [&user_cmp, &within_interval](const FdWithKeyRange& f,
                                              const InternalKey* k) {
+      // 如果启用 within_interval，使用文件的最小 key 进行比较
+      // 否则使用文件的最大 key 进行比较
       auto& file_key = within_interval ? f.file_metadata->smallest
                                        : f.file_metadata->largest;
+      // 使用 sstableKeyCompare 比较 file_key 和 k
+      // 返回 true 表示 file_key < k（升序排序）
       return sstableKeyCompare(user_cmp, file_key, *k) < 0;
     };
 
+    // 使用 std::lower_bound 二分查找第一个 >= begin 的文件
+    // 搜索范围：从 files 开始，到 hint_index 或 num_files 结束
+    // hint_index 是提示索引，用于优化查找性能
     start_index = static_cast<int>(
         std::lower_bound(files,
                          files + (hint_index == -1 ? num_files : hint_index),
                          begin, cmp) -
         files);
 
+    // 如果 start_index > 0 且启用了 within_interval 模式
+    // 需要检查 start_index 之前的文件是否与 start_index 处的文件重叠
+    // 这是为了确保 clean cut（不分割 user key）
     if (start_index > 0 && within_interval) {
+      // 初始化重叠标志为 true
       bool is_overlapping = true;
+      // 向前检查，直到找到不重叠的文件
       while (is_overlapping && start_index < num_files) {
+        // 获取前一个文件的最大 key
         auto& pre_limit = files[start_index - 1].file_metadata->largest;
+        // 获取当前文件的最小 key
         auto& cur_start = files[start_index].file_metadata->smallest;
+        // 检查两个文件是否重叠（最大 key 是否等于最小 key）
+        // sstableKeyCompare 返回 0 表示相等
         is_overlapping = sstableKeyCompare(user_cmp, pre_limit, cur_start) == 0;
+        // 如果重叠，start_index 向前移动（包含前一个文件）
         start_index += is_overlapping;
       }
     }
   }
 
+  // 如果查找范围有上限（end 不为空）
+  // 使用二分查找确定 end_index
   if (end != nullptr) {
     // if within_interval is true, with file_key would find
     // not overlapping ranges in std::upper_bound.
+    // 定义比较函数，用于 std::upper_bound
+    // 根据是否使用 within_interval 模式，选择比较文件的最大 key 或最小 key
     auto cmp = [&user_cmp, &within_interval](const InternalKey* k,
                                              const FdWithKeyRange& f) {
+      // 如果启用 within_interval，使用文件的最大 key 进行比较
+      // 否则使用文件的最小 key 进行比较
       auto& file_key = within_interval ? f.file_metadata->largest
                                        : f.file_metadata->smallest;
+      // 使用 sstableKeyCompare 比较 k 和 file_key
+      // 返回 true 表示 k < file_key（升序排序）
       return sstableKeyCompare(user_cmp, *k, file_key) < 0;
     };
 
+    // 使用 std::upper_bound 二分查找第一个 > end 的文件
+    // 搜索范围：从 start_index 开始，到 num_files 结束
     end_index = static_cast<int>(
         std::upper_bound(files + start_index, files + num_files, end, cmp) -
         files);
 
+    // 如果 end_index < num_files 且启用了 within_interval 模式
+    // 需要检查 end_index 处的文件是否与 end_index - 1 处的文件重叠
+    // 这是为了确保 clean cut（不分割 user key）
     if (end_index < num_files && within_interval) {
+      // 初始化重叠标志为 true
       bool is_overlapping = true;
+      // 向后检查，直到找到不重叠的文件
       while (is_overlapping && end_index > start_index) {
+        // 获取下一个文件的最小 key
         auto& next_start = files[end_index].file_metadata->smallest;
+        // 获取当前文件的最大 key
         auto& cur_limit = files[end_index - 1].file_metadata->largest;
+        // 检查两个文件是否重叠（最大 key 是否等于最小 key）
         is_overlapping =
             sstableKeyCompare(user_cmp, cur_limit, next_start) == 0;
+        // 如果重叠，end_index 向后移动（包含下一个文件）
         end_index -= is_overlapping;
       }
     }
   }
 
+  // 断言 start_index <= end_index
+  // 这是一个基本的逻辑检查，确保查找范围有效
   assert(start_index <= end_index);
 
   // If there were no overlapping files, return immediately.
+  // 如果没有找到重叠文件（start_index == end_index），直接返回
   if (start_index == end_index) {
+    // 如果 next_smallest 不为空，设为 nullptr（没有文件，也没有下一个最小 key）
     if (next_smallest) {
       *next_smallest = nullptr;
     }
     return;
   }
 
+  // 断言 start_index < end_index
+  // 如果执行到这里，说明找到了重叠文件
   assert(start_index < end_index);
 
   // returns the index where an overlap is found
+  // 如果 file_index 不为空，记录找到的第一个重叠文件的索引
   if (file_index) {
     *file_index = start_index;
   }
 
   // insert overlapping files into vector
+  // 将 [start_index, end_index) 范围内的文件添加到输出列表 inputs
   for (int i = start_index; i < end_index; i++) {
+    // 将文件指针添加到 inputs 向量末尾
     inputs->push_back(files_[level][i]);
   }
 
+  // 如果 next_smallest 不为空（需要返回范围之外的下一个最小 key）
   if (next_smallest != nullptr) {
     // Provide the next key outside the range covered by inputs
+    // 检查 end_index 是否小于该层的文件总数
+    // 即是否还有文件在查找范围之外
     if (end_index < static_cast<int>(files_[level].size())) {
+      // 返回 end_index 处文件的最小 key
+      // 这是在查找范围之外的第一个文件的最小 key
+      // 用于判断是否可以 trivial move（如果无重叠则可以）
       **next_smallest = files_[level][end_index]->smallest;
+    // 如果 end_index 已经是最后一个文件的索引
+    // 说明没有更多文件了
     } else {
+      // 设为 nullptr（范围之后没有文件）
       *next_smallest = nullptr;
     }
   }
@@ -4781,31 +6336,78 @@ uint64_t VersionStorageInfo::EstimateLiveDataSize() const {
 bool VersionStorageInfo::RangeMightExistAfterSortedRun(
     const Slice& smallest_user_key, const Slice& largest_user_key,
     int last_level, int last_l0_idx) {
+  // 断言：last_l0_idx为-1当且仅当last_level不为0
+  // 这确保了L0层的特殊参数last_l0_idx只在last_level=0时使用
   assert((last_l0_idx != -1) == (last_level == 0));
-  // TODO(ajkr): this preserves earlier behavior where we considered an L0 file
-  // bottommost only if it's the oldest L0 file and there are no files on older
-  // levels. It'd be better to consider it bottommost if there's no overlap in
-  // older levels/files.
+  
+  // ==================== L0层特殊处理 ====================
+  // L0层的文件是无序的，可能互相重叠，无法简单地按范围判断
+  // 当前的保守策略：只有当L0文件是最老的文件（last_l0_idx == LevelFiles(0).size() - 1）
+  // 且更深层（L1, L2, ...）没有文件时，才认为是bottommost
+  //
+  // TODO(ajkr): 这个判断过于保守。理想情况下，应该检查L0输出范围是否与
+  // 更深层的文件有重叠。如果有重叠，就不是bottommost；如果没有重叠，可以是bottommost。
+  // 当前的实现要求必须是L0层最后一个文件才能是bottommost，限制过于严格。
+  //
+  // 例如场景：
+  //   L0: [file_a, file_b, file_c]  (假设file_c是最新文件)
+  //   如果file_b的输出范围与L1-L6所有文件都不重叠，理论上可以是bottommost
+  //   但当前实现会返回false（因为file_b不是最后一个文件）
   if (last_level == 0 &&
       last_l0_idx != static_cast<int>(LevelFiles(0).size() - 1)) {
+    // L0层且不是最后一个文件，说明之后还有L0文件
+    // 这些文件可能包含更新的数据或与当前范围重叠
+    // 因此，当前范围之后可能存在数据，返回true
     return true;
   }
 
-  // Checks whether there are files living beyond the `last_level`. If lower
-  // levels have files, it checks for overlap between [`smallest_key`,
-  // `largest_key`] and those files. Bottomlevel optimizations can be made if
-  // there are no files in lower levels or if there is no overlap with the files
-  // in the lower levels.
+  // ==================== 检查更深层次的文件 ====================
+  // 从 last_level + 1 开始，逐层检查是否有文件与给定范围重叠
+  //
+  // 对于Level压缩风格（Leveled Compaction）：
+  //   - last_level = 0: 检查L1, L2, L3, ..., L6是否有文件
+  //     * 只要L1-L6任何一层有文件，就返回true（因为L0文件总是可能被覆盖）
+  //   - last_level = 5: 检查L6是否有文件与[smallest_user_key, largest_user_key]重叠
+  //     * L6有文件且不重叠 -> 返回false（是bottommost）
+  //     * L6有文件且重叠 -> 返回true（不是bottommost）
+  //   - last_level = 6: L6是最后一层，没有更深的层，直接返回false（是bottommost）
+  //
+  // 对于Universal压缩风格（Universal Compaction）：
+  //   - sorted run按年龄排序，编号0是最老的，编号n是最新的
+  //   - last_level表示当前sorted run的编号
+  //   - 检查编号 > last_level 的所有sorted run是否与给定范围重叠
+  //   - 如果有任何后续sorted run重叠，说明数据可能被覆盖，返回true
+  //   - 如果所有后续sorted run都不重叠，说明这是最底层的run，返回false
+  //
+  // Bottommost优化的前提：
+  //   1. 更深层（last_level + 1 及之后）没有文件，或
+  //   2. 更深层的文件与[smallest_user_key, largest_user_key]没有重叠
+  //   此时可以安全地进行bottommost优化（如删除旧数据、移除tombstone等）
   for (int level = last_level + 1; level < num_levels(); level++) {
-    // The range is not in the bottommost level if there are files in lower
-    // levels when the `last_level` is 0 or if there are files in lower levels
-    // which overlap with [`smallest_key`, `largest_key`].
+    // 判断是否可能存在后续数据的逻辑：
+    // 条件1：该层有文件（files_[level].size() > 0）
+    // 条件2（满足其一即可）：
+    //   A) last_level == 0: L0层的任何情况下，只要更深层有文件就返回true
+    //      因为L0文件是无序的，无法保证与深层文件的重叠关系
+    //   B) OverlapInLevel返回true: 该层存在文件与给定范围重叠
+    //
+    // 示例场景（Level压缩）：
+    //   last_level = 5, 范围 = [key_a, key_b]
+    //   L6文件: file_1: [key_x, key_y] (不重叠) -> 继续检查
+    //         file_2: [key_a, key_c] (重叠!) -> 返回true（不是bottommost）
+    //
+    //   last_level = 5, 范围 = [key_a, key_b]
+    //   L6文件: file_1: [key_x, key_y] (不重叠)
+    //         file_2: [key_z, key_w] (不重叠)
+    //   循环结束，返回false（是bottommost）
     if (files_[level].size() > 0 &&
         (last_level == 0 ||
          OverlapInLevel(level, &smallest_user_key, &largest_user_key))) {
       return true;
     }
   }
+  // 所有更深层次的检查都通过，没有发现与给定范围重叠的文件
+  // 说明该范围之后不存在数据，是bottommost level
   return false;
 }
 

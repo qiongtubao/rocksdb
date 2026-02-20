@@ -614,76 +614,147 @@ void CompactionJob::GenSubcompactionBoundaries() {
 }
 
 Status CompactionJob::Run() {
+  // ===== 压缩任务执行函数 =====
+  //
+  // 该函数是压缩任务的核心执行函数，负责：
+  // 1. 并行执行多个子压缩（subcompaction）
+  // 2. 验证输出的 SSTable 文件
+  // 3. 收集统计信息
+  // 4. 清理资源
+  //
+  // 并行执行策略：
+  // - 将一个大压缩任务分解为多个子压缩
+  // - 每个子压缩处理不同的键范围
+  // - 使用多个线程并行执行子压缩
+  // - 第一个子压缩在当前线程执行（节省资源）
+  // - 其余子压缩在工作线程池中执行
+  //
+  // 子压缩（Subcompaction）概念：
+  // - 为了利用多核 CPU，将大范围压缩拆分为多个子任务
+  // - 每个子压缩独立处理一个键范围
+  // - 所有子压缩的输出文件共同构成完整的压缩结果
+
+  // 1. 更新线程操作阶段
+  // 用于线程状态监控，表明当前处于压缩执行阶段
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_RUN);
+
+  // 2. 测试同步点（用于单元测试）
   TEST_SYNC_POINT("CompactionJob::Run():Start");
+
+  // 3. 将日志缓冲区刷新到日志文件
   log_buffer_->FlushBufferToLog();
+
+  // 4. 记录压缩开始信息（压缩范围、涉及的文件等）
   LogCompaction();
 
+  // 5. 获取子压缩数量
+  // 至少有一个子压缩（num_threads > 0）
   const size_t num_threads = compact_->sub_compact_states.size();
   assert(num_threads > 0);
+
+  // 6. 记录开始时间，用于统计压缩耗时
   const uint64_t start_micros = db_options_.clock->NowMicros();
 
+  // ===== 第一阶段：并行执行子压缩 =====
+
   // Launch a thread for each of subcompactions 1...num_threads-1
+  // 为每个子压缩（除了第一个）启动一个工作线程
+
+  // 准备线程池，预留足够的空间
   std::vector<port::Thread> thread_pool;
   thread_pool.reserve(num_threads - 1);
+
+  // 为子压缩 1...num_threads-1 启动工作线程
   for (size_t i = 1; i < compact_->sub_compact_states.size(); i++) {
+    // 创建线程并执行 ProcessKeyValueCompaction
+    // 每个线程处理一个子压缩的范围
     thread_pool.emplace_back(&CompactionJob::ProcessKeyValueCompaction, this,
                              &compact_->sub_compact_states[i]);
   }
 
   // Always schedule the first subcompaction (whether or not there are also
   // others) in the current thread to be efficient with resources
+  // 总是在当前线程执行第一个子压缩（无论是否有其他子压缩）
+  // 这样可以：
+  // 1. 节省一个线程的资源（复用当前线程）
+  // 2. 避免线程上下文切换的开销
+  // 3. 减少线程池的负载
   ProcessKeyValueCompaction(&compact_->sub_compact_states[0]);
 
   // Wait for all other threads (if there are any) to finish execution
+  // 等待所有工作线程完成
   for (auto& thread : thread_pool) {
     thread.join();
   }
 
+  // ===== 第二阶段：收集统计信息 =====
+
+  // 7. 计算压缩总耗时
   compaction_stats_.SetMicros(db_options_.clock->NowMicros() - start_micros);
 
+  // 8. 聚合所有子压缩的 CPU 时间
+  // 移除每个子压缩的最后一个空输出文件（如果有）
   for (auto& state : compact_->sub_compact_states) {
     compaction_stats_.AddCpuMicros(state.compaction_job_stats.cpu_micros);
     state.RemoveLastEmptyOutput();
   }
 
+  // 9. 记录压缩时间到直方图
+  // COMPACTION_TIME：压缩的墙钟时间（Wall Clock Time）
+  // COMPACTION_CPU_TIME：压缩的 CPU 时间
   RecordTimeToHistogram(stats_, COMPACTION_TIME,
                         compaction_stats_.stats.micros);
   RecordTimeToHistogram(stats_, COMPACTION_CPU_TIME,
                         compaction_stats_.stats.cpu_micros);
 
+  // ===== 第三阶段：验证和同步 =====
+
+  // 10. 测试同步点：验证前
   TEST_SYNC_POINT("CompactionJob::Run:BeforeVerify");
 
   // Check if any thread encountered an error during execution
-  Status status;
-  IOStatus io_s;
-  bool wrote_new_blob_files = false;
+  // 检查是否有线程在执行过程中遇到错误
 
+  Status status; // 压缩状态（返回值）
+  IOStatus io_s; // I/O 状态
+  bool wrote_new_blob_files = false; // 是否写了新的 blob 文件
+
+  // 遍历所有子压缩状态，检查错误
   for (const auto& state : compact_->sub_compact_states) {
     if (!state.status.ok()) {
+      // 发现错误，记录并跳出
       status = state.status;
       io_s = state.io_status;
       break;
     }
 
+    // 检查是否生成了新的 blob 文件
+    // Blob 文件用于存储大值（large values），与 SSTable 分离
     if (state.Current().HasBlobFileAdditions()) {
       wrote_new_blob_files = true;
     }
   }
 
+  // 11. 同步 I/O 状态
   if (io_status_.ok()) {
     io_status_ = io_s;
   }
+
+  // 12. 如果没有错误，执行目录同步（fsync）
   if (status.ok()) {
     constexpr IODebugContext* dbg = nullptr;
 
+    // 同步输出目录
+    // 确保新创建的 SSTable 文件元数据已持久化到磁盘
     if (output_directory_) {
       io_s = output_directory_->FsyncWithDirOptions(
           IOOptions(), dbg,
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
 
+    // 如果有新的 blob 文件且 blob 目录与输出目录不同，同步 blob 目录
+    // Blob 目录可能存储在不同的磁盘上，需要单独同步
     if (io_s.ok() && wrote_new_blob_files && blob_output_directory_ &&
         blob_output_directory_ != output_directory_) {
       io_s = blob_output_directory_->FsyncWithDirOptions(
@@ -691,39 +762,67 @@ Status CompactionJob::Run() {
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
   }
+
+  // 更新 I/O 状态
   if (io_status_.ok()) {
     io_status_ = io_s;
   }
+
+  // 更新压缩状态
   if (status.ok()) {
     status = io_s;
   }
+
+  // ===== 第四阶段：验证输出文件 =====
+
+  // 13. 如果没有错误，验证所有输出的 SSTable 文件
   if (status.ok()) {
+    // 清空线程池，复用之前的线程池变量
     thread_pool.clear();
+
+    // 收集所有输出的文件
     std::vector<const CompactionOutputs::Output*> files_output;
     for (const auto& state : compact_->sub_compact_states) {
       for (const auto& output : state.GetOutputs()) {
         files_output.emplace_back(&output);
       }
     }
+
+    // 获取列族信息和前缀提取器
     ColumnFamilyData* cfd = compact_->compaction->column_family_data();
     auto& prefix_extractor =
         compact_->compaction->mutable_cf_options()->prefix_extractor;
+
+    // 原子计数器，用于在多线程中分配文件索引
     std::atomic<size_t> next_file_idx(0);
+
+    // 定义验证函数：验证单个 SSTable 文件
     auto verify_table = [&](Status& output_status) {
       while (true) {
+        // 原子地获取下一个要验证的文件索引
         size_t file_idx = next_file_idx.fetch_add(1);
         if (file_idx >= files_output.size()) {
-          break;
+          break; // 所有文件都已处理完毕
         }
+
         // Verify that the table is usable
+        // 验证表是否可用（可以正常打开和读取）
         // We set for_compaction to false and don't
         // OptimizeForCompactionTableRead here because this is a special case
         // after we finish the table building No matter whether
         // use_direct_io_for_flush_and_compaction is true, we will regard this
         // verification as user reads since the goal is to cache it here for
         // further user reads
+        //
+        // 这里将验证视为用户读取，目的是：
+        // 1. 将文件预加载到缓存中（块缓存、页缓存）
+        // 2. 避免后续用户读取时重复打开文件
+        // 3. 提前发现文件损坏问题
+
         const ReadOptions verify_table_read_options(
             Env::IOActivity::kCompaction);
+
+        // 创建表的迭代器
         InternalIterator* iter = cfd->table_cache()->NewIterator(
             verify_table_read_options, file_options_,
             cfd->internal_comparator(), files_output[file_idx]->meta,
@@ -740,44 +839,66 @@ Status CompactionJob::Run() {
             /*allow_unprepared_value=*/false,
             compact_->compaction->mutable_cf_options()
                 ->block_protection_bytes_per_key);
+
+        // 检查迭代器状态
         auto s = iter->status();
 
+        // 如果启用偏执文件检查（paranoid_file_checks_）
+        // 进行更严格的验证（顺序检查和哈希校验）
         if (s.ok() && paranoid_file_checks_) {
+          // 创建输出验证器
           OutputValidator validator(cfd->internal_comparator(),
                                     /*_enable_order_check=*/true,
                                     /*_enable_hash=*/true);
+
+          // 遍历表中的所有键值对
           for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
             s = validator.Add(iter->key(), iter->value());
             if (!s.ok()) {
               break;
             }
           }
+
+          // 检查迭代器状态
           if (s.ok()) {
             s = iter->status();
           }
+
+          // 比较校验结果
+          // 将验证时的校验和与压缩时计算的校验和进行比较
           if (s.ok() &&
               !validator.CompareValidator(files_output[file_idx]->validator)) {
             s = Status::Corruption("Paranoid checksums do not match");
           }
         }
 
+        // 删除迭代器
         delete iter;
 
+        // 如果验证失败，记录错误并退出
         if (!s.ok()) {
           output_status = s;
           break;
         }
       }
     };
+
+    // 并行验证输出文件
+    // 为子压缩 1...num_threads-1 启动验证线程
     for (size_t i = 1; i < compact_->sub_compact_states.size(); i++) {
       thread_pool.emplace_back(
           verify_table, std::ref(compact_->sub_compact_states[i].status));
     }
+
+    // 在当前线程验证第一个子压缩的输出
     verify_table(compact_->sub_compact_states[0].status);
+
+    // 等待所有验证线程完成
     for (auto& thread : thread_pool) {
       thread.join();
     }
 
+    // 检查验证结果
     for (const auto& state : compact_->sub_compact_states) {
       if (!state.status.ok()) {
         status = state.status;
@@ -786,87 +907,195 @@ Status CompactionJob::Run() {
     }
   }
 
+  // ===== 第五阶段：清理和收尾 =====
+
+  // 14. 释放子压缩资源
+  // 包括：迭代器、输出文件句柄等
   ReleaseSubcompactionResources();
+
+  // 测试同步点
   TEST_SYNC_POINT("CompactionJob::ReleaseSubcompactionResources:0");
   TEST_SYNC_POINT("CompactionJob::ReleaseSubcompactionResources:1");
 
+  // 15. 收集所有输出表的属性（Table Properties）
+  // Table Properties 包含表的元数据，如：
+  // - 数据大小、键数量、值数量
+  // - 压缩率
+  // - 索引/过滤器块信息
+  // - 用户定义的属性等
   TablePropertiesCollection tp;
   for (const auto& state : compact_->sub_compact_states) {
     for (const auto& output : state.GetOutputs()) {
+      // 构建完整的文件名
       auto fn =
           TableFileName(state.compaction->immutable_options()->cf_paths,
                         output.meta.fd.GetNumber(), output.meta.fd.GetPathId());
+      // 将表属性添加到集合中
       tp[fn] = output.table_properties;
     }
   }
+
+  // 设置压缩任务的输出表属性
   compact_->compaction->SetOutputTableProperties(std::move(tp));
 
+  // 16. 聚合压缩统计信息
   // Finish up all book-keeping to unify the subcompaction results
+  // 将所有子压缩的统计信息合并到总统计中
   compact_->AggregateCompactionStats(compaction_stats_, *compaction_job_stats_);
+
+  // 更新压缩统计（更新到列族统计中）
   UpdateCompactionStats();
 
+  // 17. 记录 I/O 统计
   RecordCompactionIOStats();
+
+  // 18. 刷新日志
   LogFlush(db_options_.info_log);
+
+  // 测试同步点：压缩结束
   TEST_SYNC_POINT("CompactionJob::Run():End");
+
+  // 19. 设置压缩状态
   compact_->status = status;
+
+  // 测试同步点：状态设置后
   TEST_SYNC_POINT_CALLBACK("CompactionJob::Run():EndStatusSet", &status);
+
+  // 返回压缩状态
   return status;
 }
 
 Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
+  // ===== 安装压缩结果函数 =====
+  //
+  // 该函数是压缩任务的最后一步，负责：
+  // 1. 将压缩结果应用到 LSM 树（更新版本信息）
+  // 2. 记录压缩统计信息
+  // 3. 计算并记录放大因子（读放、写放、读写放）
+  // 4. 记录日志和事件
+  // 5. 清理压缩资源
+  //
+  // 必须在持有数据库锁（db_mutex_）的情况下调用
+  //
+  // 安装过程：
+  // - 调用 InstallCompactionResults() 更新版本
+  // - 更新列族的统计信息
+  // - 记录压缩指标（放大因子、吞吐量等）
+  // - 通知事件监听器
+
+  // 1. 断言检查：确保 compact_ 指针有效
   assert(compact_);
 
+  // 2. 更新线程操作阶段
+  // 标记当前处于压缩安装阶段
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_INSTALL);
+
+  // 3. 断言：确保持有数据库锁
+  // 安装压缩结果需要修改版本信息，必须在持有锁的情况下进行
   db_mutex_->AssertHeld();
+
+  // 4. 获取压缩状态
+  // 这是 Run() 函数中设置的压缩执行结果
   Status status = compact_->status;
 
+  // 5. 获取列族数据指针
   ColumnFamilyData* cfd = compact_->compaction->column_family_data();
   assert(cfd);
 
+  // 6. 获取输出层号
   int output_level = compact_->compaction->output_level();
+
+  // 7. 将压缩统计信息添加到列族的内部统计中
+  // 包括：压缩耗时、IO 统计、数据量等
+  // thread_pri_：压缩线程的优先级（用于区分不同类型的压缩）
   cfd->internal_stats()->AddCompactionStats(output_level, thread_pri_,
                                             compaction_stats_);
 
+  // 8. 如果压缩成功，安装压缩结果
+  // InstallCompactionResults() 会：
+  // - 创建新的 Version
+  // - 将输出文件添加到 Version
+  // - 删除输入文件
+  // - 应用 VersionEdit 到 VersionSet
+  // - 切换当前 Version
   if (status.ok()) {
     status = InstallCompactionResults(mutable_cf_options);
   }
+
+  // 9. 检查 VersionSet 的 I/O 状态
+  // 如果 VersionSet 有 I/O 错误，传播到压缩任务的 I/O 状态
   if (!versions_->io_status().ok()) {
     io_status_ = versions_->io_status();
   }
 
+  // ===== 计算和记录统计信息 =====
+
+  // 10. 获取当前版本的存储信息和压缩统计数据
   VersionStorageInfo::LevelSummaryStorage tmp;
   auto vstorage = cfd->current()->storage_info();
   const auto& stats = compaction_stats_.stats;
 
-  double read_write_amp = 0.0;
-  double write_amp = 0.0;
-  double bytes_read_per_sec = 0;
-  double bytes_written_per_sec = 0;
+  // 11. 初始化统计变量
+  double read_write_amp = 0.0; // 读写放大因子
+  double write_amp = 0.0;      // 写放大因子
+  double bytes_read_per_sec = 0;    // 读取吞吐量（字节/秒）
+  double bytes_written_per_sec = 0; // 写入吞吐量（字节/秒）
 
+  // 12. 计算读取的字节数
+  // bytes_read_non_output_and_blob：非输出层（输入层）+ Blob 文件的读取字节数
+  // bytes_read_all：所有来源的读取字节数（包括输出层）
   const uint64_t bytes_read_non_output_and_blob =
       stats.bytes_read_non_output_levels + stats.bytes_read_blob;
   const uint64_t bytes_read_all =
       stats.bytes_read_output_level + bytes_read_non_output_and_blob;
+
+  // 13. 计算写入的字节数
+  // bytes_written_all：所有写入字节数（SSTable + Blob 文件）
   const uint64_t bytes_written_all =
       stats.bytes_written + stats.bytes_written_blob;
 
+  // 14. 计算放大因子
+  //
+  // 读写放大因子（Read-Write Amplification）：
+  // 定义：（写入字节数 + 读取字节数）/ 非输出层读取字节数
+  // 含义：处理 1 字节原始数据需要读写多少字节的数据
+  // 该指标反映了压缩的整体效率，包括读取输入、写入输出等所有 I/O
   if (bytes_read_non_output_and_blob > 0) {
     read_write_amp = (bytes_written_all + bytes_read_all) /
                      static_cast<double>(bytes_read_non_output_and_blob);
+
+    // 写放大因子（Write Amplification）：
+    // 定义：写入字节数 / 非输出层读取字节数
+    // 含义：处理 1 字节原始数据需要写入多少字节的数据
+    // 该指标反映了压缩的写入效率，只考虑写入开销
+    // 在 LSM 树中，写放大通常 > 1，因为数据会从上层写入下层
     write_amp =
         bytes_written_all / static_cast<double>(bytes_read_non_output_and_blob);
   }
+
+  // 15. 计算吞吐量
   if (stats.micros > 0) {
     bytes_read_per_sec = bytes_read_all / static_cast<double>(stats.micros);
     bytes_written_per_sec =
         bytes_written_all / static_cast<double>(stats.micros);
   }
 
+  // 16. 获取列族名称
   const std::string& column_family_name = cfd->GetName();
 
+  // 17. 定义 MB 常量（用于日志格式化）
   constexpr double kMB = 1048576.0;
 
+  // 18. 记录压缩结果日志
+  // 包含：
+  // - 压缩后的层级状态
+  // - 吞吐量（MB/sec）
+  // - 输入输出文件数量
+  // - 输入输出数据量（MB）
+  // - 放大因子
+  // - 记录数量
+  // - 压缩类型
   ROCKS_LOG_BUFFER(
       log_buffer_,
       "[%s] compacted to: %s, MB/sec: %.1f rd, %.1f wr, level %d, "
@@ -887,6 +1116,8 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
       CompressionTypeToString(compact_->compaction->output_compression())
           .c_str());
 
+  // 19. 记录 Blob 文件摘要（如果存在）
+  // Blob 文件用于存储大值，单独管理
   const auto& blob_files = vstorage->GetBlobFiles();
   if (!blob_files.empty()) {
     assert(blob_files.front());
@@ -899,6 +1130,9 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
         blob_files.back()->GetBlobFileNumber());
   }
 
+  // 20. 记录倒数第二层（Penultimate Level）输出（如果有）
+  // Penultimate Level 是指输出层的上一层
+  // 某些压缩策略可能会在倒数第二层也生成输出文件
   if (compaction_stats_.has_penultimate_level_output) {
     ROCKS_LOG_BUFFER(
         log_buffer_,
@@ -911,8 +1145,13 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
         compaction_stats_.penultimate_level_stats.num_output_records);
   }
 
+  // 21. 更新压缩作业统计
   UpdateCompactionJobStats(stats);
 
+  // ===== 记录事件日志 =====
+
+  // 22. 记录压缩完成事件
+  // 事件日志用于监控和分析，记录为 JSON 格式
   auto stream = event_logger_->LogToBuffer(log_buffer_, 8192);
   stream << "job" << job_id_ << "event"
          << "compaction_finished"
@@ -922,22 +1161,27 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
          << stats.num_output_files << "total_output_size"
          << stats.bytes_written;
 
+  // 23. 记录 Blob 文件信息（如果有）
   if (stats.num_output_files_blob > 0) {
     stream << "num_blob_output_files" << stats.num_output_files_blob
            << "total_blob_output_size" << stats.bytes_written_blob;
   }
 
+  // 24. 记录记录数量和压缩信息
   stream << "num_input_records" << stats.num_input_records
          << "num_output_records" << stats.num_output_records
          << "num_subcompactions" << compact_->sub_compact_states.size()
          << "output_compression"
          << CompressionTypeToString(compact_->compaction->output_compression());
 
+  // 25. 记录单删除（Single Delete）统计
+  // Single Delete 是一种特殊的删除操作，可以删除单个键值对
   stream << "num_single_delete_mismatches"
          << compaction_job_stats_->num_single_del_mismatch;
   stream << "num_single_delete_fallthrough"
          << compaction_job_stats_->num_single_del_fallthru;
 
+  // 26. 记录 I/O 统计（如果启用）
   if (measure_io_stats_) {
     stream << "file_write_nanos" << compaction_job_stats_->file_write_nanos;
     stream << "file_range_sync_nanos"
@@ -947,6 +1191,7 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
            << compaction_job_stats_->file_prepare_write_nanos;
   }
 
+  // 27. 记录 LSM 树状态（各层文件数量）
   stream << "lsm_state";
   stream.StartArray();
   for (int level = 0; level < vstorage->num_levels(); ++level) {
@@ -954,6 +1199,7 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
   }
   stream.EndArray();
 
+  // 28. 记录 Blob 文件范围（如果有）
   if (!blob_files.empty()) {
     assert(blob_files.front());
     stream << "blob_file_head" << blob_files.front()->GetBlobFileNumber();
@@ -962,6 +1208,7 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
     stream << "blob_file_tail" << blob_files.back()->GetBlobFileNumber();
   }
 
+  // 29. 记录倒数第二层输出统计（如果有）
   if (compaction_stats_.has_penultimate_level_output) {
     InternalStats::CompactionStats& pl_stats =
         compaction_stats_.penultimate_level_stats;
@@ -975,7 +1222,13 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
            << pl_stats.bytes_written_blob;
   }
 
+  // ===== 清理和返回 =====
+
+  // 30. 清理压缩资源
+  // 包括：释放文件句柄、清理临时数据等
   CleanupCompaction();
+
+  // 31. 返回压缩状态
   return status;
 }
 

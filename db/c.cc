@@ -895,34 +895,317 @@ rocksdb_t* rocksdb_open_and_trim_history(
   return result;
 }
 
+// ============================================================================
+// 函数名: rocksdb_open_column_families
+// 功能描述: 打开一个支持多列族（Column Family）的 RocksDB 数据库（C API）
+//
+// 参数说明:
+//   - db_options: 数据库全局选项（DBOptions），包含数据库级别的配置
+//     * env: 环境对象（文件系统、线程池等）
+//     * create_if_missing: 如果数据库不存在是否创建
+//     * error_if_exists: 如果数据库已存在是否报错
+//     * max_open_files: 最大打开文件数
+//     * use_fsync: 是否使用 fsync 而不是 fdatasync
+//     * db_log_dir: 日志文件目录
+//     * max_log_file_size: 日志文件最大大小
+//     * info_log_level: 日志级别
+//     * create_missing_column_families: 如果列族不存在是否创建
+//     * 其他数据库级别配置...
+//
+//   - name: 数据库目录路径（字符串）
+//     * 必须是绝对路径或相对路径（取决于 env 的实现）
+//     * 例如: "/data/rocksdb/mydb"
+//     * 目录必须已存在（如果 create_if_missing=false）
+//     * 目录会包含以下文件:
+//       - CURRENT: 当前 Manifest 文件名
+//       - MANIFEST-<seq>: Manifest 文件（数据库元数据）
+//       - LOCK: 文件锁（防止多个进程同时打开）
+//       - LOG: 日志文件（如果未指定 db_log_dir）
+//       - *.sst: SSTable 文件（数据文件）
+//       - *.log: WAL 日志文件
+//
+//   - num_column_families: 要打开的列族数量
+//     * 必须大于 0
+//     * 必须等于 column_family_names 和 column_family_options 数组的长度
+//     * 典型值: 1（默认列族）到数百个
+//
+//   - column_family_names: 列族名称数组（指针数组）
+//     * 每个 char* 指向一个以 null 结尾的列族名字符串
+//     * 长度必须等于 num_column_families
+//     * 默认列族名称: "default"
+//     * 自定义列族名称: 例如 "user", "order", "product"
+//     * 列族名称必须与数据库中已存在的列族名称完全匹配
+//     * 如果 create_missing_column_families=true，可以创建新列族
+//
+//   - column_family_options: 列族选项数组（指针数组）
+//     * 每个 rocksdb_options_t* 指向一个列族的配置
+//     * 长度必须等于 num_column_families
+//     * 包含列族级别的配置（如压缩策略、缓存配置等）
+//     * 主要配置项:
+//       - compaction_style: 压缩风格（Level/Tier/Universal/FIFO）
+//       - write_buffer_size: 写缓冲区大小
+//       - max_write_buffer_number: 最大写缓冲区数量
+//       - compression: 压缩算法
+//       - table_factory: 表工厂（BlockBasedTableFactory 等）
+//       - merge_operator: 合并操作符
+//       - comparator: 比较器
+//       - 其他列族级别配置...
+//
+//   - column_family_handles: [输出参数] 列族句柄数组（指针数组）
+//     * 调用者分配的数组，长度必须至少为 num_column_families
+//     * 函数成功时，每个元素指向一个 rocksdb_column_family_handle_t
+//     * 调用者必须在使用完后调用 rocksdb_column_family_handle_destroy() 释放
+//     * 列族句柄用于执行读写操作（如 rocksdb_put_cf, rocksdb_get_cf）
+//     * 句柄与数据库实例绑定，数据库关闭后不能使用
+//
+//   - errptr: [输出参数] 错误信息指针的指针
+//     * 调用者传递一个 char* 变量的地址
+//     * 函数成功时，*errptr = nullptr（或不变）
+//     * 函数失败时，*errptr 指向一个错误字符串（通过 malloc 分配）
+//     * 调用者必须在使用完后调用 free(*errptr) 释放
+//     * 错误信息格式: "Error message (code)"
+//     * 示例错误:
+//       - "IO error: lock /data/rocksdb/mydb/LOCK: No space left on device (Status::IOError)"
+//       - "Invalid argument: column family not found: unknown_cf (Status::InvalidArgument)"
+//
+// 返回值:
+//   - 成功: 返回 rocksdb_t* 指针（指向数据库句柄）
+//     * rocksdb_t 是一个结构体，包含一个 DB* 成员
+//     * 调用者必须在使用完后调用 rocksdb_close() 关闭数据库
+//     * 数据库句柄可以用于执行各种数据库操作
+//   - 失败: 返回 nullptr
+//     * 错误信息通过 errptr 返回
+//     * 调用者应该检查返回值是否为 nullptr
+//
+// 函数功能:
+//   1. 构建列族描述符列表:
+//      - 将 column_family_names 和 column_family_options 转换为 ColumnFamilyDescriptor
+//      - ColumnFamilyDescriptor = (列族名称, 列族选项)
+//      - 描述符列表传递给 DB::Open()
+//
+//   2. 打开数据库:
+//      - 调用 DB::Open() 打开数据库
+//      - 传递数据库选项、数据库名称、列族描述符列表
+//      - DB::Open() 返回列族句柄列表（handles）和数据库实例（db）
+//
+//   3. 封装列族句柄:
+//      - 将 C++ 的 ColumnFamilyHandle* 封装为 C API 的 rocksdb_column_family_handle_t
+//      - 为每个列族句柄分配内存（new rocksdb_column_family_handle_t）
+//      - 将 C++ 句柄保存在 rep 成员中
+//      - 将封装后的句柄传递给调用者
+//
+//   4. 封装数据库句柄:
+//      - 将 C++ 的 DB* 封装为 C API 的 rocksdb_t
+//      - 为数据库句柄分配内存（new rocksdb_t）
+//      - 将 C++ 数据库实例保存在 rep 成员中
+//      - 返回封装后的数据库句柄
+//
+// 内存管理:
+//   - 输入参数: db_options, column_family_names, column_family_options 由调用者管理
+//   - 输出参数:
+//     * column_family_handles: 每个句柄通过 new 分配，调用者负责释放
+//     * errptr: 错误字符串通过 malloc 分配，调用者负责释放
+//   - 返回值: rocksdb_t* 通过 new 分配，调用者负责释放（调用 rocksdb_close）
+//
+// 错误处理:
+//   - DB::Open() 失败时，SaveError() 保存错误信息到 errptr
+//   - 函数返回 nullptr 表示失败
+//   - 常见错误:
+//     * IOError: 文件系统错误（权限、磁盘空间等）
+//     * InvalidArgument: 参数错误（列族不匹配、配置无效等）
+//     * Corruption: 数据库文件损坏
+//     * NotFound: 数据库不存在（create_if_missing=false）
+//
+// 调用时机:
+//   - 应用程序启动时打开数据库
+//   - 数据库首次创建时（create_if_missing=true）
+//   - 添加新列族时（create_missing_column_families=true）
+//
+// 使用场景:
+//   - 多租户应用: 每个租户使用独立的列族
+//   - 数据分类: 不同类型的数据存储在不同的列族中
+//   - 性能优化: 不同列族使用不同的压缩策略、缓存配置等
+//   - 数据隔离: 列族之间相互独立，互不影响
+//
+// 线程安全性:
+//   - 函数本身不是线程安全的（多个线程不能同时调用打开同一个数据库）
+//   - 返回的数据库句柄是线程安全的（多个线程可以同时使用）
+//   - 列族句柄也是线程安全的
+//
+// 示例:
+//   ```c
+//   // 1. 创建数据库选项
+//   rocksdb_options_t* db_options = rocksdb_options_create();
+//   rocksdb_options_set_create_if_missing(db_options, 1);
+//
+//   // 2. 创建列族选项
+//   rocksdb_options_t* cf_options_default = rocksdb_options_create();
+//   rocksdb_options_t* cf_options_user = rocksdb_options_create();
+//   rocksdb_options_t* cf_options_order = rocksdb_options_create();
+//
+//   // 3. 配置列族选项
+//   rocksdb_options_set_write_buffer_size(cf_options_user, 64 * 1024 * 1024);
+//   rocksdb_options_set_write_buffer_size(cf_options_order, 32 * 1024 * 1024);
+//
+//   // 4. 准备列族名称和选项数组
+//   const char* cf_names[] = {"default", "user", "order"};
+//   rocksdb_options_t* cf_opts[] = {cf_options_default, cf_options_user, cf_options_order};
+//   int num_cfs = 3;
+//
+//   // 5. 打开数据库
+//   rocksdb_column_family_handle_t* cf_handles[3];
+//   char* err = nullptr;
+//   rocksdb_t* db = rocksdb_open_column_families(
+//       db_options, "/data/rocksdb/mydb", num_cfs,
+//       cf_names, cf_opts, cf_handles, &err);
+//
+//   // 6. 检查错误
+//   if (err != nullptr || db == nullptr) {
+//       fprintf(stderr, "Failed to open database: %s\n", err);
+//       rocksdb_free(err);
+//       return -1;
+//   }
+//
+//   // 7. 使用数据库
+//   rocksdb_put_cf(db, rocksdb_writeoptions_create(), cf_handles[1],
+//                  "user1", 5, "John Doe", 8, &err);
+//
+//   // 8. 关闭数据库
+//   rocksdb_close(db);
+//
+//   // 9. 释放资源
+//   for (int i = 0; i < num_cfs; i++) {
+//       rocksdb_column_family_handle_destroy(cf_handles[i]);
+//   }
+//   rocksdb_options_destroy(db_options);
+//   rocksdb_options_destroy(cf_options_default);
+//   rocksdb_options_destroy(cf_options_user);
+//   rocksdb_options_destroy(cf_options_order);
+//   ```
+//
+// 注意事项:
+//   - 调用者必须确保 column_family_handles 数组有足够的空间（至少 num_column_families）
+//   - 列族名称必须与数据库中已存在的列族完全匹配（区分大小写）
+//   - 如果数据库中已存在列族，则不能创建同名列族
+//   - 如果 create_missing_column_families=true，可以创建新列族
+//   - 数据库打开后，不能修改列族数量（需要重新打开数据库）
+//   - 列族句柄在数据库关闭后不能使用
+//   - 错误信息字符串必须由调用者释放（使用 free 或 rocksdb_free）
+//   - 此函数是 C API，内部调用 C++ 的 DB::Open()
+//
+// 相关函数:
+//   - rocksdb_open(): 打开单列族数据库（只包含 default 列族）
+//   - rocksdb_open_column_families_with_ttl(): 打开支持 TTL 的多列族数据库
+//   - rocksdb_open_for_read_only_column_families(): 以只读模式打开多列族数据库
+//   - rocksdb_open_as_secondary_column_families(): 打开辅助实例
+//   - rocksdb_close(): 关闭数据库
+//   - rocksdb_column_family_handle_destroy(): 释放列族句柄
+//   - rocksdb_options_create(): 创建选项对象
+//   - rocksdb_options_destroy(): 释放选项对象
+// ============================================================================
 rocksdb_t* rocksdb_open_column_families(
     const rocksdb_options_t* db_options, const char* name,
     int num_column_families, const char* const* column_family_names,
     const rocksdb_options_t* const* column_family_options,
     rocksdb_column_family_handle_t** column_family_handles, char** errptr) {
+  // === 构建列族描述符列表 ===
+  // ColumnFamilyDescriptor 包含:
+  //   1. 列族名称 (std::string)
+  //   2. 列族选项 (ColumnFamilyOptions)
+  //
+  // 转换过程:
+  //   1. 从 C API 的 char* 转换为 C++ 的 std::string
+  //   2. 从 C API 的 rocksdb_options_t* 提取 C++ 的 ColumnFamilyOptions
+  //   3. 创建 ColumnFamilyDescriptor 对象
+  //   4. 添加到 column_families vector
+  //
+  // 示例:
+  //   column_family_names = {"default", "user", "order"}
+  //   column_family_options = {opt1, opt2, opt3}
+  //   column_families = {
+  //       ColumnFamilyDescriptor("default", ColumnFamilyOptions(opt1->rep)),
+  //       ColumnFamilyDescriptor("user", ColumnFamilyOptions(opt2->rep)),
+  //       ColumnFamilyDescriptor("order", ColumnFamilyOptions(opt3->rep)),
+  //   }
   std::vector<ColumnFamilyDescriptor> column_families;
   for (int i = 0; i < num_column_families; i++) {
+    // 将第 i 个列族的名称和选项转换为 ColumnFamilyDescriptor
+    // column_family_names[i]: 列族名称（如 "user"）
+    // column_family_options[i]->rep: 列族选项的 C++ 实现对象
     column_families.push_back(ColumnFamilyDescriptor(
         std::string(column_family_names[i]),
         ColumnFamilyOptions(column_family_options[i]->rep)));
   }
 
+  // === 打开数据库 ===
+  // 调用 DB::Open() 打开数据库并加载所有列族
+  //
+  // 参数说明:
+  //   1. DBOptions(db_options->rep): 数据库选项（从 C API 转换为 C++）
+  //   2. std::string(name): 数据库目录路径
+  //   3. column_families: 列族描述符列表
+  //   4. &handles: [输出] 列族句柄列表（C++ 的 ColumnFamilyHandle*）
+  //   5. &db: [输出] 数据库实例（C++ 的 DB*）
+  //
+  // DB::Open() 的主要操作:
+  //   1. 获取文件锁（LOCK 文件）
+  //   2. 读取 Manifest 文件（CURRENT -> MANIFEST-<seq>）
+  //   3. 验证列族配置是否匹配
+  //   4. 如果 create_missing_column_families=true，创建新列族
+  //   5. 创建列族句柄（ColumnFamilyHandle）
+  //   6. 初始化后台线程（压缩、刷新、清理）
+  //   7. 打开 WAL 日志文件
+  //   8. 恢复未完成的事务（如果有）
+  //
+  // SaveError() 函数说明:
+  //   - 如果 DB::Open() 失败，保存错误信息到 *errptr
+  //   - 返回 true 表示发生错误（需要设置 errptr）
+  //   - 返回 false 表示成功（不需要设置 errptr）
+  //   - 错误字符串通过 strdup 分配，调用者负责释放
   DB* db;
   std::vector<ColumnFamilyHandle*> handles;
   if (SaveError(errptr, DB::Open(DBOptions(db_options->rep), std::string(name),
                                  column_families, &handles, &db))) {
+    // DB::Open() 失败，返回 nullptr
+    // handles 和 db 变量不会被使用（因为函数已返回）
     return nullptr;
   }
 
+  // === 封装列族句柄（C++ -> C API） ===
+  // 为每个 C++ 的 ColumnFamilyHandle* 创建一个 C API 的 rocksdb_column_family_handle_t
+  // 这样 C 客户端可以使用这些句柄执行读写操作
+  //
+  // 封装结构:
+  //   C++: ColumnFamilyHandle* (RocksDB 内部对象)
+  //   C API: rocksdb_column_family_handle_t* (封装对象)
+  //   rocksdb_column_family_handle_t { ColumnFamilyHandle* rep; }
+  //
+  // 内存管理:
+  //   - 每个 rocksdb_column_family_handle_t 通过 new 分配
+  //   - ColumnFamilyHandle* 由 DB 对象管理，调用者不能释放
+  //   - 调用者必须调用 rocksdb_column_family_handle_destroy() 释放封装对象
   for (size_t i = 0; i < handles.size(); i++) {
     rocksdb_column_family_handle_t* c_handle =
         new rocksdb_column_family_handle_t;
-    c_handle->rep = handles[i];
-    column_family_handles[i] = c_handle;
+    c_handle->rep = handles[i];  // 保存 C++ 句柄
+    column_family_handles[i] = c_handle;  // 传递给调用者
   }
+
+  // === 封装数据库句柄（C++ -> C API） ===
+  // 创建 C API 的数据库句柄，封装 C++ 的 DB* 对象
+  //
+  // 封装结构:
+  //   C++: DB* (RocksDB 内部对象)
+  //   C API: rocksdb_t* (封装对象)
+  //   rocksdb_t { DB* rep; }
+  //
+  // 内存管理:
+  //   - rocksdb_t 通过 new 分配
+  //   - DB* 由 rocksdb_t 管理，调用者不能释放
+  //   - 调用者必须调用 rocksdb_close() 关闭数据库并释放资源
   rocksdb_t* result = new rocksdb_t;
-  result->rep = db;
-  return result;
+  result->rep = db;  // 保存 C++ 数据库实例
+  return result;  // 返回封装后的数据库句柄
 }
 
 rocksdb_t* rocksdb_open_column_families_with_ttl(
@@ -1952,10 +2235,10 @@ void rocksdb_writebatch_put(rocksdb_writebatch_t* b, const char* key,
   b->rep.Put(Slice(key, klen), Slice(val, vlen));
 }
 
-void rocksdb_writebatch_put_cf(rocksdb_writebatch_t* b,
-                               rocksdb_column_family_handle_t* column_family,
-                               const char* key, size_t klen, const char* val,
-                               size_t vlen) {
+void rocksdb_writebatch_put_cf(rocksdb_writebatch_t* b, /*指向 WriteBatch 对象的句柄。*/
+                               rocksdb_column_family_handle_t* column_family, /*指定的 Column Family 句柄。*/
+                               const char* key, size_t klen, const char* val, /*klen: 键及其长度。*/
+                               size_t vlen /*vlen: 值及其长度。*/) {
   b->rep.Put(column_family->rep, Slice(key, klen), Slice(val, vlen));
 }
 

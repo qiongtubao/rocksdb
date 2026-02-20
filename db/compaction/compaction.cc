@@ -157,26 +157,83 @@ std::vector<CompactionInputFiles> Compaction::PopulateWithAtomicBoundaries(
   return inputs;
 }
 
-// helper function to determine if compaction is creating files at the
-// bottommost level
+// 辅助函数：判断当前压缩是否在最底层（bottommost level）进行
+//
+// 【功能说明】
+// 判断压缩任务的输出是否位于LSM树的最底层。在最底层压缩有以下特点：
+// 1. 压缩后的数据不会被更底层的文件覆盖
+// 2. 可以执行更激进的优化，如：
+//    - 删除被覆盖的旧记录
+//    - 移除已经过期的range tombstone
+//    - 应用compaction filter进行数据清理
+// 3. 生成的文件是LSM树中最终的存储位置，无需再次压缩
+//
+// 【参数说明】
+// @param output_level    压缩输出层的目标level编号（如L6）
+// @param vstorage        VersionStorageInfo指针，包含版本存储信息（各层的文件列表）
+// @param inputs          压缩输入文件列表，包含从哪些level选择了哪些文件
+//
+// 【返回值】
+// @return true  - 压缩在最底层进行（bottommost compaction）
+// @return false - 压缩不在最底层进行，输出文件后续可能需要再次压缩
+//
+// 【底层逻辑】
+// 1. 对于Level压缩：检查output_level之下是否还有level包含重叠的数据
+// 2. 对于Universal压缩：检查是否压缩到所有sorted runs的最后一个
+// 3. 通过RangeMightExistAfterSortedRun判断输出范围是否会被更底层的sorted run覆盖
+//
+// 【使用场景】
+// - 在Compaction构造时设置bottommost_level_标志（见第240-248行）
+// - 在KeyNotExistsBeyondOutputLevel函数中直接返回true（见第531-532行）
+// - 影响输出文件大小策略（见第287-290行，bottommost level使用target_output_file_size_）
+// - 决定是否可以使用BOTTOM优先级的线程池进行压缩
+//
+// 【注意事项】
+// - L0层压缩永远不会是bottommost（因为L0之下还有其他层）
+// - Universal压缩风格可能没有明确的"最底层"概念
+// - kExternalSstIngestion和kRefitLevel压缩原因会强制设置bottommost_level_=false
 bool Compaction::IsBottommostLevel(
     int output_level, VersionStorageInfo* vstorage,
     const std::vector<CompactionInputFiles>& inputs) {
   int output_l0_idx;
+  // 处理L0层输出的特殊情况
+  // L0层的文件是无序且可能重叠的，需要找到最后一个输入文件在L0层中的位置索引
+  // output_l0_idx用于确定从L0层的哪个位置开始查找是否有后续文件与输出范围重叠
   if (output_level == 0) {
     output_l0_idx = 0;
+    // 遍历L0层所有文件，找到最后一个输入文件（inputs[0].files.back()）的位置
     for (const auto* file : vstorage->LevelFiles(0)) {
       if (inputs[0].files.back() == file) {
         break;
       }
       ++output_l0_idx;
     }
+    // 断言确保找到了文件位置
     assert(static_cast<size_t>(output_l0_idx) < vstorage->LevelFiles(0).size());
   } else {
+    // 非L0层输出，不需要output_l0_idx索引（设置为-1表示未使用）
     output_l0_idx = -1;
   }
+  // 获取当前压缩输入文件的边界键范围
+  // smallest_key: 最小用户键
+  // largest_key: 最大用户键
+  // 这个键范围代表压缩输出的数据范围
   Slice smallest_key, largest_key;
   GetBoundaryKeys(vstorage, inputs, &smallest_key, &largest_key);
+  
+  // 核心判断逻辑：检查输出范围之后是否还存在有序sorted run
+  // RangeMightExistAfterSortedRun 返回 true 表示存在可能覆盖输出范围的数据
+  // 取反（!）后的含义：
+  //   - 返回true：输出范围之后没有数据，说明这是最底层压缩
+  //   - 返回false：输出范围之后还有数据，说明不是最底层
+  //
+  // 对于Level压缩风格：
+  //   - 如果output_level = L6（最后一层），则output_level + 1不存在，返回true（是最底层）
+  //   - 如果output_level = L5，检查L6层是否有文件与[smallest_key, largest_key]范围重叠
+  //
+  // 对于Universal压缩风格：
+  //   - 检查是否有sorted run位于当前输出位置之后
+  //   - 如果有则不是bottommost，因为后续的run可能包含更新的数据
   return !vstorage->RangeMightExistAfterSortedRun(smallest_key, largest_key,
                                                   output_level, output_l0_idx);
 }

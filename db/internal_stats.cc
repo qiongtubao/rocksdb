@@ -957,12 +957,311 @@ bool InternalStats::HandleBlobCachePinnedUsage(uint64_t* value, DBImpl* /*db*/,
   return false;
 }
 
+// ============================================================================
+// 函数名: GetPropertyInfo
+// 功能描述: 根据属性名称查找属性信息的函数
+//
+// 参数说明:
+//   - property: 属性名称（Slice 类型），可以是带参数的完整属性名
+//     * 格式: "rocksdb.<property-name>" 或 "rocksdb.<property-name>.<arg>"
+//     * 示例:
+//       - "rocksdb.num-files-at-level0" -> 属性名: "rocksdb.num-files-at-level", 参数: "0"
+//       - "rocksdb.stats" -> 属性名: "rocksdb.stats", 参数: ""（空）
+//       - "rocksdb.compaction-pending" -> 属性名: "rocksdb.compaction-pending", 参数: ""（空）
+//     * 参数类型: 通常是数字（如层号、文件号等）
+//     * 示例属性:
+//       - "rocksdb.num-files-at-level5": 获取第 5 层的文件数量
+//       - "rocksdb.compression-ratio-at-level2": 获取第 2 层的压缩率
+//       - "rocksdb.stats": 获取详细统计信息
+//       - "rocksdb.estimate-num-keys": 获取估计键值对数量
+//
+// 返回值:
+//   - 成功: 返回指向 DBPropertyInfo 的指针（常量指针）
+//     * 包含属性的元信息和处理函数指针
+//     * 可以直接使用（不需要释放内存）
+//     * 指针有效期为程序运行期间（静态数据）
+//   - 失败: 返回 nullptr
+//     * 属性名称不存在或无效
+//     * 调用者应该检查返回值是否为 nullptr
+//
+// 函数功能:
+//   1. 解析属性名称:
+//      - 调用 GetPropertyNameAndArg() 分离属性名和参数
+//      - 从完整属性名中提取基础名称（去掉尾部数字参数）
+//      - 例如: "rocksdb.num-files-at-level5" -> "rocksdb.num-files-at-level"
+//
+//   2. 查找属性信息:
+//      - 在 InternalStats::ppt_name_to_info 哈希表中查找
+//      - 使用提取的基础名称作为键
+//      - 返回对应的 DBPropertyInfo
+//
+//   3. 返回属性信息:
+//      - 如果找到，返回 DBPropertyInfo 的指针
+//      - 如果未找到，返回 nullptr
+//
+// 属性名称解析规则（GetPropertyNameAndArg）:
+//   - 从属性名称的末尾开始，向前面扫描数字字符
+//   - 将末尾的数字字符作为参数（arg）
+//   - 剩余部分作为属性名（name）
+//   - 示例:
+//     * "rocksdb.num-files-at-level5"
+//       - name = "rocksdb.num-files-at-level"
+//       - arg = "5"
+//     * "rocksdb.compression-ratio-at-level0"
+//       - name = "rocksdb.compression-ratio-at-level"
+//       - arg = "0"
+//     * "rocksdb.stats"
+//       - name = "rocksdb.stats"
+//       - arg = ""（空字符串，没有数字参数）
+//
+// 属性信息映射表（ppt_name_to_info）:
+//   - 这是一个静态哈希表（UnorderedMap<std::string, DBPropertyInfo>）
+//   - 键: 属性名称字符串（如 "rocksdb.num-files-at-level"）
+//   - 值: DBPropertyInfo 结构体（包含属性的处理函数指针）
+//   - 初始化: 在文件开头初始化（所有支持的属性）
+//
+// 支持的属性分类:
+//
+//   1. 文件数量相关:
+//      - "rocksdb.num-files-at-level": 第 N 层的文件数量（带数字参数）
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleNumFilesAtLevel
+//        * 参数: 层号（0, 1, 2, ...）
+//
+//   2. 压缩率相关:
+//      - "rocksdb.compression-ratio-at-level": 第 N 层的压缩率（带数字参数）
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleCompressionRatioAtLevelPrefix
+//        * 参数: 层号（0, 1, 2, ...）
+//
+//   3. 统计信息:
+//      - "rocksdb.stats": 详细的数据库统计信息
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleStats
+//      - "rocksdb.cfstats": 列族统计信息
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleCFStats
+//        * handle_map: &InternalStats::HandleCFMapStats
+//      - "rocksdb.dbstats": 数据库统计信息
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleDBStats
+//        * handle_map: &InternalStats::HandleDBMapStats
+//      - "rocksdb.levelstats": 各层文件数量和大小统计
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleLevelStats
+//
+//   4. 数据估计:
+//      - "rocksdb.estimate-num-keys": 估计的键值对数量
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleEstimateNumKeys
+//      - "rocksdb.estimate-live-data-size": 估计的存活数据大小
+//        * need_out_of_mutex: true（持锁外访问）
+//        * handle_int: &InternalStats::HandleEstimateLiveDataSize
+//      - "rocksdb.estimate-table-readers-mem": SSTable 读取器内存占用
+//        * need_out_of_mutex: true（持锁外访问）
+//        * handle_int: &InternalStats::HandleEstimateTableReadersMem
+//
+//   5. MemTable 相关:
+//      - "rocksdb.num-immutable-memtable": 不可变 memtable 数量
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleNumImmutableMemTable
+//      - "rocksdb.memtable-flush-pending": 刷新待处理标志
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleMemTableFlushPending
+//      - "rocksdb.cur-size-active-memtable": 活跃 memtable 大小
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleCurSizeActiveMemTable
+//      - "rocksdb.cur-size-all-memtables": 所有 memtable 总大小
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleCurSizeAllMemTables
+//
+//   6. 后台任务相关:
+//      - "rocksdb.compaction-pending": 压缩待处理标志
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleCompactionPending
+//      - "rocksdb.num-running-compactions": 运行中的压缩任务数
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleNumRunningCompactions
+//      - "rocksdb.num-running-flushes": 运行中的刷新任务数
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleNumRunningFlushes
+//      - "rocksdb.background-errors": 后台任务错误数量
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleBackgroundErrors
+//
+//   7. 快照相关:
+//      - "rocksdb.num-snapshots": 快照数量
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleNumSnapshots
+//      - "rocksdb.oldest-snapshot-time": 最旧快照的时间戳
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_int: &InternalStats::HandleOldestSnapshotTime
+//
+//   8. 缓存统计:
+//      - "rocksdb.block-cache-entry-stats": 块缓存条目统计
+//        * need_out_of_mutex: true（持锁外访问，避免阻塞）
+//        * handle_string: &InternalStats::HandleBlockCacheEntryStats
+//        * handle_map: &InternalStats::HandleBlockCacheEntryStatsMap
+//      - "rocksdb.fast-block-cache-entry-stats": 快速块缓存条目统计
+//        * need_out_of_mutex: true（持锁外访问，避免阻塞）
+//        * handle_string: &InternalStats::HandleFastBlockCacheEntryStats
+//        * handle_map: &InternalStats::HandleFastBlockCacheEntryStatsMap
+//
+//   9. SSTable 相关:
+//      - "rocksdb.sstables": 所有 SSTable 文件列表
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleSsTables
+//      - "rocksdb.aggregated-table-properties": 聚合的表属性
+//        * need_out_of_mutex: false（持锁访问）
+//        * handle_string: &InternalStats::HandleAggregatedTableProperties
+//        * handle_map: &InternalStats::HandleAggregatedTablePropertiesMap
+//
+//   10. 写入停止相关:
+//       - "rocksdb.is-write-stopped": 写入是否被停止
+//         * need_out_of_mutex: false（持锁访问）
+//         * handle_int: &InternalStats::HandleIsWriteStopped
+//       - "rocksdb.is-write-stopped-by-overflow": 写入是否因 memtable 溢出而停止
+//         * need_out_of_mutex: false（持锁访问）
+//         * handle_int: &InternalStats::HandleIsWriteStoppedByOverflow
+//
+// DBPropertyInfo 结构说明:
+//   - need_out_of_mutex: 布尔值，是否需要在锁外访问
+//     * true: 访问成本高，不应阻塞其他线程（如遍历 SSTable）
+//     * false: 访问成本低，需要保护共享数据（如读取计数器）
+//   - handle_string: 字符串属性的处理函数指针（InternalStats 成员函数）
+//     * 签名: bool (InternalStats::*)(std::string* value, Slice suffix)
+//     * suffix: 属性参数（如层号）
+//     * 返回: 成功返回 true，失败返回 false
+//   - handle_int: 整数属性的处理函数指针（InternalStats 成员函数）
+//     * 签名: bool (InternalStats::*)(uint64_t* value, DBImpl* db, Version* version)
+//     * value: [输出] 属性值
+//     * db: DBImpl 指针（持锁访问时使用）
+//     * version: Version 指针（持锁外访问时使用）
+//   - handle_map: Map 类型属性的处理函数指针（InternalStats 成员函数）
+//     * 签名: bool (InternalStats::*)(std::map<std::string, std::string>* props, Slice suffix)
+//     * props: [输出] 属性键值对映射
+//     * suffix: 属性参数
+//   - handle_string_dbimpl: DBImpl 成员函数指针（较少使用）
+//     * 签名: bool (DBImpl::*)(std::string* value)
+//     * 用于需要访问 DBImpl 私有成员的属性
+//
+// 错误处理:
+//   - 属性名称不存在: 返回 nullptr
+//   - 属性名称格式错误: 返回 nullptr（基础名称未找到）
+//   - 注意: 如果属性存在但参数无效（如层号超出范围），在处理函数中返回 false
+//
+// 线程安全性:
+//   - 函数本身是线程安全的（ppt_name_to_info 是静态只读数据）
+//   - 多个线程可以同时调用此函数
+//   - 不需要互斥锁保护（只读访问静态数据）
+//
+// 性能考虑:
+//   - 哈希表查找是 O(1) 平均时间复杂度
+//   - 字符串转换（ToString()）有开销，但较小
+//   - 函数是内联友好的（可以作为小函数优化）
+//
+// 调用时机:
+//   - 被 DBImpl::GetProperty() 调用
+//   - 被 DBImpl::GetIntProperty() 调用
+//   - 被 DBImpl::GetMapProperty() 调用
+//   - 被其他内部函数调用（如监控、调试）
+//
+// 使用场景:
+//   - 动态查询属性（运行时确定属性名称）
+//   - 验证属性是否存在
+//   - 获取属性的处理函数
+//   - 单元测试（验证属性映射表）
+//
+// 示例:
+//   ```cpp
+//   // 1. 查找第 0 层文件数量的属性信息
+//   const DBPropertyInfo* info = GetPropertyInfo(Slice("rocksdb.num-files-at-level0"));
+//   if (info != nullptr) {
+//       printf("Property found, need_out_of_mutex: %d\n", info->need_out_of_mutex);
+//   } else {
+//       printf("Property not found\n");
+//   }
+//
+//   // 2. 查找统计信息的属性信息
+//   const DBPropertyInfo* stats_info = GetPropertyInfo(Slice("rocksdb.stats"));
+//   if (stats_info != nullptr && stats_info->handle_string != nullptr) {
+//       std::string value;
+//       if ((internal_stats->*(stats_info->handle_string))(&value, Slice())) {
+//           printf("Stats: %s\n", value.c_str());
+//       }
+//   }
+//
+//   // 3. 查找不存在的属性
+//   const DBPropertyInfo* invalid_info = GetPropertyInfo(Slice("rocksdb.invalid-property"));
+//   if (invalid_info == nullptr) {
+//       printf("Property does not exist\n");
+//   }
+//   ```
+//
+// 注意事项:
+//   - 属性名称区分大小写（必须完全匹配）
+//   - 返回的指针有效期为程序运行期间（不需要释放）
+//   - 指针指向静态数据，不要修改或释放
+//   - 参数解析只提取末尾的数字（不支持其他类型的参数）
+//   - 某些属性需要数字参数（如层号），某些不需要
+//   - 如果属性不存在，检查属性名称是否正确（包括前缀 "rocksdb."）
+//
+// 相关函数:
+//   - GetPropertyNameAndArg(): 解析属性名称和参数
+//   - DBImpl::GetProperty(): 获取字符串属性（调用此函数）
+//   - DBImpl::GetIntProperty(): 获取整数属性（调用此函数）
+//   - DBImpl::GetMapProperty(): 获取 Map 类型属性（调用此函数）
+//   - InternalStats::GetStringProperty(): 处理字符串属性
+//   - InternalStats::GetIntProperty(): 处理整数属性
+//   - InternalStats::GetMapProperty(): 处理 Map 类型属性
+// ============================================================================
 const DBPropertyInfo* GetPropertyInfo(const Slice& property) {
+  // === 解析属性名称 ===
+  // 调用 GetPropertyNameAndArg() 从完整属性名中分离属性名和参数
+  // GetPropertyNameAndArg() 返回一个 pair:
+  //   - first: 基础属性名（去掉末尾的数字参数）
+  //   - second: 参数（末尾的数字字符串）
+  //
+  // 示例:
+  //   输入: "rocksdb.num-files-at-level5"
+  //   输出: {first: "rocksdb.num-files-at-level", second: "5"}
+  //
+  //   输入: "rocksdb.stats"
+  //   输出: {first: "rocksdb.stats", second: ""}
+  //
+  // 解析规则:
+  //   - 从属性名称的末尾开始，向前面扫描数字字符
+  //   - 将末尾的连续数字作为参数
+  //   - 剩余部分作为基础属性名
   std::string ppt_name = GetPropertyNameAndArg(property).first.ToString();
+
+  // === 查找属性信息 ===
+  // 在 InternalStats::ppt_name_to_info 哈希表中查找属性信息
+  // ppt_name_to_info 是一个静态哈希表（UnorderedMap）
+  // 键: 属性名称字符串（如 "rocksdb.num-files-at-level"）
+  // 值: DBPropertyInfo 结构体（包含属性的处理函数指针）
+  //
+  // find() 返回一个迭代器:
+  //   - 成功: 指向找到的元素（迭代器指向 pair<string, DBPropertyInfo>）
+  //   - 失败: 返回 end() 迭代器（表示未找到）
   auto ppt_info_iter = InternalStats::ppt_name_to_info.find(ppt_name);
+
+  // === 检查查找结果 ===
+  // 如果迭代器等于 end()，说明属性不存在
+  // 返回 nullptr 表示查找失败
   if (ppt_info_iter == InternalStats::ppt_name_to_info.end()) {
     return nullptr;
   }
+
+  // === 返回属性信息指针 ===
+  // 返回 DBPropertyInfo 的指针（const 指针）
+  // ppt_info_iter->second 是 DBPropertyInfo 的引用（哈希表中的值）
+  // &ppt_info_iter->second 获取 DBPropertyInfo 的指针
+  //
+  // 注意:
+  //   - 返回的指针指向静态数据（不需要释放）
+  //   - 指针有效期为程序运行期间
+  //   - 不要修改或释放返回的指针
   return &ppt_info_iter->second;
 }
 

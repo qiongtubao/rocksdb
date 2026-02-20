@@ -55,24 +55,101 @@ bool DBImpl::EnoughRoomForCompaction(
   return enough_room;
 }
 
+/**
+ * @brief 请求压缩任务限制令牌
+ *
+ * 该函数用于在调度压缩任务前请求任务限制令牌，用于控制并发压缩任务的数量，
+ * 防止过多的压缩任务同时执行导致系统资源耗尽或性能下降。
+ *
+ * @param cfd 目标列族数据指针，指定要执行压缩的列族
+ * @param force 是否强制获取令牌（忽略限制）
+ *            - true：强制获取令牌，即使超出并发限制
+ *            - false：遵守限制，只有当未超过限制时才获取令牌
+ *            - 手动压缩通常使用 false，避免强制调度
+ * @param token 输出参数，任务限制令牌的唯一指针
+ *             - 输入时必须为 nullptr（通过断言检查）
+ *             - 输出时指向获取到的令牌，nullptr 表示获取失败
+ *             - 令牌会在任务完成后自动释放（通过析构函数）
+ * @param log_buffer 日志缓冲区，用于记录令牌请求过程
+ *
+ * @return bool 操作结果
+ *         - true：成功获取到压缩令牌，可以调度压缩任务
+ *         - false：未能获取到令牌，不应调度压缩任务
+ *
+ * @note 调用此函数时必须持有 mutex_（db_mutex）
+ *
+ * @brief 任务限制器（Task Limiter）的作用：
+ * - 控制并发压缩任务的最大数量
+ * - 防止系统资源（CPU、内存、磁盘 I/O）耗尽
+ * - 避免过多的并发压缩导致性能下降（锁竞争、I/O 竞争）
+ * - 可以通过 DBOptions::max_background_compactions 和 DBOptions::max_background_jobs 配置
+ *
+ * @brief ConcurrentTaskLimiterImpl 工作原理：
+ * - 维护一个当前运行的任务计数器
+ * - GetToken(force) 试图获取令牌：
+ *   - 如果 force = true：总是返回有效令牌，不检查限制
+ *   - 如果 force = false：只有当前任务数 < 限制时才返回令牌
+ * - 令牌的析构函数会自动释放，减少任务计数
+ * - 使用 RAII（Resource Acquisition Is Initialization）模式管理资源
+ *
+ * @brief 使用场景：
+ * 1. 自动压缩：force = false，遵守并发限制
+ * 2. 手动压缩：force = false，遵守并发限制（通常）
+ * 3. 紧急压缩：force = true，强制执行（可能超出限制）
+ *
+ * @brief 返回值说明：
+ * - 返回 true：
+ *   - 成功获取到令牌
+ *   - 可以安全地调度压缩任务
+ *   - 令牌会在任务完成时自动释放
+ *   - 记录日志说明任务数变化
+ *
+ * - 返回 false：
+ *   - 未获取到令牌（超出并发限制）
+ *   - 不应调度压缩任务
+ *   - 任务会等待后续重试
+ *   - 可能是因为达到了 max_background_compactions 限制
+ */
 bool DBImpl::RequestCompactionToken(ColumnFamilyData* cfd, bool force,
                                     std::unique_ptr<TaskLimiterToken>* token,
                                     LogBuffer* log_buffer) {
+  // 断言：确保 token 输入时为空
+  // 这是一个安全检查，防止资源泄漏
   assert(*token == nullptr);
+
+  // 获取列族的压缩线程限制器
+  // compaction_thread_limiter 是在 ColumnFamilyOptions 中配置的任务限制器
+  // 如果未配置（nullptr），则不限制并发压缩任务
   auto limiter = static_cast<ConcurrentTaskLimiterImpl*>(
       cfd->ioptions()->compaction_thread_limiter.get());
+
+  // 如果没有配置限制器，直接返回成功
+  // 这种情况下，不限制并发压缩任务的数量
   if (limiter == nullptr) {
     return true;
   }
+
+  // 尝试获取任务限制令牌
+  // GetToken(force) 的行为：
+  // - force = true：总是返回有效令牌（可能超出限制）
+  // - force = false：只有当前任务数 < 限制时才返回令牌
   *token = limiter->GetToken(force);
+
+  // 如果成功获取到令牌
   if (*token != nullptr) {
+    // 记录日志：任务数增加
     ROCKS_LOG_BUFFER(log_buffer,
                      "Thread limiter [%s] increase [%s] compaction task, "
                      "force: %s, tasks after: %d",
                      limiter->GetName().c_str(), cfd->GetName().c_str(),
                      force ? "true" : "false", limiter->GetOutstandingTask());
+
+    // 返回成功：可以调度压缩任务
     return true;
   }
+
+  // 未获取到令牌：超出并发限制
+  // 返回 false：不应调度压缩任务
   return false;
 }
 
@@ -147,6 +224,53 @@ IOStatus DBImpl::SyncClosedLogs(JobContext* job_context,
   return io_s;
 }
 
+/**
+ * @brief 将不可变 memtables 刷写到 SST 文件
+ *
+ * 该函数是 RocksDB flush 流程的核心入口点，负责将列族的不可变 memtables
+ * 转换为持久化的 SST 文件。这是保证数据持久化和内存回收的关键步骤。
+ *
+ * @param cfd 目标列族数据指针，指定要执行 flush 的列族
+ * @param mutable_cf_options 可变列族选项，包含 flush 相关配置（如压缩算法、文件大小等）
+ * @param made_progress 输出参数，指示 flush 是否实际完成（true 表示生成了 SST 文件）
+ * @param job_context 后台任务上下文，包含 flush 相关的资源管理信息
+ * @param flush_reason flush 触发原因（如 memtable 满了、手动触发、WAL 大小限制等）
+ * @param superversion_context SuperVersion 上下文，用于 flush 完成后更新版本
+ * @param snapshot_seqs 需要保留的快照序列号列表，用于正确处理快照读取
+ * @param earliest_write_conflict_snapshot 最早的写冲突快照序列号
+ * @param snapshot_checker 快照检查器，用于确定哪些 key 需要保留
+ * @param log_buffer 日志缓冲区，用于记录 flush 过程的日志信息
+ * @param thread_pri 线程优先级，指定 flush 线程的优先级级别
+ *
+ * @return Status 操作状态，OK 表示 flush 成功完成
+ *
+ * @note 调用此函数时必须持有 mutex_（db_mutex）
+ *
+ * 函数执行流程：
+ * 1. 前置检查和 WAL 同步决策（多列族场景需要同步已关闭的 WAL）
+ * 2. 设置 max_memtable_id 以防止 flush 期间新增的 memtable 被错误包含
+ * 3. 创建 FlushJob 并选择要 flush 的 memtables
+ * 4. 通知监听器 flush 开始
+ * 5. 执行实际的 flush 操作（写入 SST 文件）
+ * 6. 失败时取消已选择的 memtables
+ * 7. 成功时更新 SuperVersion 并调度后续任务
+ * 8. 错误处理和资源清理
+ * 9. 通知监听器 flush 完成并更新文件管理器
+ *
+ * 关键设计要点：
+ * - WAL 同步：多列族场景下必须同步已关闭的 WAL，避免数据不一致
+ * - Memtable ID 过滤：使用 max_memtable_id 确保只 flush 已经存在且有 WAL 支持的 memtables
+ * - 快照处理：通过 snapshot_seqs 确保快照数据的可见性
+ * - 锁释放策略：flush_job.Run 期间释放 db_mutex，允许并发写操作
+ * - 错误恢复：失败时清理已修改的状态，避免部分更新
+ * - 空间管理：flush 成功后通知 SST 文件管理器
+ *
+ * 调用时机：
+ * - memtable 大小达到 write_buffer_size
+ * - WAL 大小超过 max_total_wal_size
+ * - 用户调用 Flush() 手动触发
+ * - 后台线程调度 flush 任务
+ */
 Status DBImpl::FlushMemTableToOutputFile(
     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
     bool* made_progress, JobContext* job_context, FlushReason flush_reason,
@@ -155,56 +279,67 @@ Status DBImpl::FlushMemTableToOutputFile(
     SequenceNumber earliest_write_conflict_snapshot,
     SnapshotChecker* snapshot_checker, LogBuffer* log_buffer,
     Env::Priority thread_pri) {
+  // 断言：调用者必须持有数据库互斥锁
   mutex_.AssertHeld();
+  // 前置断言：确保列族和不可变 memtables 存在且需要 flush
   assert(cfd);
   assert(cfd->imm());
   assert(cfd->imm()->NumNotFlushed() != 0);
   assert(cfd->imm()->IsFlushPending());
   assert(versions_);
   assert(versions_->GetColumnFamilySet());
-  // If there are more than one column families, we need to make sure that
-  // all the log files except the most recent one are synced. Otherwise if
-  // the host crashes after flushing and before WAL is persistent, the
-  // flushed SST may contain data from write batches whose updates to
-  // other (unflushed) column families are missing.
+
+  // 决定是否需要同步已关闭的 WAL 文件
+  // 场景说明：
+  // - 如果存在多个列族，一个写入操作可能同时更新多个列族的 memtables
+  // - 这些写入记录在同一个 WAL 文件中
+  // - 如果只 flush 某个列族后主机崩溃，但其他列族的 memtables 还在内存中且 WAL 未持久化
+  // - 那么恢复后，SST 文件中包含的数据对应的 WAL 更新丢失，导致数据不一致
+  // 因此需要确保除了最新的 WAL 外，所有旧 WAL 都已同步到磁盘
   const bool needs_to_sync_closed_wals =
       logfile_number_ > 0 &&
       versions_->GetColumnFamilySet()->NumberOfColumnFamilies() > 1;
 
-  // If needs_to_sync_closed_wals is true, we need to record the current
-  // maximum memtable ID of this column family so that a later PickMemtables()
-  // call will not pick memtables whose IDs are higher. This is due to the fact
-  // that SyncClosedLogs() may release the db mutex, and memtable switch can
-  // happen for this column family in the meantime. The newly created memtables
-  // have their data backed by unsynced WALs, thus they cannot be included in
-  // this flush job.
-  // Another reason why we must record the current maximum memtable ID of this
-  // column family: SyncClosedLogs() may release db mutex, thus it's possible
-  // for application to continue to insert into memtables increasing db's
-  // sequence number. The application may take a snapshot, but this snapshot is
-  // not included in `snapshot_seqs` which will be passed to flush job because
-  // `snapshot_seqs` has already been computed before this function starts.
-  // Recording the max memtable ID ensures that the flush job does not flush
-  // a memtable without knowing such snapshot(s).
+  // 设置最大 memtable ID 用于过滤
+  //
+  // 设计原因 1 - 防止 WAL 未同步的 memtable 被 flush：
+  // - SyncClosedLogs() 会释放和重新获取 db mutex
+  // - 在此期间，该列族可能发生 memtable 切换（生成新的 memtable）
+  // - 新创建的 memtable 的数据由未同步的 WAL 支持
+  // - 如果将这些 memtable 包含在本次 flush 中，一旦主机崩溃，SST 文件数据将无法从 WAL 恢复
+  //
+  // 设计原因 2 - 防止未知的快照数据被错误丢弃：
+  // - SyncClosedLogs() 释放 db mutex 后，应用可以继续写入，增加数据库的序列号
+  // - 应用可能在此时创建快照，希望快照可见的数据被保留
+  // - snapshot_seqs 参数是在此函数调用前计算的，不包含新创建的快照
+  // - 如果 flush 了包含新快照数据的 memtable 但不知道该快照存在，可能会错误地删除某些 key
+  // - 导致使用该快照读取时返回错误的数据
+  //
+  // 解决方案：
+  // - 记录当前的 max_memtable_id，后续 PickMemTable() 只选择 ID <= max_memtable_id 的 memtables
+  // - 这样确保了：
+  //   1. 不会 flush 由未同步 WAL 支持的新 memtables
+  //   2. 不会 flush 包含未知快照的新 memtables（因为它们有更高的 ID）
   uint64_t max_memtable_id = needs_to_sync_closed_wals
                                  ? cfd->imm()->GetLatestMemTableID()
                                  : std::numeric_limits<uint64_t>::max();
 
-  // If needs_to_sync_closed_wals is false, then the flush job will pick ALL
-  // existing memtables of the column family when PickMemTable() is called
-  // later. Although we won't call SyncClosedLogs() in this case, we may still
-  // call the callbacks of the listeners, i.e. NotifyOnFlushBegin() which also
-  // releases and re-acquires the db mutex. In the meantime, the application
-  // can still insert into the memtables and increase the db's sequence number.
-  // The application can take a snapshot, hoping that the latest visible state
-  // to this snapshto is preserved. This is hard to guarantee since db mutex
-  // not held. This newly-created snapshot is not included in `snapshot_seqs`
-  // and the flush job is unaware of its presence. Consequently, the flush job
-  // may drop certain keys when generating the L0, causing incorrect data to be
-  // returned for snapshot read using this snapshot.
-  // To address this, we make sure NotifyOnFlushBegin() executes after memtable
-  // picking so that no new snapshot can be taken between the two functions.
+  // 关于 memtable 选择和快照的时序设计
+  //
+  // 当 needs_to_sync_closed_wals = false 时（通常是单列族场景）：
+  // - flush job 将选择该列族的所有现有 memtables
+  // - 虽然不调用 SyncClosedLogs()，但会调用 NotifyOnFlushBegin()
+  // - NotifyOnFlushBegin() 也会释放和重新获取 db mutex
+  // - 在释放期间，应用可以继续写入并创建新的快照
+  // - 新创建的快照不在 snapshot_seqs 中，flush job 不知道它的存在
+  // - 如果 flush 删除了该快照可见的某些 key，会导致快照读取返回错误数据
+  //
+  // 解决方案：确保 NotifyOnFlushBegin() 在 memtable 选择之后执行
+  // - 先调用 PickMemTable() 选择要 flush 的 memtables
+  // - 后调用 NotifyOnFlushBegin() 通知监听器
+  // - 这样即使期间创建了新快照，也不会影响已选择的 memtables
 
+  // 创建 FlushJob 对象，封装 flush 操作的所有必要信息
   FlushJob flush_job(
       dbname_, cfd, immutable_db_options_, mutable_cf_options, max_memtable_id,
       file_options_for_compaction_, versions_.get(), &mutex_, &shutting_down_,
@@ -219,15 +354,18 @@ Status DBImpl::FlushMemTableToOutputFile(
   FileMetaData file_meta;
 
   Status s;
-  bool need_cancel = false;
+  bool need_cancel = false;  // 标记是否需要在失败时取消已选择的 memtables
   IOStatus log_io_s = IOStatus::OK();
+
+  // 步骤 1: 同步已关闭的 WAL 文件（多列族场景）
   if (needs_to_sync_closed_wals) {
-    // SyncClosedLogs() may unlock and re-lock the log_write_mutex multiple
-    // times.
+    // SyncClosedLogs() 可能会多次释放和重新获取 log_write_mutex
     VersionEdit synced_wals;
     mutex_.Unlock();
     log_io_s = SyncClosedLogs(job_context, &synced_wals);
     mutex_.Lock();
+
+    // 如果 WAL 同步成功且有 WAL 添加记录，将其应用到 MANIFEST
     if (log_io_s.ok() && synced_wals.IsWalAddition()) {
       const ReadOptions read_options(Env::IOActivity::kFlush);
       log_io_s =
@@ -236,6 +374,7 @@ Status DBImpl::FlushMemTableToOutputFile(
                                nullptr);
     }
 
+    // 如果 WAL 同步失败且不是关机或列族删除，设置后台错误
     if (!log_io_s.ok() && !log_io_s.IsShutdownInProgress() &&
         !log_io_s.IsColumnFamilyDropped()) {
       error_handler_.SetBGError(log_io_s, BackgroundErrorReason::kFlush);
@@ -245,44 +384,49 @@ Status DBImpl::FlushMemTableToOutputFile(
   }
   s = log_io_s;
 
-  // If the log sync failed, we do not need to pick memtable. Otherwise,
-  // num_flush_not_started_ needs to be rollback.
+  // 步骤 2: 选择要 flush 的 memtables
+  // 如果 WAL 同步失败，不需要选择 memtable
+  // 否则，num_flush_not_started_ 需要回滚
   TEST_SYNC_POINT("DBImpl::FlushMemTableToOutputFile:BeforePickMemtables");
   if (s.ok()) {
     flush_job.PickMemTable();
-    need_cancel = true;
+    need_cancel = true;  // 已选择 memtables，如果后续步骤失败需要取消
   }
   TEST_SYNC_POINT_CALLBACK(
       "DBImpl::FlushMemTableToOutputFile:AfterPickMemtables", &flush_job);
 
-  // may temporarily unlock and lock the mutex.
+  // 步骤 3: 通知监听器 flush 开始
+  // 注意：此函数可能会临时释放和重新获取 mutex
+  // 这就是为什么需要在 PickMemTable() 之后调用，避免期间新增 memtables 影响已选择的集合
   NotifyOnFlushBegin(cfd, &file_meta, mutable_cf_options, job_context->job_id,
                      flush_reason);
 
+  // 步骤 4: 执行实际的 flush 操作
   bool switched_to_mempurge = false;
-  // Within flush_job.Run, rocksdb may call event listener to notify
-  // file creation and deletion.
-  //
-  // Note that flush_job.Run will unlock and lock the db_mutex,
-  // and EventListener callback will be called when the db_mutex
-  // is unlocked by the current thread.
+  // flush_job.Run 内部可能会调用事件监听器通知文件创建和删除
+  // 注意：flush_job.Run 会释放和重新获取 db_mutex
+  // 事件监听器的回调会在 db_mutex 被释放时调用
   if (s.ok()) {
     s = flush_job.Run(&logs_with_prep_tracker_, &file_meta,
                       &switched_to_mempurge);
-    need_cancel = false;
+    need_cancel = false;  // flush 成功，不需要取消
   }
 
+  // 步骤 5: 失败时取消已选择的 memtables
   if (!s.ok() && need_cancel) {
     flush_job.Cancel();
   }
 
+  // 步骤 6: flush 成功后的处理
   if (s.ok()) {
+    // 安装新的 SuperVersion 并调度后台任务（flush/compaction）
     InstallSuperVersionAndScheduleWork(cfd, superversion_context,
                                        mutable_cf_options);
     if (made_progress) {
-      *made_progress = true;
+      *made_progress = true;  // 标记 flush 实际完成了
     }
 
+    // 记录日志信息：层级摘要和 blob 文件摘要
     const std::string& column_family_name = cfd->GetName();
 
     Version* const current = cfd->current();
@@ -291,11 +435,13 @@ Status DBImpl::FlushMemTableToOutputFile(
     const VersionStorageInfo* const storage_info = current->storage_info();
     assert(storage_info);
 
+    // 记录各层级文件数量和大小信息
     VersionStorageInfo::LevelSummaryStorage tmp;
     ROCKS_LOG_BUFFER(log_buffer, "[%s] Level summary: %s\n",
                      column_family_name.c_str(),
                      storage_info->LevelSummary(&tmp));
 
+    // 记录 blob 文件信息（如果启用了 blob 功能）
     const auto& blob_files = storage_info->GetBlobFiles();
     if (!blob_files.empty()) {
       assert(blob_files.front());
@@ -309,48 +455,51 @@ Status DBImpl::FlushMemTableToOutputFile(
     }
   }
 
+  // 步骤 7: 错误处理
   if (!s.ok() && !s.IsShutdownInProgress() && !s.IsColumnFamilyDropped()) {
     if (log_io_s.ok()) {
-      // Error while writing to MANIFEST.
-      // In fact, versions_->io_status() can also be the result of renaming
-      // CURRENT file. With current code, it's just difficult to tell. So just
-      // be pessimistic and try write to a new MANIFEST.
-      // TODO: distinguish between MANIFEST write and CURRENT renaming
+      // MANIFEST 写入失败
+      // 注意：versions_->io_status() 可能也是 CURRENT 文件重命名失败的结果
+      // 当前代码难以区分，所以采取悲观策略，尝试写入新的 MANIFEST
+      // TODO: 区分 MANIFEST 写入和 CURRENT 文件重命名
       if (!versions_->io_status().ok()) {
-        // If WAL sync is successful (either WAL size is 0 or there is no IO
-        // error), all the Manifest write will be map to soft error.
-        // TODO: kManifestWriteNoWAL and kFlushNoWAL are misleading. Refactor is
-        // needed.
+        // 如果 WAL 同步成功（WAL 大小为 0 或无 IO 错误），
+        // 所有 MANIFEST 写入错误都映射为软错误
+        // TODO: kManifestWriteNoWAL 和 kFlushNoWAL 名称有误导性，需要重构
         error_handler_.SetBGError(s,
                                   BackgroundErrorReason::kManifestWriteNoWAL);
       } else {
-        // If WAL sync is successful (either WAL size is 0 or there is no IO
-        // error), all the other SST file write errors will be set as
-        // kFlushNoWAL.
+        // 如果 WAL 同步成功（WAL 大小为 0 或无 IO 错误），
+        // 其他所有 SST 文件写入错误都设置为 kFlushNoWAL
         error_handler_.SetBGError(s, BackgroundErrorReason::kFlushNoWAL);
       }
     } else {
+      // WAL 同步失败
       assert(s == log_io_s);
       Status new_bg_error = s;
       error_handler_.SetBGError(new_bg_error, BackgroundErrorReason::kFlush);
     }
   }
-  // If flush ran smoothly and no mempurge happened
-  // install new SST file path.
+
+  // 步骤 8: 通知监听器 flush 完成并更新文件管理器
+  // 条件：flush 成功完成且没有切换到 mempurge（内存清理模式）
   if (s.ok() && (!switched_to_mempurge)) {
-    // may temporarily unlock and lock the mutex.
+    // 通知监听器 flush 完成（可能会临时释放和重新获取 mutex）
     NotifyOnFlushCompleted(cfd, mutable_cf_options,
                            flush_job.GetCommittedFlushJobsInfo());
+
+    // 更新 SST 文件管理器
     auto sfm = static_cast<SstFileManagerImpl*>(
         immutable_db_options_.sst_file_manager.get());
     if (sfm) {
-      // Notify sst_file_manager that a new file was added
+      // 通知文件管理器有新文件添加
       std::string file_path = MakeTableFileName(
           cfd->ioptions()->cf_paths[0].path, file_meta.fd.GetNumber());
-      // TODO (PR7798).  We should only add the file to the FileManager if it
-      // exists. Otherwise, some tests may fail.  Ignore the error in the
-      // interim.
+      // TODO (PR7798): 应该只在文件存在时添加到 FileManager
+      // 否则某些测试可能会失败。暂时忽略错误
       sfm->OnAddFile(file_path).PermitUncheckedError();
+
+      // 检查是否达到最大允许空间限制
       if (sfm->IsMaxAllowedSpaceReached()) {
         Status new_bg_error =
             Status::SpaceLimit("Max allowed space was reached");
@@ -361,6 +510,7 @@ Status DBImpl::FlushMemTableToOutputFile(
       }
     }
   }
+
   TEST_SYNC_POINT("DBImpl::FlushMemTableToOutputFile:Finish");
   return s;
 }
@@ -998,23 +1148,33 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
                                     ColumnFamilyHandle* column_family,
                                     const Slice* begin, const Slice* end,
                                     const std::string& trim_ts) {
+  // 将列族句柄转换为 ColumnFamilyHandleImpl 类型
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+
+  // 获取列族数据指针
   auto cfd = cfh->cfd();
 
+  // 验证目标路径 ID 是否有效
   if (options.target_path_id >= cfd->ioptions()->cf_paths.size()) {
     return Status::InvalidArgument("Invalid target path ID");
   }
 
+  // 标记是否需要 flush，默认为 true
   bool flush_needed = true;
 
-  // Update full_history_ts_low if it's set
+  // 如果设置了 full_history_ts_low，则更新它
   if (options.full_history_ts_low != nullptr &&
       !options.full_history_ts_low->empty()) {
+    // 将时间戳转换为字符串
     std::string ts_low = options.full_history_ts_low->ToString();
+
+    // 检查：如果指定了压缩范围，则不允许同时设置 full_history_ts_low
     if (begin != nullptr || end != nullptr) {
       return Status::InvalidArgument(
           "Cannot specify compaction range with full_history_ts_low");
     }
+
+    // 调用实现更新 full_history_ts_low
     Status s = IncreaseFullHistoryTsLowImpl(cfd, ts_low);
     if (!s.ok()) {
       LogFlush(immutable_db_options_.info_log);
@@ -1022,182 +1182,274 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
     }
   }
 
+  // 声明状态变量
   Status s;
+
+  // 如果指定了压缩范围的开始和结束
   if (begin != nullptr && end != nullptr) {
-    // TODO(ajkr): We could also optimize away the flush in certain cases where
-    // one/both sides of the interval are unbounded. But it requires more
-    // changes to RangesOverlapWithMemtables.
+    // TODO(ajkr): 我们可以在某些情况下优化掉 flush，例如区间的一边或两边是无界的
+    // 但这需要对 RangesOverlapWithMemtables 做更多修改
+
+    // 创建范围对象
     Range range(*begin, *end);
+
+    // 获取当前 SuperVersion 的引用
     SuperVersion* super_version = cfd->GetReferencedSuperVersion(this);
+
+    // 检查压缩范围是否与 MemTable 重叠
     s = cfd->RangesOverlapWithMemtables(
         {range}, super_version, immutable_db_options_.allow_data_in_errors,
         &flush_needed);
+
+    // 清理 SuperVersion 引用
     CleanupSuperVersion(super_version);
   }
 
+  // 如果前面操作成功且需要 flush
   if (s.ok() && flush_needed) {
+    // 创建 Flush 选项
     FlushOptions fo;
+
+    // 允许写入停顿
     fo.allow_write_stall = options.allow_write_stall;
+
+    // 如果启用了原子 flush
     if (immutable_db_options_.atomic_flush) {
+      // 原子 flush 所有列族的 MemTable
       s = AtomicFlushMemTables(fo, FlushReason::kManualCompaction);
-    } else {
+    } else {  // default false
+      // 只 flush 当前列族的 MemTable
       s = FlushMemTable(cfd, fo, FlushReason::kManualCompaction);
     }
+
+    // 如果 flush 失败
     if (!s.ok()) {
       LogFlush(immutable_db_options_.info_log);
       return s;
     }
   }
 
+  // 定义无效 level 的常量
   constexpr int kInvalidLevel = -1;
+
+  // 最终输出 level，初始化为无效值
   int final_output_level = kInvalidLevel;
-  bool exclusive = options.exclusive_manual_compaction;
+
+  // 是否是独占的手动压缩
+  bool exclusive = options.exclusive_manual_compaction; //默认false
+
+  // 如果使用 Universal 压缩风格且层级数大于 1
   if (cfd->ioptions()->compaction_style == kCompactionStyleUniversal &&
       cfd->NumberLevels() > 1) {
-    // Always compact all files together.
+    // Universal 压缩总是将所有文件一起压缩
+
+    // 最终输出 level 是最底层
     final_output_level = cfd->NumberLevels() - 1;
-    // if bottom most level is reserved
+
+    // 如果最底层被保留（用于 ingest_behind）
     if (immutable_db_options_.allow_ingest_behind) {
+      // 则输出到倒数第二层
       final_output_level--;
     }
+
+    // 运行手动压缩，压缩所有层
     s = RunManualCompaction(cfd, ColumnFamilyData::kCompactAllLevels,
                             final_output_level, options, begin, end, exclusive,
                             false /* disable_trivial_move */,
                             std::numeric_limits<uint64_t>::max(), trim_ts);
   } else {
+    // 非Universal压缩风格的情况
+    // 记录第一个与压缩范围重叠的 level
     int first_overlapped_level = kInvalidLevel;
+
     {
+      // 获取当前 SuperVersion 的引用
       SuperVersion* super_version = cfd->GetReferencedSuperVersion(this);
+
+      // 获取当前版本指针
       Version* current_version = super_version->current;
 
-      // Might need to query the partitioner
+      // 可能需要查询分区器
       SstPartitionerFactory* partitioner_factory =
           current_version->cfd()->ioptions()->sst_partitioner_factory.get();
+
+      // 分区器对象
       std::unique_ptr<SstPartitioner> partitioner;
+
+      // 如果存在分区器工厂且指定了压缩范围
       if (partitioner_factory && begin != nullptr && end != nullptr) {
+        // 创建分区器上下文
         SstPartitioner::Context context;
+
+        // 不是全压缩
         context.is_full_compaction = false;
+
+        // 是手动压缩
         context.is_manual_compaction = true;
+
+        // 输出 level 未知
         context.output_level = /*unknown*/ -1;
-        // Small lies about compaction range
+
+        // 关于压缩范围的小谎言（用于分区器判断）
         context.smallest_user_key = *begin;
         context.largest_user_key = *end;
+
+        // 创建分区器实例
         partitioner = partitioner_factory->CreatePartitioner(context);
       }
 
+      // 创建读取选项
       ReadOptions ro;
+
+      // 启用全局顺序查找
       ro.total_order_seek = true;
+
+      // 设置 IO 活动类型为压缩
       ro.io_activity = Env::IOActivity::kCompaction;
+
+      // 重叠标志
       bool overlap;
+
+      // 遍历所有非空层
       for (int level = 0;
            level < current_version->storage_info()->num_non_empty_levels();
            level++) {
+        // 默认为重叠
         overlap = true;
 
-        // Whether to look at specific keys within files for overlap with
-        // compaction range, other than largest and smallest keys of the file
-        // known in Version metadata.
+        // 是否需要在文件内部检查具体 key 与压缩范围的重叠
+        // 而不仅仅是检查文件元数据中的最大和最小 key
         bool check_overlap_within_file = false;
+
+        // 如果指定了压缩范围的开始和结束
         if (begin != nullptr && end != nullptr) {
-          // Typically checking overlap within files in this case
+          // 通常在这种情况下会检查文件内部的重叠
           check_overlap_within_file = true;
-          // WART: Not known why we don't check within file in one-sided bound
-          // cases
+
+          // WART: 不知道为什么在单侧边界的情况下不检查文件内部
           if (partitioner) {
-            // Especially if the partitioner is new, the manual compaction
-            // might be used to enforce the partitioning. Checking overlap
-            // within files might miss cases where compaction is needed to
-            // partition the files, as in this example:
-            // * File has two keys "001" and "111"
-            // * Compaction range is ["011", "101")
-            // * Partition boundary at "100"
-            // In cases like this, file-level overlap with the compaction
-            // range is sufficient to force any partitioning that is needed
-            // within the compaction range.
+            // 特别是如果分区器是新的，手动压缩可能被用来强制执行分区
+            // 检查文件内部的重叠可能会错过需要压缩文件进行分区的情况，例如：
+            // * 文件有两个 key "001" 和 "111"
+            // * 压缩范围是 ["011", "101")
+            // * 分区边界在 "100"
+            // 在这种情况下，文件级别与压缩范围的重叠就足以强制压缩范围内所需的任何分区
             //
-            // But if there's no partitioning boundary within the compaction
-            // range, we can be sure there's no need to fix partitioning
-            // within that range, thus safe to check overlap within file.
+            // 但是如果压缩范围内没有分区边界，我们可以确定不需要在该范围内修复分区
+            // 因此可以安全地检查文件内部的重叠
             //
-            // Use a hypothetical trivial move query to check for partition
-            // boundary in range. (NOTE: in defiance of all conventions,
-            // `begin` and `end` here are both INCLUSIVE bounds, which makes
-            // this analogy to CanDoTrivialMove() accurate even when `end` is
-            // the first key in a partition.)
+            // 使用假设的 trivial move 查询来检查范围内是否有分区边界
+            // （注意：违反所有惯例，这里的 `begin` 和 `end` 都是包含边界，
+            // 这使得即使 `end` 是分区中的第一个 key，这种与 CanDoTrivialMove() 的类比也是准确的）
             if (!partitioner->CanDoTrivialMove(*begin, *end)) {
+              // 如果不能执行 trivial move，则不检查文件内部
               check_overlap_within_file = false;
             }
           }
         }
+
+        // 如果需要检查文件内部的重叠
         if (check_overlap_within_file) {
+          // 使用级别迭代器检查重叠
           Status status = current_version->OverlapWithLevelIterator(
               ro, file_options_, *begin, *end, level, &overlap);
           if (!status.ok()) {
+            // 如果失败，则回退到文件级别检查
             check_overlap_within_file = false;
           }
         }
+
+        // 如果不检查文件内部的重叠，则检查文件级别的重叠
         if (!check_overlap_within_file) {
           overlap = current_version->storage_info()->OverlapInLevel(level,
                                                                     begin, end);
         }
+
+        // 如果找到重叠
         if (overlap) {
+          // 记录第一个重叠的 level
           first_overlapped_level = level;
           break;
         }
       }
+
+      // 清理 SuperVersion 引用
       CleanupSuperVersion(super_version);
     }
+
+    // 如果前面操作成功且找到了第一个重叠的 level
     if (s.ok() && first_overlapped_level != kInvalidLevel) {
+      // 如果是 Universal 或 FIFO 压缩风格
       if (cfd->ioptions()->compaction_style == kCompactionStyleUniversal ||
           cfd->ioptions()->compaction_style == kCompactionStyleFIFO) {
+        // 断言：这些风格的重叠 level 必须是 0
         assert(first_overlapped_level == 0);
+
+        // 运行手动压缩，从 L0 压缩到 L0
         s = RunManualCompaction(
             cfd, first_overlapped_level, first_overlapped_level, options, begin,
             end, exclusive, true /* disallow_trivial_move */,
             std::numeric_limits<uint64_t>::max() /* max_file_num_to_ignore */,
             trim_ts);
+
+        // 最终输出 level 就是第一个重叠的 level
         final_output_level = first_overlapped_level;
       } else {
+        // Level 压缩风格
         assert(cfd->ioptions()->compaction_style == kCompactionStyleLevel);
+
+        // 获取当前下一个文件编号（用于避免重写新压缩的文件）
         uint64_t next_file_number = versions_->current_next_file_number();
-        // Start compaction from `first_overlapped_level`, one level down at a
-        // time, until output level >= max_overlapped_level.
-        // When max_overlapped_level == 0, we will still compact from L0 -> L1
-        // (or LBase), and followed by a bottommost level intra-level compaction
-        // at L1 (or LBase), if applicable.
+
+        // 从 `first_overlapped_level` 开始压缩，一次压缩一层
+        // 直到输出 level >= max_overlapped_level
+        // 当 max_overlapped_level == 0 时，我们仍然会从 L0 -> L1（或 LBase）压缩
+        // 然后可能在 L1（或 LBase）进行底层级内压缩（如果适用）
         int level = first_overlapped_level;
         final_output_level = level;
         int output_level = 0, base_level = 0;
+
+        // 无限循环，逐层压缩
         for (;;) {
-          // Always allow L0 -> L1 compaction
+          // 始终允许 L0 -> L1 压缩
           if (level > 0) {
+            // 如果使用动态 level 字节大小
             if (cfd->ioptions()->level_compaction_dynamic_level_bytes) {
+              // 断言：最终输出 level 必须小于总 level 数
               assert(final_output_level < cfd->ioptions()->num_levels);
+
+              // 如果已经到达最后一层，停止
               if (final_output_level + 1 == cfd->ioptions()->num_levels) {
                 break;
               }
             } else {
-              // TODO(cbi): there is still a race condition here where
-              //  if a background compaction compacts some file beyond
-              //  current()->storage_info()->num_non_empty_levels() right after
-              //  the check here.This should happen very infrequently and should
-              //  not happen once a user populates the last level of the LSM.
+              // TODO(cbi): 这里仍然存在竞态条件
+              // 如果后台压缩在检查后立即压缩了某些文件到
+              // current()->storage_info()->num_non_empty_levels() 之外
+              // 这应该非常罕见，并且一旦用户填充了 LSM 的最后一层就不会发生
+
+              // 获取互斥锁
               InstrumentedMutexLock l(&mutex_);
-              // num_non_empty_levels may be lower after a compaction, so
-              // we check for >= here.
+
+              // 压缩后 num_non_empty_levels 可能会降低，所以这里检查 >=
               if (final_output_level + 1 >=
                   cfd->current()->storage_info()->num_non_empty_levels()) {
                 break;
               }
             }
           }
+
+          // 输出 level 是当前 level + 1
           output_level = level + 1;
+
+          // 如果使用动态 level 字节大小且当前 level 是 0
           if (cfd->ioptions()->level_compaction_dynamic_level_bytes &&
               level == 0) {
+            // L0 直接压缩到 base level
             output_level = ColumnFamilyData::kCompactToBaseLevel;
           }
-          // Use max value for `max_file_num_to_ignore` to always compact
-          // files down.
+
+          // 使用最大值作为 `max_file_num_to_ignore` 以始终向下压缩文件
           s = RunManualCompaction(
               cfd, level, output_level, options, begin, end, exclusive,
               !trim_ts.empty() /* disallow_trivial_move */,
@@ -1206,22 +1458,41 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
               output_level == ColumnFamilyData::kCompactToBaseLevel
                   ? &base_level
                   : nullptr);
+
+          // 如果压缩失败，停止循环
           if (!s.ok()) {
             break;
           }
+
+          // 如果压缩到了 base level
           if (output_level == ColumnFamilyData::kCompactToBaseLevel) {
+            // 断言：base level 必须大于 0
             assert(base_level > 0);
+
+            // 设置 level 为 base level
             level = base_level;
           } else {
+            // 否则 level 加 1
             ++level;
           }
+
+          // 更新最终输出 level
           final_output_level = level;
+
+          // 测试同步点
           TEST_SYNC_POINT("DBImpl::RunManualCompaction()::1");
           TEST_SYNC_POINT("DBImpl::RunManualCompaction()::2");
         }
+
+        // 如果前面操作成功
         if (s.ok()) {
+          // 断言：最终输出 level 必须大于 0
           assert(final_output_level > 0);
-          // bottommost level intra-level compaction
+
+          // 底层级内压缩
+          // 条件：设置了压缩过滤器 且 选项为 kIfHaveCompactionFilter
+          //       或者 选项为 kForceOptimized
+          //       或者 选项为 kForce
           if ((options.bottommost_level_compaction ==
                    BottommostLevelCompaction::kIfHaveCompactionFilter &&
                (cfd->ioptions()->compaction_filter != nullptr ||
@@ -1230,9 +1501,9 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
                   BottommostLevelCompaction::kForceOptimized ||
               options.bottommost_level_compaction ==
                   BottommostLevelCompaction::kForce) {
-            // Use `next_file_number` as `max_file_num_to_ignore` to avoid
-            // rewriting newly compacted files when it is kForceOptimized
-            // or kIfHaveCompactionFilter with compaction filter set.
+            // 使用 `next_file_number` 作为 `max_file_num_to_ignore`
+            // 以避免在 kForceOptimized 或 kIfHaveCompactionFilter 且设置了压缩过滤器时
+            // 重写新压缩的文件
             s = RunManualCompaction(
                 cfd, final_output_level, final_output_level, options, begin,
                 end, exclusive, true /* disallow_trivial_move */,
@@ -1242,46 +1513,71 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
       }
     }
   }
+
+  // 如果操作失败或没有有效的最终输出 level
   if (!s.ok() || final_output_level == kInvalidLevel) {
     LogFlush(immutable_db_options_.info_log);
     return s;
   }
 
+  // 如果需要改变 level（ReFitLevel）
   if (options.change_level) {
+    // 测试同步点
     TEST_SYNC_POINT("DBImpl::CompactRange:BeforeRefit:1");
     TEST_SYNC_POINT("DBImpl::CompactRange:BeforeRefit:2");
 
+    // 记录日志：等待后台线程停止
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "[RefitLevel] waiting for background threads to stop");
-    // TODO(hx235): remove `Enable/DisableManualCompaction` and
-    // `Continue/PauseBackgroundWork` once we ensure registering RefitLevel()'s
-    // range is sufficient (if not, what else is needed) for avoiding range
-    // conflicts with other activities (e.g, compaction, flush) that are
-    // currently avoided by `Enable/DisableManualCompaction` and
-    // `Continue/PauseBackgroundWork`.
+
+    // TODO(hx235): 一旦我们确保注册 RefitLevel() 的范围足以避免范围冲突
+    // 就移除 `Enable/DisableManualCompaction` 和 `Continue/PauseBackgroundWork`
+    // （如果不够，还需要什么）与当前通过 `Enable/DisableManualCompaction` 和
+    // `Continue/PauseBackgroundWork` 避免的其他活动（例如压缩、flush）的冲突
+
+    // 禁用手动压缩
     DisableManualCompaction();
+
+    // 暂停后台工作
     s = PauseBackgroundWork();
+
+    // 如果暂停成功
     if (s.ok()) {
+      // 测试同步点
       TEST_SYNC_POINT("DBImpl::CompactRange:PreRefitLevel");
+
+      // 执行 ReFitLevel 调整 level 布局
       s = ReFitLevel(cfd, final_output_level, options.target_level);
+
+      // 测试同步点
       TEST_SYNC_POINT("DBImpl::CompactRange:PostRefitLevel");
-      // ContinueBackgroundWork always return Status::OK().
+
+      // 继续后台工作（总是返回 Status::OK()）
       Status temp_s = ContinueBackgroundWork();
       assert(temp_s.ok());
     }
+
+    // 启用手动压缩
     EnableManualCompaction();
+
+    // 测试同步点
     TEST_SYNC_POINT(
         "DBImpl::CompactRange:PostRefitLevel:ManualCompactionEnabled");
   }
+
+  // 刷新日志
   LogFlush(immutable_db_options_.info_log);
 
   {
+    // 获取互斥锁
     InstrumentedMutexLock l(&mutex_);
-    // an automatic compaction that has been scheduled might have been
-    // preempted by the manual compactions. Need to schedule it back.
+
+    // 已经调度的自动压缩可能被手动压缩抢占
+    // 需要重新调度它
     MaybeScheduleFlushOrCompaction();
   }
 
+  // 返回状态
   return s;
 }
 
@@ -1927,43 +2223,58 @@ Status DBImpl::RunManualCompaction(
     const Slice* end, bool exclusive, bool disallow_trivial_move,
     uint64_t max_file_num_to_ignore, const std::string& trim_ts,
     int* final_output_level) {
+  // 断言：输入层必须有效（要么是所有层，要么是非负数）
   assert(input_level == ColumnFamilyData::kCompactAllLevels ||
          input_level >= 0);
 
+  // 存储范围键的内部表示（InternalKey 会包含 sequence number）
   InternalKey begin_storage, end_storage;
-  CompactionArg* ca = nullptr;
+  CompactionArg* ca = nullptr; // 压缩参数，用于传递给后台工作线程
 
-  bool scheduled = false;
-  bool unscheduled = false;
-  Env::Priority thread_pool_priority = Env::Priority::TOTAL;
-  bool manual_conflict = false;
+  // 调度状态标志
+  bool scheduled = false;    // 是否已经调度了压缩任务
+  bool unscheduled = false;  // 是否已经取消调度了压缩任务
+  Env::Priority thread_pool_priority = Env::Priority::TOTAL; // 线程池优先级
+  bool manual_conflict = false; // 是否存在冲突的压缩
 
+  // 初始化手动压缩状态对象
   ManualCompactionState manual(
       cfd, input_level, output_level, compact_range_options.target_path_id,
       exclusive, disallow_trivial_move, compact_range_options.canceled);
+
+  // 对于 Universal 和 FIFO 压缩风格，强制压缩所有文件（忽略范围参数）
   // For universal compaction, we enforce every manual compaction to compact
   // all files.
   if (begin == nullptr ||
       cfd->ioptions()->compaction_style == kCompactionStyleUniversal ||
       cfd->ioptions()->compaction_style == kCompactionStyleFIFO) {
-    manual.begin = nullptr;
+    manual.begin = nullptr; // 压缩整个数据范围（从最小键开始）
   } else {
+    // 设置为 user key 的最小可能 sequence number（包含所有版本）
     begin_storage.SetMinPossibleForUserKey(*begin);
     manual.begin = &begin_storage;
   }
+
   if (end == nullptr ||
       cfd->ioptions()->compaction_style == kCompactionStyleUniversal ||
       cfd->ioptions()->compaction_style == kCompactionStyleFIFO) {
-    manual.end = nullptr;
+    manual.end = nullptr; // 压缩整个数据范围（到最大键结束）
   } else {
+    // 设置为 user key 的最大可能 sequence number（包含所有版本）
     end_storage.SetMaxPossibleForUserKey(*end);
     manual.end = &end_storage;
   }
 
+  // 测试同步点，用于单元测试
   TEST_SYNC_POINT("DBImpl::RunManualCompaction:0");
   TEST_SYNC_POINT("DBImpl::RunManualCompaction:1");
+
+  // 获取数据库锁，保护共享状态
   InstrumentedMutexLock l(&mutex_);
 
+  // 检查是否暂停了手动压缩
+  // DisableManualCompaction() 会等待所有手动压缩完成后才设置该标志
+  // 此时不应再添加新的手动压缩任务，直接返回
   if (manual_compaction_paused_ > 0) {
     // Does not make sense to `AddManualCompaction()` in this scenario since
     // `DisableManualCompaction()` just waited for the manual compaction queue
@@ -1975,33 +2286,33 @@ Status DBImpl::RunManualCompaction(
     return manual.status;
   }
 
-  // When a manual compaction arrives, temporarily disable scheduling of
-  // non-manual compactions and wait until the number of scheduled compaction
-  // jobs drops to zero. This used to be needed to ensure that this manual
-  // compaction can compact any range of keys/files. Now it is optional
-  // (see `CompactRangeOptions::exclusive_manual_compaction`). The use case for
-  // `exclusive_manual_compaction=true` is unclear beyond not trusting the code.
+  // 当手动压缩请求到达时，需要处理排他性调度：
+  // 1. 临时禁用非手动压缩的调度（通过 HasPendingManualCompaction 标志）
+  // 2. 如果 exclusive=true，等待所有后台压缩任务完成
   //
-  // HasPendingManualCompaction() is true when at least one thread is inside
-  // RunManualCompaction(), i.e. during that time no other compaction will
-  // get scheduled (see MaybeScheduleFlushOrCompaction).
+  // 这样做是为了确保手动压缩能够访问任意范围的键/文件。
+  // 现在这是可选项（通过 CompactRangeOptions::exclusive_manual_compaction 控制）
   //
-  // Note that the following loop doesn't stop more that one thread calling
-  // RunManualCompaction() from getting to the second while loop below.
-  // However, only one of them will actually schedule compaction, while
-  // others will wait on a condition variable until it completes.
+  // HasPendingManualCompaction() 在至少有一个线程在 RunManualCompaction() 中时返回 true
+  // 此时不会有其他压缩被调度（见 MaybeScheduleFlushOrCompaction）
+  //
+  // 注意：下面的循环不会阻止多个线程同时调用 RunManualCompaction()
+  // 多个线程都可以到达下面的第二个 while 循环
+  // 但只有一个线程会实际调度压缩，其他线程会在条件变量上等待直到完成
 
+  // 将手动压缩任务添加到挂起的压缩队列
   AddManualCompaction(&manual);
   TEST_SYNC_POINT_CALLBACK("DBImpl::RunManualCompaction:NotScheduled", &mutex_);
+
+  // 如果要求排他性执行（exclusive=true）
   if (exclusive) {
-    // Limitation: there's no way to wake up the below loop when user sets
-    // `*manual.canceled`. So `CompactRangeOptions::exclusive_manual_compaction`
-    // and `CompactRangeOptions::canceled` might not work well together.
+    // 限制：当用户设置 *manual.canceled 时，没有方式唤醒下面的循环
+    // 所以 exclusive_manual_compaction 和 canceled 可能无法很好地协同工作
     while (bg_bottom_compaction_scheduled_ > 0 ||
            bg_compaction_scheduled_ > 0) {
+      // 检查是否被取消或暂停
       if (manual_compaction_paused_ > 0 || manual.canceled == true) {
-        // Pretend the error came from compaction so the below cleanup/error
-        // handling code can process it.
+        // 停止等待，假装错误来自压缩，以便下面的清理/错误处理代码能够处理它
         manual.done = true;
         manual.status =
             Status::Incomplete(Status::SubCode::kManualCompactionPaused);
@@ -2013,16 +2324,19 @@ Status DBImpl::RunManualCompaction(
           "[%s] Manual compaction waiting for all other scheduled background "
           "compactions to finish",
           cfd->GetName().c_str());
+      // 等待条件变量，直到所有后台压缩完成
       bg_cv_.Wait();
     }
   }
 
+  // 创建日志缓冲区，用于批量写入日志
   LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
                        immutable_db_options_.info_log.get());
 
   ROCKS_LOG_BUFFER(&log_buffer, "[%s] Manual compaction starting",
                    cfd->GetName().c_str());
 
+  // 主循环：持续执行直到手动压缩完成
   // We don't check bg_error_ here, because if we get the error in compaction,
   // the compaction will set manual.status to bg_error_ and set manual.done to
   // true.
@@ -2030,6 +2344,15 @@ Status DBImpl::RunManualCompaction(
     assert(HasPendingManualCompaction());
     manual_conflict = false;
     Compaction* compaction = nullptr;
+
+    // 检查是否应该运行手动压缩：
+    // 1. ShouldntRunManualCompaction：检查是否有其他条件阻止运行（如暂停、取消）
+    // 2. manual.in_progress：检查是否已经在运行中
+    // 3. scheduled：检查是否已经调度了
+    // 4. 尝试创建压缩计划：
+    //    - manual.manual_end = &manual.tmp_storage1：设置输出参数接收实际压缩范围
+    //    - 调用 CompactRange() 创建压缩计划
+    //    - 如果返回 nullptr 且 manual_conflict=true，说明存在冲突的压缩
     if (ShouldntRunManualCompaction(&manual) || (manual.in_progress == true) ||
         scheduled ||
         (((manual.manual_end = &manual.tmp_storage1) != nullptr) &&
@@ -2039,6 +2362,10 @@ Status DBImpl::RunManualCompaction(
                manual.begin, manual.end, &manual.manual_end, &manual_conflict,
                max_file_num_to_ignore, trim_ts)) == nullptr &&
           manual_conflict))) {
+
+      // 进入这个分支说明：
+      // - 还没有调度压缩，或者
+      // - 存在冲突的压缩，需要等待
       if (!scheduled) {
         // There is a conflicting compaction
         if (manual_compaction_paused_ > 0 || manual.canceled == true) {
@@ -2050,11 +2377,15 @@ Status DBImpl::RunManualCompaction(
         }
       }
       if (!manual.done) {
+        // 等待条件变量，直到状态变化（如冲突的压缩完成）
         bg_cv_.Wait();
       }
+
+      // 处理暂停时的取消调度逻辑
       if (manual_compaction_paused_ > 0 && scheduled && !unscheduled) {
         assert(thread_pool_priority != Env::Priority::TOTAL);
         // unschedule all manual compactions
+        // 取消所有手动压缩任务（从线程池队列中移除）
         auto unscheduled_task_num = env_->UnSchedule(
             GetTaskTag(TaskType::kManualCompaction), thread_pool_priority);
         if (unscheduled_task_num > 0) {
@@ -2063,19 +2394,24 @@ Status DBImpl::RunManualCompaction(
               "[%s] Unscheduled %d number of manual compactions from the "
               "thread-pool",
               cfd->GetName().c_str(), unscheduled_task_num);
-          // it may unschedule other manual compactions, notify others.
+          // 可能会取消其他手动压缩任务，通知所有等待的线程
           bg_cv_.SignalAll();
         }
         unscheduled = true;
         TEST_SYNC_POINT("DBImpl::RunManualCompaction:Unscheduled");
       }
+
+      // 如果压缩不完整（incomplete=true），重置调度状态
+      // 这允许在压缩完成后重新调度
       if (scheduled && manual.incomplete == true) {
         assert(!manual.in_progress);
         scheduled = false;
         manual.incomplete = false;
       }
     } else if (!scheduled) {
+      // 成功创建了压缩计划，且还没有调度
       if (compaction == nullptr) {
+        // 不需要压缩（范围为空）或存在冲突的压缩（但在上面的逻辑中已处理）
         manual.done = true;
         if (final_output_level) {
           // No compaction needed or there is a conflicting compaction.
@@ -2083,26 +2419,37 @@ Status DBImpl::RunManualCompaction(
           // have compacted to.
           *final_output_level = output_level;
           if (output_level == ColumnFamilyData::kCompactToBaseLevel) {
+            // 如果输出层是 base_level，则获取实际的 base level
             *final_output_level = cfd->current()->storage_info()->base_level();
           }
         }
         bg_cv_.SignalAll();
         continue;
       }
+
+      // 创建压缩参数对象，传递给后台工作线程
       ca = new CompactionArg;
       ca->db = this;
       ca->prepicked_compaction = new PrepickedCompaction;
       ca->prepicked_compaction->manual_compaction_state = &manual;
       ca->prepicked_compaction->compaction = compaction;
+
+      // 请求压缩 token（用于控制并发压缩数量）
+      // 手动压缩不会被限流，只统计任务数
       if (!RequestCompactionToken(
               cfd, true, &ca->prepicked_compaction->task_token, &log_buffer)) {
         // Don't throttle manual compaction, only count outstanding tasks.
         assert(false);
       }
+
       manual.incomplete = false;
+
+      // 根据压缩类型选择线程池：
+      // - bottommost_level 压缩：使用 BOTTOM 优先级线程池（如果配置了）
+      // - 普通压缩：使用 LOW 优先级线程池
       if (compaction->bottommost_level() &&
           env_->GetBackgroundThreads(Env::Priority::BOTTOM) > 0) {
-        bg_bottom_compaction_scheduled_++;
+        bg_bottom_compaction_scheduled_++; // 增加 bottom 压缩计数
         ca->compaction_pri_ = Env::Priority::BOTTOM;
         env_->Schedule(&DBImpl::BGWorkBottomCompaction, ca,
                        Env::Priority::BOTTOM,
@@ -2110,32 +2457,45 @@ Status DBImpl::RunManualCompaction(
                        &DBImpl::UnscheduleCompactionCallback);
         thread_pool_priority = Env::Priority::BOTTOM;
       } else {
-        bg_compaction_scheduled_++;
+        bg_compaction_scheduled_++; // 增加普通压缩计数
         ca->compaction_pri_ = Env::Priority::LOW;
         env_->Schedule(&DBImpl::BGWorkCompaction, ca, Env::Priority::LOW,
                        GetTaskTag(TaskType::kManualCompaction),
                        &DBImpl::UnscheduleCompactionCallback);
         thread_pool_priority = Env::Priority::LOW;
       }
-      scheduled = true;
+
+      scheduled = true; // 标记为已调度
       TEST_SYNC_POINT("DBImpl::RunManualCompaction:Scheduled");
+
+      // 记录最终输出层
       if (final_output_level) {
         *final_output_level = compaction->output_level();
       }
     }
+    // 注意：在循环中，当 scheduled=true 时，我们会在 bg_cv_.Wait() 上等待
+    // 压缩完成后，BGWorkCompaction/BGWorkBottomCompaction 会：
+    // 1. 设置 manual.done = true（如果完成）
+    // 2. 设置 manual.incomplete = true（如果需要继续下一轮压缩）
+    // 3. 调用 bg_cv_.SignalAll() 唤醒等待线程
   }
 
+  // 将缓冲的日志刷新到日志文件
   log_buffer.FlushBufferToLog();
+
+  // 清理：从挂起的压缩队列中移除
   assert(!manual.in_progress);
   assert(HasPendingManualCompaction());
   RemoveManualCompaction(&manual);
-  // if the manual job is unscheduled, try schedule other jobs in case there's
-  // any unscheduled compaction job which was blocked by exclusive manual
-  // compaction.
+
+  // 如果手动压缩被取消调度（因为暂停），尝试调度其他压缩任务
+  // 可能有其他压缩任务被排他性的手动压缩阻塞了
   if (manual.status.IsIncomplete() &&
       manual.status.subcode() == Status::SubCode::kManualCompactionPaused) {
     MaybeScheduleFlushOrCompaction();
   }
+
+  // 唤醒所有等待的线程
   bg_cv_.SignalAll();
   return manual.status;
 }
@@ -2640,87 +3000,148 @@ void DBImpl::EnableManualCompaction() {
 }
 
 void DBImpl::MaybeScheduleFlushOrCompaction() {
+  // 断言：调用此函数时必须持有互斥锁
   mutex_.AssertHeld();
+
+  // 检查：如果数据库未成功打开，则不调度后台任务
+  // 因为压缩操作可能会与数据库打开操作产生数据竞争
   if (!opened_successfully_) {
-    // Compaction may introduce data race to DB open
+    // 压缩操作可能会与数据库打开产生数据竞争
     return;
   }
+
+  // 检查：如果后台工作已暂停，直接返回
   if (bg_work_paused_ > 0) {
-    // we paused the background work
+    // 后台工作已被暂停
     return;
   } else if (error_handler_.IsBGWorkStopped() &&
              !error_handler_.IsRecoveryInProgress()) {
-    // There has been a hard error and this call is not part of the recovery
-    // sequence. Bail out here so we don't get into an endless loop of
-    // scheduling BG work which will again call this function
+    // 检查：发生了严重错误且当前调用不是恢复序列的一部分
+    // 在此退出以避免陷入调度后台工作的无限循环
+    // 因为后台工作失败后会再次调用此函数
+    // 发生了严重错误且此调用不是恢复序列的一部分
+    // 在此处退出，避免陷入调度后台工作然后再次调用此函数的无限循环
     return;
   } else if (shutting_down_.load(std::memory_order_acquire)) {
-    // DB is being deleted; no more background compactions
+    // 检查：数据库正在关闭中，不再调度后台压缩任务
+    // 数据库正在被删除；不再进行后台压缩
     return;
   }
+
+  // 获取后台任务的限制（最大并发 flush 和 compaction 数量）
   auto bg_job_limits = GetBGJobLimits();
+
+  // 检查高优先级（flush）线程池是否为空（未配置）
   bool is_flush_pool_empty =
       env_->GetBackgroundThreads(Env::Priority::HIGH) == 0;
+
+  // 循环：调度高优先级（HIGH）的 flush 任务
+  // 条件：flush 线程池非空 && 有未调度的 flush && 已调度的 flush 未达到上限
   while (!is_flush_pool_empty && unscheduled_flushes_ > 0 &&
          bg_flush_scheduled_ < bg_job_limits.max_flushes) {
+    // 测试同步点：在调度 flush 任务前
     TEST_SYNC_POINT_CALLBACK(
         "DBImpl::MaybeScheduleFlushOrCompaction:BeforeSchedule",
         &unscheduled_flushes_);
+
+    // 增加已调度的 flush 任务计数
     bg_flush_scheduled_++;
+
+    // 创建 flush 线程参数对象
     FlushThreadArg* fta = new FlushThreadArg;
+
+    // 设置参数中的数据库指针
     fta->db_ = this;
+
+    // 设置线程优先级为高优先级
     fta->thread_pri_ = Env::Priority::HIGH;
+
+    // 调度 flush 后台任务
+    // 参数：任务函数、任务参数、优先级、数据库实例、取消回调
     env_->Schedule(&DBImpl::BGWorkFlush, fta, Env::Priority::HIGH, this,
                    &DBImpl::UnscheduleFlushCallback);
+
+    // 减少未调度的 flush 任务计数
     --unscheduled_flushes_;
+
+    // 测试同步点：在调度 flush 任务后
     TEST_SYNC_POINT_CALLBACK(
         "DBImpl::MaybeScheduleFlushOrCompaction:AfterSchedule:0",
         &unscheduled_flushes_);
   }
 
-  // special case -- if high-pri (flush) thread pool is empty, then schedule
-  // flushes in low-pri (compaction) thread pool.
+  // 特殊情况：如果高优先级（flush）线程池为空，则在低优先级（compaction）线程池中调度 flush
   if (is_flush_pool_empty) {
+    // 循环：在低优先级线程池中调度 flush 任务
+    // 条件：有未调度的 flush && 已调度的 flush + compaction 未达到 flush 上限
     while (unscheduled_flushes_ > 0 &&
            bg_flush_scheduled_ + bg_compaction_scheduled_ <
                bg_job_limits.max_flushes) {
+      // 增加已调度的 flush 任务计数
       bg_flush_scheduled_++;
+
+      // 创建 flush 线程参数对象
       FlushThreadArg* fta = new FlushThreadArg;
+
+      // 设置参数中的数据库指针
       fta->db_ = this;
+
+      // 设置线程优先级为低优先级
       fta->thread_pri_ = Env::Priority::LOW;
+
+      // 在低优先级线程池中调度 flush 后台任务
       env_->Schedule(&DBImpl::BGWorkFlush, fta, Env::Priority::LOW, this,
                      &DBImpl::UnscheduleFlushCallback);
+
+      // 减少未调度的 flush 任务计数
       --unscheduled_flushes_;
     }
   }
 
+  // 检查：如果后台压缩已暂停，直接返回
   if (bg_compaction_paused_ > 0) {
-    // we paused the background compaction
+    // 后台压缩已被暂停
     return;
   } else if (error_handler_.IsBGWorkStopped()) {
-    // Compaction is not part of the recovery sequence from a hard error. We
-    // might get here because recovery might do a flush and install a new
-    // super version, which will try to schedule pending compactions. Bail
-    // out here and let the higher level recovery handle compactions
+    // 检查：后台工作已停止
+    // 压缩不是从严重错误恢复序列的一部分
+    // 我们可能到达这里是因为恢复可能执行 flush 并安装新的 super version，
+    // 这会尝试调度挂起的压缩。在此退出，让更高层的恢复处理压缩
     return;
   }
 
+  // 检查：是否有独占的手动压缩任务
   if (HasExclusiveManualCompaction()) {
-    // only manual compactions are allowed to run. don't schedule automatic
-    // compactions
+    // 只允许手动压缩运行。不要调度自动压缩
     TEST_SYNC_POINT("DBImpl::MaybeScheduleFlushOrCompaction:Conflict");
     return;
   }
 
+  // 循环：调度低优先级（LOW）的 compaction 任务
+  // 条件：已调度的 compaction + bottom compaction 未达到上限 && 有未调度的 compaction
   while (bg_compaction_scheduled_ + bg_bottom_compaction_scheduled_ <
              bg_job_limits.max_compactions &&
          unscheduled_compactions_ > 0) {
+    // 创建 compaction 参数对象
     CompactionArg* ca = new CompactionArg;
+
+    // 设置参数中的数据库指针
     ca->db = this;
+
+    // 设置线程优先级为低优先级
     ca->compaction_pri_ = Env::Priority::LOW;
+
+    // 设置预选的压缩任务为空（稍后会自动选择）
     ca->prepicked_compaction = nullptr;
+
+    // 增加已调度的 compaction 任务计数
     bg_compaction_scheduled_++;
+
+    // 减少未调度的 compaction 任务计数
     unscheduled_compactions_--;
+
+    // 调度 compaction 后台任务
+    // 参数：任务函数、任务参数、优先级、数据库实例、取消回调
     env_->Schedule(&DBImpl::BGWorkCompaction, ca, Env::Priority::LOW, this,
                    &DBImpl::UnscheduleCompactionCallback);
   }
@@ -2862,35 +3283,129 @@ void DBImpl::SchedulePendingPurge(std::string fname, std::string dir_to_sync,
 }
 
 void DBImpl::BGWorkFlush(void* arg) {
+  // 将参数转换为 FlushThreadArg 并复制内容
+  // 使用值拷贝而不是指针，确保在删除原始参数后仍然可以访问数据
   FlushThreadArg fta = *(reinterpret_cast<FlushThreadArg*>(arg));
+
+  // 删除传递进来的参数指针（已复制到 fta 中）
+  // 这是必要的，因为线程池使用 new 分配的内存传递参数
   delete reinterpret_cast<FlushThreadArg*>(arg);
 
+  // 设置 IO 统计中的线程池 ID
+  // 根据线程的实际优先级设置（HIGH 或 LOW）
+  // 用于区分不同优先级线程的 IO 操作统计
   IOSTATS_SET_THREAD_POOL_ID(fta.thread_pri_);
+
+  // 测试同步点：在 flush 工作开始时
+  // 用于测试和调试，可以在特定点注入延迟或检查状态
   TEST_SYNC_POINT("DBImpl::BGWorkFlush");
+
+  // 调用实际的 flush 处理函数
+  // 参数：线程优先级（从 fta.thread_pri_ 传入）
+  // 这里会将执行权转移给 BackgroundCallFlush 函数
   static_cast_with_check<DBImpl>(fta.db_)->BackgroundCallFlush(fta.thread_pri_);
+
+  // 测试同步点：在 flush 工作完成时
+  // 用于测试和调试，可以验证 flush 操作是否正确完成
   TEST_SYNC_POINT("DBImpl::BGWorkFlush:done");
 }
 
 void DBImpl::BGWorkCompaction(void* arg) {
+  // 将参数转换为 CompactionArg 并复制内容
+  // 使用值拷贝而不是指针，确保在删除原始参数后仍然可以访问数据
   CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
+
+  // 删除传递进来的参数指针（已复制到 ca 中）
+  // 这是必要的，因为线程池使用 new 分配的内存传递参数
   delete reinterpret_cast<CompactionArg*>(arg);
+
+  // 设置 IO 统计中的线程池 ID 为低优先级
+  // 用于区分不同优先级线程的 IO 操作统计
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
+
+  // 测试同步点：在压缩工作开始时
+  // 用于测试和调试，可以在特定点注入延迟或检查状态
   TEST_SYNC_POINT("DBImpl::BGWorkCompaction");
+
+  // 获取预选的压缩任务指针
+  // 如果是自动压缩，可能为 nullptr；如果是手动压缩，会指向具体的压缩任务
   auto prepicked_compaction =
       static_cast<PrepickedCompaction*>(ca.prepicked_compaction);
+
+  // 调用实际的压缩处理函数
+  // 参数：预选的压缩任务、线程优先级（LOW）
+  // 这里会将执行权转移给 BackgroundCallCompaction 函数
   static_cast_with_check<DBImpl>(ca.db)->BackgroundCallCompaction(
       prepicked_compaction, Env::Priority::LOW);
+
+  // 删除预选的压缩任务对象（如果存在）
+  // 释放动态分配的内存
   delete prepicked_compaction;
 }
 
 void DBImpl::BGWorkBottomCompaction(void* arg) {
+  // ===== Bottom 优先级压缩后台工作线程入口函数 =====
+  //
+  // 该函数是 bottommost 压缩任务的后台线程入口，负责：
+  // 1. 从参数中提取压缩任务信息
+  // 2. 设置线程池 ID 用于 IO 统计
+  // 3. 调用实际的压缩执行函数
+  //
+  // Bottommost 压缩特点：
+  // - 指的是压缩到 LSM 树最底层的压缩操作
+  // - 这些压缩通常涉及大量数据，需要更长时间
+  // - 使用专门的 BOTTOM 优先级线程池（如果配置了）
+  // - 与普通压缩分离，避免阻塞常规压缩任务
+  //
+  // 参数 arg：指向 CompactionArg 结构体的指针，包含压缩任务信息
+  // 注意：调用者负责分配内存，此函数负责释放内存
+
+  // 1. 从参数中提取并复制 CompactionArg 内容
+  // 使用拷贝构造函数复制，以便立即释放原始参数内存
+  // 这样做是为了避免在长时间运行的压缩过程中持有临时内存
   CompactionArg ca = *(static_cast<CompactionArg*>(arg));
+
+  // 2. 释放原始参数内存（由 RunManualCompaction 分配）
   delete static_cast<CompactionArg*>(arg);
+
+  // 3. 设置 I/O 统计的线程池 ID
+  // 这样 I/O 统计可以区分不同优先级线程池的 I/O 活动
+  // 有助于性能分析和监控
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::BOTTOM);
+
+  // 4. 测试同步点（用于单元测试）
+  // 允许测试代码在此时插入自定义逻辑
   TEST_SYNC_POINT("DBImpl::BGWorkBottomCompaction");
+
+  // 5. 提取预选的压缩任务
+  // PrepickedCompaction 包含：
+  // - compaction：压缩计划对象（包含输入文件、输出层等信息）
+  // - manual_compaction_state：手动压缩状态（如果是手动压缩）
+  // - task_token：任务限制器 token（用于控制并发任务数）
   auto* prepicked_compaction = ca.prepicked_compaction;
+
+  // 6. 断言：确保压缩任务有效
+  // prepicked_compaction 不能为空
+  // compaction 也不能为空（必须有有效的压缩计划）
   assert(prepicked_compaction && prepicked_compaction->compaction);
+
+  // 7. 调用实际的压缩执行函数
+  // BackgroundCallCompaction 是压缩的核心执行函数，负责：
+  // - 执行实际的压缩操作（读取输入文件、排序、写入输出文件）
+  // - 更新版本信息（VersionEdit）
+  // - 处理错误和重试逻辑
+  // - 更新压缩状态（done、in_progress、incomplete 等）
+  // - 释放压缩资源
+  // - 唤醒等待的线程
+  //
+  // 参数：
+  // - prepicked_compaction：压缩任务信息
+  // - Env::Priority::BOTTOM：线程优先级标识
   ca.db->BackgroundCallCompaction(prepicked_compaction, Env::Priority::BOTTOM);
+
+  // 8. 释放 prepicked_compaction 内存
+  // 注意：compaction 对象的所有权在 BackgroundCallCompaction 中转移
+  // 这里只释放 prepicked_compaction 结构体本身
   delete prepicked_compaction;
 }
 
@@ -2943,62 +3458,90 @@ void DBImpl::UnscheduleFlushCallback(void* arg) {
   TEST_SYNC_POINT("DBImpl::UnscheduleFlushCallback");
 }
 
+/**
+ * @brief 后台Flush操作的实现函数
+ *
+ * 该函数负责执行实际的Flush操作，将memtable中的数据刷新到磁盘：
+ * 1. 检查是否应该执行Flush（错误状态、shutdown状态等）
+ * 2. 从flush队列中选择需要Flush的列族
+ * 3. 调用FlushMemTablesToOutputFiles执行实际的Flush
+ * 4. 记录Flush原因并释放列族引用
+ *
+ * @param made_progress 输出参数，表示是否实际完成了Flush工作
+ * @param job_context 作业上下文，包含任务状态和superversion上下文
+ * @param log_buffer 日志缓冲区，用于记录Flush过程
+ * @param reason 输出参数，返回Flush的原因
+ * @param thread_pri 线程优先级
+ * @return Status Flush操作的状态
+ *
+ * @note 该函数必须在持有mutex_的情况下调用
+ */
 Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
                                LogBuffer* log_buffer, FlushReason* reason,
                                Env::Priority thread_pri) {
-  mutex_.AssertHeld();
+  mutex_.AssertHeld(); // 确保当前线程持有互斥锁
 
-  Status status;
-  *reason = FlushReason::kOthers;
+  Status status; // 状态对象
+  *reason = FlushReason::kOthers; // 默认Flush原因
   // If BG work is stopped due to an error, but a recovery is in progress,
   // that means this flush is part of the recovery. So allow it to go through
+  // 如果后台工作因错误停止，但正在进行恢复，说明这个Flush是恢复的一部分，允许执行
   if (!error_handler_.IsBGWorkStopped()) {
     if (shutting_down_.load(std::memory_order_acquire)) {
-      status = Status::ShutdownInProgress();
+      status = Status::ShutdownInProgress(); // DB正在关闭
     }
   } else if (!error_handler_.IsRecoveryInProgress()) {
-    status = error_handler_.GetBGError();
+    status = error_handler_.GetBGError(); // 获取后台错误
   }
 
   if (!status.ok()) {
-    return status;
+    return status; // 有错误则直接返回
   }
 
-  autovector<BGFlushArg> bg_flush_args;
+  autovector<BGFlushArg> bg_flush_args; // 后台Flush参数列表
   std::vector<SuperVersionContext>& superversion_contexts =
-      job_context->superversion_contexts;
-  autovector<ColumnFamilyData*> column_families_not_to_flush;
+      job_context->superversion_contexts; // superversion上下文列表
+  autovector<ColumnFamilyData*> column_families_not_to_flush; // 不需要Flush的列族列表
+
+  // 从flush队列中选择需要Flush的列族
   while (!flush_queue_.empty()) {
     // This cfd is already referenced
+    // 从队列中取出第一个Flush任务（该列族已被引用）
     auto [flush_reason, cfd_to_max_mem_id_to_persist] =
         PopFirstFromFlushQueue();
-    superversion_contexts.clear();
-    superversion_contexts.reserve(cfd_to_max_mem_id_to_persist.size());
+    superversion_contexts.clear(); // 清空superversion上下文
+    superversion_contexts.reserve(cfd_to_max_mem_id_to_persist.size()); // 预分配空间
 
+    // 遍历需要Flush的列族及其最大memtable ID
     for (const auto& [cfd, max_memtable_id] : cfd_to_max_mem_id_to_persist) {
       if (cfd->GetMempurgeUsed()) {
         // If imm() contains silent memtables (e.g.: because
         // MemPurge was activated), requesting a flush will
         // mark the imm_needed as true.
+        // 如果imm()包含静默memtable（例如因为MemPurge被激活），
+        // 请求Flush会将imm_needed标记为true
         cfd->imm()->FlushRequested();
       }
 
       if (cfd->IsDropped() || !cfd->imm()->IsFlushPending()) {
         // can't flush this CF, try next one
+        // 列族已删除或没有待Flush的memtable，跳过
         column_families_not_to_flush.push_back(cfd);
         continue;
       }
+      // 创建superversion上下文和Flush参数
       superversion_contexts.emplace_back(SuperVersionContext(true));
       bg_flush_args.emplace_back(cfd, max_memtable_id,
                                  &(superversion_contexts.back()), flush_reason);
     }
     if (!bg_flush_args.empty()) {
-      break;
+      break; // 找到需要Flush的列族，退出循环
     }
   }
 
+  // 如果有需要Flush的列族
   if (!bg_flush_args.empty()) {
-    auto bg_job_limits = GetBGJobLimits();
+    auto bg_job_limits = GetBGJobLimits(); // 获取后台任务限制
     for (const auto& arg : bg_flush_args) {
       ColumnFamilyData* cfd = arg.cfd_;
       ROCKS_LOG_BUFFER(
@@ -3009,54 +3552,78 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
           "flush slots scheduled %d, compaction slots scheduled %d",
           cfd->GetName().c_str(), bg_job_limits.max_flushes,
           bg_job_limits.max_compactions, bg_flush_scheduled_,
-          bg_compaction_scheduled_);
+          bg_compaction_scheduled_); // 记录日志
     }
+    // 执行实际的Flush操作
     status = FlushMemTablesToOutputFiles(bg_flush_args, made_progress,
                                          job_context, log_buffer, thread_pri);
-    TEST_SYNC_POINT("DBImpl::BackgroundFlush:BeforeFlush");
+    TEST_SYNC_POINT("DBImpl::BackgroundFlush:BeforeFlush"); // 测试同步点
 // All the CFD/bg_flush_arg in the FlushReq must have the same flush reason, so
 // just grab the first one
+// FlushReq中的所有列族/参数必须有相同的Flush原因，所以只需取第一个
 #ifndef NDEBUG
     for (const auto& bg_flush_arg : bg_flush_args) {
-      assert(bg_flush_arg.flush_reason_ == bg_flush_args[0].flush_reason_);
+      assert(bg_flush_arg.flush_reason_ == bg_flush_args[0].flush_reason_); // 断言所有Flush原因相同
     }
 #endif /* !NDEBUG */
-    *reason = bg_flush_args[0].flush_reason_;
+    *reason = bg_flush_args[0].flush_reason_; // 记录Flush原因
+    // 释放列族引用
     for (auto& arg : bg_flush_args) {
       ColumnFamilyData* cfd = arg.cfd_;
       if (cfd->UnrefAndTryDelete()) {
-        arg.cfd_ = nullptr;
+        arg.cfd_ = nullptr; // 列族已删除，置空指针
       }
     }
   }
+  // 释放不需要Flush的列族的引用
   for (auto cfd : column_families_not_to_flush) {
     cfd->UnrefAndTryDelete();
   }
-  return status;
+  return status; // 返回状态
 }
 
+/**
+ * @brief 后台Flush调用的主函数
+ *
+ * 该函数是后台Flush线程的入口点，负责：
+ * 1. 初始化Flush作业上下文和日志缓冲区
+ * 2. 在持有互斥锁的情况下执行Flush操作
+ * 3. 处理Flush过程中的错误（如环境问题）
+ * 4. 清理临时文件和过期文件
+ * 5. 减少调度计数并触发下一次调度
+ * 6. 通知等待的线程（如DB析构函数）
+ *
+ * @param thread_pri 后台线程的优先级
+ *
+ * @note 该函数必须在持有mutex_的情况下运行大部分逻辑
+ * @note bg_flush_scheduled_必须为true才能调用此函数
+ * @note 调用SignalAll后不能再访问DB变量，因为DB可能被析构
+ */
 void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
-  bool made_progress = false;
-  JobContext job_context(next_job_id_.fetch_add(1), true);
+  bool made_progress = false; // 是否实际完成了Flush工作
+  JobContext job_context(next_job_id_.fetch_add(1), true); // 创建新的作业上下文
 
-  TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallFlush:start", nullptr);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallFlush:start", nullptr); // 测试同步点
 
   LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
-                       immutable_db_options_.info_log.get());
-  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:1");
-  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:2");
+                       immutable_db_options_.info_log.get()); // 初始化日志缓冲区
+  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:1"); // 测试同步点
+  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:2"); // 测试同步点
   {
-    InstrumentedMutexLock l(&mutex_);
-    assert(bg_flush_scheduled_);
-    num_running_flushes_++;
+    InstrumentedMutexLock l(&mutex_); // 获取互斥锁
+    assert(bg_flush_scheduled_); // 确保已经调度了Flush任务
+    num_running_flushes_++; // 增加正在运行的Flush计数
 
     std::unique_ptr<std::list<uint64_t>::iterator>
         pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
-            CaptureCurrentFileNumberInPendingOutputs()));
-    FlushReason reason;
+            CaptureCurrentFileNumberInPendingOutputs())); // 捕获当前文件号到pending_outputs中，用于清理
+    FlushReason reason; // Flush的原因
 
+    // 执行实际的Flush操作
     Status s = BackgroundFlush(&made_progress, &job_context, &log_buffer,
                                &reason, thread_pri);
+    // 处理Flush错误：如果不是shutdown、列族删除或错误恢复的情况，等待一段时间后重试
+    // 这样可以避免在环境问题导致持续失败的情况下消耗过多资源
     if (!s.ok() && !s.IsShutdownInProgress() && !s.IsColumnFamilyDropped() &&
         reason != FlushReason::kErrorRecovery) {
       // Wait a little bit before retrying background flush in
@@ -3064,106 +3631,143 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
       // chew up resources for failed flushes for the duration of
       // the problem.
       uint64_t error_cnt =
-          default_cf_internal_stats_->BumpAndGetBackgroundErrorCount();
-      bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
-      mutex_.Unlock();
+          default_cf_internal_stats_->BumpAndGetBackgroundErrorCount(); // 增加并获取错误计数
+      bg_cv_.SignalAll();  // In case a waiter can proceed despite the error // 唤醒等待的线程
+      mutex_.Unlock(); // 释放互斥锁，允许其他操作进行
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "Waiting after background flush error: %s"
                       "Accumulated background error counts: %" PRIu64,
                       s.ToString().c_str(), error_cnt);
-      log_buffer.FlushBufferToLog();
-      LogFlush(immutable_db_options_.info_log);
-      immutable_db_options_.clock->SleepForMicroseconds(1000000);
-      mutex_.Lock();
+      log_buffer.FlushBufferToLog(); // 刷新日志缓冲区
+      LogFlush(immutable_db_options_.info_log); // 刷新日志
+      immutable_db_options_.clock->SleepForMicroseconds(1000000); // 等待1秒
+      mutex_.Lock(); // 重新获取互斥锁
     }
 
-    TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:FlushFinish:0");
-    ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
+    TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:FlushFinish:0"); // 测试同步点
+    ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem); // 从pending_outputs中释放文件号
 
     // If flush failed, we want to delete all temporary files that we might have
     // created. Thus, we force full scan in FindObsoleteFiles()
+    // 如果Flush失败，强制完整扫描并删除所有临时文件
     FindObsoleteFiles(&job_context, !s.ok() && !s.IsShutdownInProgress() &&
                                         !s.IsColumnFamilyDropped());
+
     // delete unnecessary files if any, this is done outside the mutex
+    // 删除不需要的文件，这部分操作在互斥锁外执行以提高效率
     if (job_context.HaveSomethingToClean() ||
         job_context.HaveSomethingToDelete() || !log_buffer.IsEmpty()) {
-      mutex_.Unlock();
-      TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:FilesFound");
+      mutex_.Unlock(); // 释放互斥锁
+      TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:FilesFound"); // 测试同步点
       // Have to flush the info logs before bg_flush_scheduled_--
       // because if bg_flush_scheduled_ becomes 0 and the lock is
       // released, the deconstructor of DB can kick in and destroy all the
       // states of DB so info_log might not be available after that point.
       // It also applies to access other states that DB owns.
+      // 必须在bg_flush_scheduled_递减之前刷新日志，因为一旦计数为0且锁被释放，
+      // DB的析构函数可能启动并销毁所有DB状态，导致info_log不可用
       log_buffer.FlushBufferToLog();
       if (job_context.HaveSomethingToDelete()) {
-        PurgeObsoleteFiles(job_context);
+        PurgeObsoleteFiles(job_context); // 删除过期文件
       }
-      job_context.Clean();
-      mutex_.Lock();
+      job_context.Clean(); // 清理作业上下文
+      mutex_.Lock(); // 重新获取互斥锁
     }
-    TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:ContextCleanedUp");
+    TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:ContextCleanedUp"); // 测试同步点
 
-    assert(num_running_flushes_ > 0);
-    num_running_flushes_--;
-    bg_flush_scheduled_--;
+    assert(num_running_flushes_ > 0); // 确保运行计数正确
+    num_running_flushes_--; // 减少正在运行的Flush计数
+    bg_flush_scheduled_--; // 减少已调度的Flush计数
     // See if there's more work to be done
-    MaybeScheduleFlushOrCompaction();
-    atomic_flush_install_cv_.SignalAll();
-    bg_cv_.SignalAll();
+    // 检查是否还有更多工作需要执行
+    MaybeScheduleFlushOrCompaction(); // 尝试调度新的Flush或Compaction
+    atomic_flush_install_cv_.SignalAll(); // 唤醒等待原子Flush安装的线程
+    bg_cv_.SignalAll(); // 唤醒所有等待的线程（包括DB析构函数）
     // IMPORTANT: there should be no code after calling SignalAll. This call may
     // signal the DB destructor that it's OK to proceed with destruction. In
     // that case, all DB variables will be dealloacated and referencing them
     // will cause trouble.
+    // 重要：调用SignalAll后不能再有代码，因为可能会触发DB析构，
+    // 导致所有DB变量被释放，再访问它们会导致问题
   }
 }
 
+/**
+ * @brief 后台Compaction（压缩）调用的主函数
+ *
+ * 该函数是后台Compaction线程的入口点，负责：
+ * 1. 初始化Compaction作业上下文和日志缓冲区
+ * 2. 在持有互斥锁的情况下执行Compaction操作
+ * 3. 处理Compaction过程中的各种状态：
+ *    - 忙碌状态（s.IsBusy()）：短暂等待避免热循环
+ *    - 错误状态：等待后重试，避免环境问题消耗资源
+ *    - 手动Compaction暂停状态：记录但不等待
+ * 4. 清理临时文件和过期文件
+ * 5. 减少调度计数并触发下一次调度
+ * 6. 通知等待的线程（如DB析构函数、DelayWrite等）
+ *
+ * @param prepicked_compaction 预先选择的Compaction任务，可为nullptr表示自动选择
+ * @param bg_thread_pri 后台线程的优先级（LOW或BOTTOM）
+ *
+ * @note 该函数必须在持有mutex_的情况下运行大部分逻辑
+ * @note bg_compaction_scheduled_或bg_bottom_compaction_scheduled_必须大于0
+ * @note 调用SignalAll后不能再访问DB变量，因为DB可能被析构
+ */
 void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                       Env::Priority bg_thread_pri) {
-  bool made_progress = false;
-  JobContext job_context(next_job_id_.fetch_add(1), true);
-  TEST_SYNC_POINT("BackgroundCallCompaction:0");
+  bool made_progress = false; // 是否实际完成了Compaction工作
+  JobContext job_context(next_job_id_.fetch_add(1), true); // 创建新的作业上下文
+  TEST_SYNC_POINT("BackgroundCallCompaction:0"); // 测试同步点
   LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
-                       immutable_db_options_.info_log.get());
+                       immutable_db_options_.info_log.get()); // 初始化日志缓冲区
   {
-    InstrumentedMutexLock l(&mutex_);
+    InstrumentedMutexLock l(&mutex_); // 获取互斥锁
 
-    num_running_compactions_++;
+    num_running_compactions_++; // 增加正在运行的Compaction计数
 
     std::unique_ptr<std::list<uint64_t>::iterator>
         pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
-            CaptureCurrentFileNumberInPendingOutputs()));
+            CaptureCurrentFileNumberInPendingOutputs())); // 捕获当前文件号到pending_outputs中，用于清理
 
+    // 断言线程优先级和调度计数的一致性
     assert((bg_thread_pri == Env::Priority::BOTTOM &&
             bg_bottom_compaction_scheduled_) ||
            (bg_thread_pri == Env::Priority::LOW && bg_compaction_scheduled_));
+
+    // 执行实际的Compaction操作
     Status s = BackgroundCompaction(&made_progress, &job_context, &log_buffer,
                                     prepicked_compaction, bg_thread_pri);
-    TEST_SYNC_POINT("BackgroundCallCompaction:1");
+    TEST_SYNC_POINT("BackgroundCallCompaction:1"); // 测试同步点
+
+    // 处理Compaction的各种状态
     if (s.IsBusy()) {
-      bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
-      mutex_.Unlock();
+      // Compaction忙碌状态：短暂等待避免热循环
+      bg_cv_.SignalAll();  // In case a waiter can proceed despite the error // 唤醒等待的线程
+      mutex_.Unlock(); // 释放互斥锁
       immutable_db_options_.clock->SleepForMicroseconds(
-          10000);  // prevent hot loop
-      mutex_.Lock();
+          10000);  // prevent hot loop // 等待10毫秒避免热循环
+      mutex_.Lock(); // 重新获取互斥锁
     } else if (!s.ok() && !s.IsShutdownInProgress() &&
                !s.IsManualCompactionPaused() && !s.IsColumnFamilyDropped()) {
+      // Compaction错误状态：等待一段时间后重试，避免环境问题消耗资源
       // Wait a little bit before retrying background compaction in
       // case this is an environmental problem and we do not want to
       // chew up resources for failed compactions for the duration of
       // the problem.
       uint64_t error_cnt =
-          default_cf_internal_stats_->BumpAndGetBackgroundErrorCount();
-      bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
-      mutex_.Unlock();
-      log_buffer.FlushBufferToLog();
+          default_cf_internal_stats_->BumpAndGetBackgroundErrorCount(); // 增加并获取错误计数
+      bg_cv_.SignalAll();  // In case a waiter can proceed despite the error // 唤醒等待的线程
+      mutex_.Unlock(); // 释放互斥锁
+      log_buffer.FlushBufferToLog(); // 刷新日志缓冲区
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "Waiting after background compaction error: %s, "
                       "Accumulated background error counts: %" PRIu64,
                       s.ToString().c_str(), error_cnt);
-      LogFlush(immutable_db_options_.info_log);
-      immutable_db_options_.clock->SleepForMicroseconds(1000000);
-      mutex_.Lock();
+      LogFlush(immutable_db_options_.info_log); // 刷新日志
+      immutable_db_options_.clock->SleepForMicroseconds(1000000); // 等待1秒
+      mutex_.Lock(); // 重新获取互斥锁
     } else if (s.IsManualCompactionPaused()) {
+      // 手动Compaction暂停状态：仅记录日志，不等待
       assert(prepicked_compaction);
       ManualCompactionState* m = prepicked_compaction->manual_compaction_state;
       assert(m);
@@ -3171,38 +3775,43 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                        m->cfd->GetName().c_str(), job_context.job_id);
     }
 
-    ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
+    ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem); // 从pending_outputs中释放文件号
 
     // If compaction failed, we want to delete all temporary files that we
     // might have created (they might not be all recorded in job_context in
     // case of a failure). Thus, we force full scan in FindObsoleteFiles()
+    // 如果Compaction失败，强制完整扫描并删除所有临时文件
     FindObsoleteFiles(&job_context, !s.ok() && !s.IsShutdownInProgress() &&
                                         !s.IsManualCompactionPaused() &&
                                         !s.IsColumnFamilyDropped() &&
                                         !s.IsBusy());
-    TEST_SYNC_POINT("DBImpl::BackgroundCallCompaction:FoundObsoleteFiles");
+    TEST_SYNC_POINT("DBImpl::BackgroundCallCompaction:FoundObsoleteFiles"); // 测试同步点
 
     // delete unnecessary files if any, this is done outside the mutex
+    // 删除不需要的文件，这部分操作在互斥锁外执行以提高效率
     if (job_context.HaveSomethingToClean() ||
         job_context.HaveSomethingToDelete() || !log_buffer.IsEmpty()) {
-      mutex_.Unlock();
+      mutex_.Unlock(); // 释放互斥锁
       // Have to flush the info logs before bg_compaction_scheduled_--
       // because if bg_flush_scheduled_ becomes 0 and the lock is
       // released, the deconstructor of DB can kick in and destroy all the
       // states of DB so info_log might not be available after that point.
       // It also applies to access other states that DB owns.
+      // 必须在bg_compaction_scheduled_递减之前刷新日志，因为一旦计数为0且锁被释放，
+      // DB的析构函数可能启动并销毁所有DB状态，导致info_log不可用
       log_buffer.FlushBufferToLog();
       if (job_context.HaveSomethingToDelete()) {
-        PurgeObsoleteFiles(job_context);
-        TEST_SYNC_POINT("DBImpl::BackgroundCallCompaction:PurgedObsoleteFiles");
+        PurgeObsoleteFiles(job_context); // 删除过期文件
+        TEST_SYNC_POINT("DBImpl::BackgroundCallCompaction:PurgedObsoleteFiles"); // 测试同步点
       }
-      job_context.Clean();
-      mutex_.Lock();
+      job_context.Clean(); // 清理作业上下文
+      mutex_.Lock(); // 重新获取互斥锁
     }
 
-    assert(num_running_compactions_ > 0);
-    num_running_compactions_--;
+    assert(num_running_compactions_ > 0); // 确保运行计数正确
+    num_running_compactions_--; // 减少正在运行的Compaction计数
 
+    // 根据线程优先级减少相应的调度计数
     if (bg_thread_pri == Env::Priority::LOW) {
       bg_compaction_scheduled_--;
     } else {
@@ -3211,16 +3820,19 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
     }
 
     // See if there's more work to be done
-    MaybeScheduleFlushOrCompaction();
+    // 检查是否还有更多工作需要执行
+    MaybeScheduleFlushOrCompaction(); // 尝试调度新的Flush或Compaction
 
     if (prepicked_compaction != nullptr &&
         prepicked_compaction->task_token != nullptr) {
       // Releasing task tokens affects (and asserts on) the DB state, so
       // must be done before we potentially signal the DB close process to
       // proceed below.
+      // 释放任务令牌会影响DB状态（并有断言检查），因此必须在可能触发DB关闭流程之前完成
       prepicked_compaction->task_token.reset();
     }
 
+    // 根据条件决定是否唤醒等待的线程
     if (made_progress ||
         (bg_compaction_scheduled_ == 0 &&
          bg_bottom_compaction_scheduled_ == 0) ||
@@ -3231,111 +3843,144 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       // * HasPendingManualCompaction -- need to wakeup RunManualCompaction
       // If none of this is true, there is no need to signal since nobody is
       // waiting for it
+      // 唤醒条件：
+      // - made_progress: 需要唤醒DelayWrite（写限流）
+      // - bg_compaction_scheduled_为0: 需要唤醒DB析构函数
+      // - 有待处理的手动Compaction: 需要唤醒RunManualCompaction
+      // - 无未调度的Compaction: 可能需要唤醒等待线程
       bg_cv_.SignalAll();
     }
     // IMPORTANT: there should be no code after calling SignalAll. This call may
     // signal the DB destructor that it's OK to proceed with destruction. In
     // that case, all DB variables will be dealloacated and referencing them
     // will cause trouble.
+    // 重要：调用SignalAll后不能再有代码，因为可能会触发DB析构，
+    // 导致所有DB变量被释放，再访问它们会导致问题
   }
 }
 
-Status DBImpl::BackgroundCompaction(bool* made_progress,
-                                    JobContext* job_context,
-                                    LogBuffer* log_buffer,
-                                    PrepickedCompaction* prepicked_compaction,
-                                    Env::Priority thread_pri) {
+/**
+ * @brief 后台Compaction（压缩）操作的实现函数
+ *
+ * 该函数负责执行实际的Compaction操作，包括：
+ * 1. 检查是否应该执行Compaction（错误状态、shutdown状态、手动压缩取消等）
+ * 2. 处理手动Compaction和自动Compaction
+ * 3. 选择合适的Compaction任务（从队列或预选任务）
+ * 4. 检查磁盘空间是否足够
+ * 5. 执行三种类型的Compaction：
+ *    - Deletion Compaction: FIFO风格，直接删除旧文件
+ *    - Trivial Move: 文件可以直接移动到下一层，无需合并
+ *    - Non-trivial Compaction: 需要实际合并数据的完整压缩
+ * 6. 处理Compaction结果和错误
+ *
+ * @param made_progress 输出参数，表示是否实际完成了Compaction工作
+ * @param job_context 作业上下文，包含任务状态和superversion上下文
+ * @param log_buffer 日志缓冲区，用于记录Compaction过程
+ * @param prepicked_compaction 预先选择的Compaction任务，可为nullptr
+ * @param thread_pri 线程优先级
+ * @return Status Compaction操作的状态
+ *
+ * @note 该函数必须在持有mutex_的情况下调用
+ */
+Status DBImpl::BackgroundCompaction(bool* made_progress, /*输出参数，表示是否实际完成了压缩工作*/
+                                    JobContext* job_context, /*作业上下文，包含任务状态和 superversion 上下文*/
+                                    LogBuffer* log_buffer, /*日志缓冲区，用于记录压缩过程*/
+                                    PrepickedCompaction* prepicked_compaction, /*预先选择的压缩任务*/
+                                    Env::Priority thread_pri /*线程优先级*/) {
   ManualCompactionState* manual_compaction =
       prepicked_compaction == nullptr
           ? nullptr
-          : prepicked_compaction->manual_compaction_state;
-  *made_progress = false;
-  mutex_.AssertHeld();
-  TEST_SYNC_POINT("DBImpl::BackgroundCompaction:Start");
+          : prepicked_compaction->manual_compaction_state; /*参数支持手动压缩和自动压缩的统一处理*/
+  *made_progress = false;//默认没有完成压缩工作
+  mutex_.AssertHeld();//确保当前线程持有锁
+  TEST_SYNC_POINT("DBImpl::BackgroundCompaction:Start"); // 测试同步点
 
-  const ReadOptions read_options(Env::IOActivity::kCompaction);
+  const ReadOptions read_options(Env::IOActivity::kCompaction);//创建一个读选项对象，用于指定IO活动
 
-  bool is_manual = (manual_compaction != nullptr);
-  std::unique_ptr<Compaction> c;
+  bool is_manual = (manual_compaction != nullptr); /*标志位用于区分预先选定的压缩和从队列中挑选的压缩*/
+  std::unique_ptr<Compaction> c;//创建一个压缩对象
   if (prepicked_compaction != nullptr &&
       prepicked_compaction->compaction != nullptr) {
-    c.reset(prepicked_compaction->compaction);
+    c.reset(prepicked_compaction->compaction); //获取预先选择的压缩任务
   }
-  bool is_prepicked = is_manual || c;
+  bool is_prepicked = is_manual || c;//判断是否是预先选择的压缩任务
 
   // (manual_compaction->in_progress == false);
   bool trivial_move_disallowed =
-      is_manual && manual_compaction->disallow_trivial_move;
+      is_manual && manual_compaction->disallow_trivial_move; /*允许手动压缩时禁用 trivial move 优化*/
 
-  CompactionJobStats compaction_job_stats;
-  Status status;
-  if (!error_handler_.IsBGWorkStopped()) {
-    if (shutting_down_.load(std::memory_order_acquire)) {
-      status = Status::ShutdownInProgress();
+  CompactionJobStats compaction_job_stats;//创建一个压缩任务统计对象
+  Status status;//状态对象
+  if (!error_handler_.IsBGWorkStopped()) {//检查是否有错误
+    if (shutting_down_.load(std::memory_order_acquire)) {//检查是否正在关闭
+      status = Status::ShutdownInProgress();//返回一个关闭中状态
     } else if (is_manual &&
-               manual_compaction->canceled.load(std::memory_order_acquire)) {
-      status = Status::Incomplete(Status::SubCode::kManualCompactionPaused);
+               manual_compaction->canceled.load(std::memory_order_acquire)) {//检查是否手动压缩被取消
+      status = Status::Incomplete(Status::SubCode::kManualCompactionPaused);//返回一个手动压缩被取消状态
     }
   } else {
-    status = error_handler_.GetBGError();
+    status = error_handler_.GetBGError();//获取错误信息
     // If we get here, it means a hard error happened after this compaction
     // was scheduled by MaybeScheduleFlushOrCompaction(), but before it got
     // a chance to execute. Since we didn't pop a cfd from the compaction
     // queue, increment unscheduled_compactions_
-    unscheduled_compactions_++;
+    // 如果到达这里，说明在MaybeScheduleFlushOrCompaction()调度后、执行前发生了严重错误。
+    // 由于我们没有从compaction队列中弹出cfd，所以增加unscheduled_compactions_
+    unscheduled_compactions_++;//增加未调度压缩任务数
   }
 
-  if (!status.ok()) {
-    if (is_manual) {
-      manual_compaction->status = status;
-      manual_compaction->done = true;
-      manual_compaction->in_progress = false;
-      manual_compaction = nullptr;
+  if (!status.ok()) { //状态不是OK
+    if (is_manual) { //手动压缩
+      manual_compaction->status = status; //设置状态
+      manual_compaction->done = true; //设置完成标志
+      manual_compaction->in_progress = false; //设置正在执行标志
+      manual_compaction = nullptr; //置空手动压缩状态
     }
-    if (c) {
-      c->ReleaseCompactionFiles(status);
-      c.reset();
+    if (c) { //压缩任务存在
+      c->ReleaseCompactionFiles(status); //释放压缩文件
+      c.reset(); //置空压缩任务
     }
-    return status;
+    return status; //返回状态
   }
 
-  if (is_manual) {
+  if (is_manual) { //手动压缩
     // another thread cannot pick up the same work
-    manual_compaction->in_progress = true;
+    // 防止其他线程抢占同一个手动压缩任务
+    manual_compaction->in_progress = true; //设置正在执行标志
   }
 
-  TEST_SYNC_POINT("DBImpl::BackgroundCompaction:InProgress");
+  TEST_SYNC_POINT("DBImpl::BackgroundCompaction:InProgress"); // 测试同步点
 
-  std::unique_ptr<TaskLimiterToken> task_token;
+  std::unique_ptr<TaskLimiterToken> task_token; //任务限速令牌，用于控制并发压缩数量
 
   // InternalKey manual_end_storage;
   // InternalKey* manual_end = &manual_end_storage;
-  bool sfm_reserved_compact_space = false;
-  if (is_manual) {
-    ManualCompactionState* m = manual_compaction;
-    assert(m->in_progress);
-    if (!c) {
-      m->done = true;
-      m->manual_end = nullptr;
+  bool sfm_reserved_compact_space = false; //存储空间是否被压缩
+  if (is_manual) {  //手动压缩
+    ManualCompactionState* m = manual_compaction; //获取手动压缩状态
+    assert(m->in_progress); //确保正在执行
+    if (!c) { //压缩任务不存在
+      m->done = true; //设置完成标志
+      m->manual_end = nullptr; //设置结束标志
       ROCKS_LOG_BUFFER(
           log_buffer,
           "[%s] Manual compaction from level-%d from %s .. "
           "%s; nothing to do\n",
           m->cfd->GetName().c_str(), m->input_level,
           (m->begin ? m->begin->DebugString(true).c_str() : "(begin)"),
-          (m->end ? m->end->DebugString(true).c_str() : "(end)"));
+          (m->end ? m->end->DebugString(true).c_str() : "(end)")); //打印日志
     } else {
-      // First check if we have enough room to do the compaction
+      // 检查磁盘空间是否足够
       bool enough_room = EnoughRoomForCompaction(
-          m->cfd, *(c->inputs()), &sfm_reserved_compact_space, log_buffer);
+          m->cfd, *(c->inputs()), &sfm_reserved_compact_space, log_buffer);//检查磁盘空间是否足够
 
-      if (!enough_room) {
+      if (!enough_room) { //磁盘空间不足
         // Then don't do the compaction
-        c->ReleaseCompactionFiles(status);
-        c.reset();
+        c->ReleaseCompactionFiles(status); //释放压缩文件
+        c.reset(); //置空压缩任务
         // m's vars will get set properly at the end of this function,
         // as long as status == CompactionTooLarge
-        status = Status::CompactionTooLarge();
+        status = Status::CompactionTooLarge(); //返回一个压缩任务过大状态
       } else {
         ROCKS_LOG_BUFFER(
             log_buffer,
@@ -3346,26 +3991,28 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
             (m->end ? m->end->DebugString(true).c_str() : "(end)"),
             ((m->done || m->manual_end == nullptr)
                  ? "(end)"
-                 : m->manual_end->DebugString(true).c_str()));
+                 : m->manual_end->DebugString(true).c_str()));//记录压缩计划
       }
     }
-  } else if (!is_prepicked && !compaction_queue_.empty()) {
-    if (HasExclusiveManualCompaction()) {
+  } else if (!is_prepicked && !compaction_queue_.empty()) { //队列非空且非预选任务
+    if (HasExclusiveManualCompaction()) { //存在独占性手动压缩
       // Can't compact right now, but try again later
-      TEST_SYNC_POINT("DBImpl::BackgroundCompaction()::Conflict");
+      TEST_SYNC_POINT("DBImpl::BackgroundCompaction()::Conflict"); // 测试同步点
 
-      // Stay in the compaction queue.
-      unscheduled_compactions_++;
+      // 有独占性手动压缩，不能执行自动压缩
+      unscheduled_compactions_++; //增加未调度压缩任务数
 
-      return Status::OK();
+      return Status::OK(); //返回成功，稍后重试
     }
 
+    // 从队列中选择列族进行压缩，使用任务限流控制并发压缩数量
     auto cfd = PickCompactionFromQueue(&task_token, log_buffer);
-    if (cfd == nullptr) {
+    if (cfd == nullptr) { //列空
       // Can't find any executable task from the compaction queue.
       // All tasks have been throttled by compaction thread limiter.
-      ++unscheduled_compactions_;
-      return Status::Busy();
+      // 无法从压缩队列中找到任何可执行的任务，所有任务都被压缩线程限流器限制
+      ++unscheduled_compactions_; //增加未调度压缩任务数
+      return Status::Busy(); //返回 Busy 状态让调用方稍后重试
     }
 
     // We unreference here because the following code will take a Ref() on
@@ -3373,10 +4020,13 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     // reference).
     // This will all happen under a mutex so we don't have to be afraid of
     // somebody else deleting it.
-    if (cfd->UnrefAndTryDelete()) {
+    // 我们在这里取消引用，因为后续代码如果要使用这个cfd会调用Ref()
+    // （Compaction类持有引用）。这都在互斥锁保护下，所以不用担心被其他人删除
+    if (cfd->UnrefAndTryDelete()) { //列空
       // This was the last reference of the column family, so no need to
       // compact.
-      return Status::OK();
+      // 这是列族的最后一个引用，无需再压缩
+      return Status::OK(); //返回成功
     }
 
     // Pick up latest mutable CF Options and use it throughout the
@@ -3384,42 +4034,45 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     // Compaction makes a copy of the latest MutableCFOptions. It should be used
     // throughout the compaction procedure to make sure consistency. It will
     // eventually be installed into SuperVersion
-    auto* mutable_cf_options = cfd->GetLatestMutableCFOptions();
-    if (!mutable_cf_options->disable_auto_compactions && !cfd->IsDropped()) {
+    // 获取最新的可变列族选项并在整个压缩任务中使用
+    // Compaction会复制最新的MutableCFOptions，应该在压缩过程中使用它以确保一致性
+    // 最终会被安装到SuperVersion中
+    auto* mutable_cf_options = cfd->GetLatestMutableCFOptions(); //获取可变列族选项
+    if (!mutable_cf_options->disable_auto_compactions && !cfd->IsDropped()) { //列族未禁用自动压缩且列族未删除
       // NOTE: try to avoid unnecessary copy of MutableCFOptions if
       // compaction is not necessary. Need to make sure mutex is held
       // until we make a copy in the following code
-      TEST_SYNC_POINT("DBImpl::BackgroundCompaction():BeforePickCompaction");
+      TEST_SYNC_POINT("DBImpl::BackgroundCompaction():BeforePickCompaction"); // 测试同步点
       c.reset(cfd->PickCompaction(*mutable_cf_options, mutable_db_options_,
-                                  log_buffer));
-      TEST_SYNC_POINT("DBImpl::BackgroundCompaction():AfterPickCompaction");
+                                  log_buffer)); //尝试选择压缩任务
+      TEST_SYNC_POINT("DBImpl::BackgroundCompaction():AfterPickCompaction"); // 测试同步点
 
-      if (c != nullptr) {
+      if (c != nullptr) { //压缩任务存在
         bool enough_room = EnoughRoomForCompaction(
-            cfd, *(c->inputs()), &sfm_reserved_compact_space, log_buffer);
+            cfd, *(c->inputs()), &sfm_reserved_compact_space, log_buffer); //检查磁盘空间是否足够
 
-        if (!enough_room) {
+        if (!enough_room) { //磁盘空间不足
           // Then don't do the compaction
-          c->ReleaseCompactionFiles(status);
+          c->ReleaseCompactionFiles(status); //释放压缩文件
           c->column_family_data()
               ->current()
               ->storage_info()
               ->ComputeCompactionScore(*(c->immutable_options()),
-                                       *(c->mutable_cf_options()));
-          AddToCompactionQueue(cfd);
-          ++unscheduled_compactions_;
+                                       *(c->mutable_cf_options())); //计算压缩分数
+          AddToCompactionQueue(cfd); //添加到压缩队列
+          ++unscheduled_compactions_; //增加未调度压缩任务数
 
-          c.reset();
+          c.reset(); //置空压缩任务
           // Don't need to sleep here, because BackgroundCallCompaction
           // will sleep if !s.ok()
-          status = Status::CompactionTooLarge();
+          status = Status::CompactionTooLarge(); //返回一个压缩任务过大状态
         } else {
           // update statistics
-          size_t num_files = 0;
-          for (auto& each_level : *c->inputs()) {
-            num_files += each_level.files.size();
+          size_t num_files = 0; //文件数量
+          for (auto& each_level : *c->inputs()) { //遍历所有级别
+            num_files += each_level.files.size(); //文件数量累加
           }
-          RecordInHistogram(stats_, NUM_FILES_IN_SINGLE_COMPACTION, num_files);
+          RecordInHistogram(stats_, NUM_FILES_IN_SINGLE_COMPACTION, num_files); //更新文件数量统计
 
           // There are three things that can change compaction score:
           // 1) When flush or compaction finish. This case is covered by
@@ -3433,75 +4086,81 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
           // files that are currently being compacted. If we need another
           // compaction, we might be able to execute it in parallel, so we add
           // it to the queue and schedule a new thread.
-          if (cfd->NeedsCompaction()) {
+          // 有三件事可以改变压缩分数：
+          // 1) Flush或Compaction完成，这种情况由InstallSuperVersionAndScheduleWork处理
+          // 2) MutableCFOptions改变，这也由InstallSuperVersionAndScheduleWork处理，因为这是新选项生效的时候
+          // 3) 当我们选择一个新的Compaction时，从计算中"移除"正在被压缩的文件，这会影响压缩分数
+          //    这里检查即使没有当前正在被压缩的文件，是否需要新的Compaction。
+          //    如果需要另一个Compaction，可能可以并行执行，所以我们添加到队列并调度新线程
+          if (cfd->NeedsCompaction()) { //需要压缩
             // Yes, we need more compactions!
-            AddToCompactionQueue(cfd);
-            ++unscheduled_compactions_;
-            MaybeScheduleFlushOrCompaction();
+            AddToCompactionQueue(cfd); //添加到压缩队列
+            ++unscheduled_compactions_; //增加未调度压缩任务数
+            MaybeScheduleFlushOrCompaction(); //调度 flush 或压缩任务
           }
         }
       }
     }
   }
 
-  IOStatus io_s;
-  if (!c) {
+  IOStatus io_s; //输入输出状态
+  if (!c) { //压缩任务不存在
     // Nothing to do
     ROCKS_LOG_BUFFER(log_buffer, "Compaction nothing to do");
-  } else if (c->deletion_compaction()) {
+  } else if (c->deletion_compaction()) { // 删除压缩（FIFO压缩风格）
     // TODO(icanadi) Do we want to honor snapshots here? i.e. not delete old
     // file if there is alive snapshot pointing to it
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:BeforeCompaction",
                              c->column_family_data());
-    assert(c->num_input_files(1) == 0);
+    assert(c->num_input_files(1) == 0); //输入文件数量为0
     assert(c->column_family_data()->ioptions()->compaction_style ==
-           kCompactionStyleFIFO);
+           kCompactionStyleFIFO); //压缩风格为 FIFO
 
-    compaction_job_stats.num_input_files = c->num_input_files(0);
+    compaction_job_stats.num_input_files = c->num_input_files(0); //输入文件数量
 
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
-                            compaction_job_stats, job_context->job_id);
+                            compaction_job_stats, job_context->job_id); //通知压缩开始
 
-    for (const auto& f : *c->inputs(0)) {
-      c->edit()->DeleteFile(c->level(), f->fd.GetNumber());
-    }
+    for (const auto& f : *c->inputs(0)) { //遍历输入文件
+      c->edit()->DeleteFile(c->level(), f->fd.GetNumber()); //删除文件
+    } //避免读取和重写数据，直接在 manifest 中标记删除。
     status = versions_->LogAndApply(
         c->column_family_data(), *c->mutable_cf_options(), read_options,
-        c->edit(), &mutex_, directories_.GetDbDir());
-    io_s = versions_->io_status();
+        c->edit(), &mutex_, directories_.GetDbDir()); //应用日志并应用编辑
+    io_s = versions_->io_status(); //获取 IO 状态
     InstallSuperVersionAndScheduleWork(c->column_family_data(),
                                        &job_context->superversion_contexts[0],
-                                       *c->mutable_cf_options());
+                                       *c->mutable_cf_options()); //安装超级版本并调度工作
     ROCKS_LOG_BUFFER(log_buffer, "[%s] Deleted %d files\n",
                      c->column_family_data()->GetName().c_str(),
-                     c->num_input_files(0));
-    *made_progress = true;
+                     c->num_input_files(0)); //删除文件数量
+    *made_progress = true; //更新进度
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:AfterCompaction",
-                             c->column_family_data());
-  } else if (!trivial_move_disallowed && c->IsTrivialMove()) {
-    TEST_SYNC_POINT("DBImpl::BackgroundCompaction:TrivialMove");
+                             c->column_family_data()); //压缩结束
+  } else if (!trivial_move_disallowed && c->IsTrivialMove()) { // Trivial Move：当文件可以直接移动到下一层时使用（没有重叠，不需要合并）
+    TEST_SYNC_POINT("DBImpl::BackgroundCompaction:TrivialMove"); // 测试同步点
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:BeforeCompaction",
                              c->column_family_data());
     // Instrument for event update
     // TODO(yhchiang): add op details for showing trivial-move.
-    ThreadStatusUtil::SetColumnFamily(c->column_family_data());
-    ThreadStatusUtil::SetThreadOperation(ThreadStatus::OP_COMPACTION);
+    ThreadStatusUtil::SetColumnFamily(c->column_family_data()); //设置列族
+    ThreadStatusUtil::SetThreadOperation(ThreadStatus::OP_COMPACTION); //设置线程操作
 
-    compaction_job_stats.num_input_files = c->num_input_files(0);
+    compaction_job_stats.num_input_files = c->num_input_files(0); //输入文件数量
 
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
-                            compaction_job_stats, job_context->job_id);
+                            compaction_job_stats, job_context->job_id); //通知压缩开始
 
     // Move files to next level
-    int32_t moved_files = 0;
-    int64_t moved_bytes = 0;
-    for (unsigned int l = 0; l < c->num_input_levels(); l++) {
-      if (c->level(l) == c->output_level()) {
+    int32_t moved_files = 0; //移动文件数量
+    int64_t moved_bytes = 0; //移动字节数
+    for (unsigned int l = 0; l < c->num_input_levels(); l++) { //遍历所有级别
+      if (c->level(l) == c->output_level()) { //输出级别为当前级别
         continue;
       }
-      for (size_t i = 0; i < c->num_input_files(l); i++) {
-        FileMetaData* f = c->input(l, i);
-        c->edit()->DeleteFile(c->level(l), f->fd.GetNumber());
+      for (size_t i = 0; i < c->num_input_files(l); i++) { //遍历输入文件
+        FileMetaData* f = c->input(l, i); //获取文件元数据
+        c->edit()->DeleteFile(c->level(l), f->fd.GetNumber()); //从当前级别删除文件
         c->edit()->AddFile(
             c->output_level(), f->fd.GetNumber(), f->fd.GetPathId(),
             f->fd.GetFileSize(), f->smallest, f->largest, f->fd.smallest_seqno,
@@ -3510,95 +4169,99 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
             f->file_creation_time, f->epoch_number, f->file_checksum,
             f->file_checksum_func_name, f->unique_id,
             f->compensated_range_deletion_size, f->tail_size,
-            f->user_defined_timestamps_persisted);
+            f->user_defined_timestamps_persisted); //添加到输出级别
 
         ROCKS_LOG_BUFFER(
             log_buffer,
             "[%s] Moving #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
             c->column_family_data()->GetName().c_str(), f->fd.GetNumber(),
-            c->output_level(), f->fd.GetFileSize());
-        ++moved_files;
-        moved_bytes += f->fd.GetFileSize();
+            c->output_level(), f->fd.GetFileSize()); //打印移动文件
+        ++moved_files; //移动文件数量++
+        moved_bytes += f->fd.GetFileSize(); //统计移动字节数
       }
     }
-    if (c->compaction_reason() == CompactionReason::kLevelMaxLevelSize &&
-        c->immutable_options()->compaction_pri == kRoundRobin) {
-      int start_level = c->start_level();
-      if (start_level > 0) {
-        auto vstorage = c->input_version()->storage_info();
+    if (c->compaction_reason() == CompactionReason::kLevelMaxLevelSize && //压缩原因为 level 最大级别字节数
+        c->immutable_options()->compaction_pri == kRoundRobin) { //优先级为轮转时
+      int start_level = c->start_level(); //输入级别
+      if (start_level > 0) { //输入级别大于 0
+        auto vstorage = c->input_version()->storage_info(); //获取存储信息
         c->edit()->AddCompactCursor(
             start_level,
-            vstorage->GetNextCompactCursor(start_level, c->num_input_files(0)));
+            vstorage->GetNextCompactCursor(start_level, c->num_input_files(0))); //添加游标
       }
     }
     status = versions_->LogAndApply(
         c->column_family_data(), *c->mutable_cf_options(), read_options,
-        c->edit(), &mutex_, directories_.GetDbDir());
-    io_s = versions_->io_status();
+        c->edit(), &mutex_, directories_.GetDbDir()); //应用日志并应用编辑
+    io_s = versions_->io_status(); //获取 IO 状态
     // Use latest MutableCFOptions
     InstallSuperVersionAndScheduleWork(c->column_family_data(),
                                        &job_context->superversion_contexts[0],
-                                       *c->mutable_cf_options());
+                                       *c->mutable_cf_options()); //安装超级版本并调度工作
 
-    VersionStorageInfo::LevelSummaryStorage tmp;
+    VersionStorageInfo::LevelSummaryStorage tmp; //存储级别信息
     c->column_family_data()->internal_stats()->IncBytesMoved(c->output_level(),
-                                                             moved_bytes);
+                                                             moved_bytes); //移动字节数
     {
       event_logger_.LogToBuffer(log_buffer)
           << "job" << job_context->job_id << "event"
           << "trivial_move"
           << "destination_level" << c->output_level() << "files" << moved_files
-          << "total_files_size" << moved_bytes;
+          << "total_files_size" << moved_bytes; //移动文件信息
     }
     ROCKS_LOG_BUFFER(
         log_buffer,
         "[%s] Moved #%d files to level-%d %" PRIu64 " bytes %s: %s\n",
         c->column_family_data()->GetName().c_str(), moved_files,
         c->output_level(), moved_bytes, status.ToString().c_str(),
-        c->column_family_data()->current()->storage_info()->LevelSummary(&tmp));
-    *made_progress = true;
+        c->column_family_data()->current()->storage_info()->LevelSummary(&tmp)); //移动文件信息
+    *made_progress = true; //更新进度
 
     // Clear Instrument
-    ThreadStatusUtil::ResetThreadStatus();
+    ThreadStatusUtil::ResetThreadStatus(); //清空
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:AfterCompaction",
                              c->column_family_data());
-  } else if (!is_prepicked && c->output_level() > 0 &&
+  } else if (!is_prepicked && c->output_level() > 0 && /* 输出级别大于 0 */
              c->output_level() ==
                  c->column_family_data()
                      ->current()
                      ->storage_info()
                      ->MaxOutputLevel(
-                         immutable_db_options_.allow_ingest_behind) &&
-             env_->GetBackgroundThreads(Env::Priority::BOTTOM) > 0) {
+                         immutable_db_options_.allow_ingest_behind) && //输出级别等于最大级别
+             env_->GetBackgroundThreads(Env::Priority::BOTTOM) > 0) { //存在低优先级线程
     // Forward compactions involving last level to the bottom pool if it exists,
     // such that compactions unlikely to contribute to write stalls can be
     // delayed or deprioritized.
-    TEST_SYNC_POINT("DBImpl::BackgroundCompaction:ForwardToBottomPriPool");
-    CompactionArg* ca = new CompactionArg;
-    ca->db = this;
-    ca->compaction_pri_ = Env::Priority::BOTTOM;
-    ca->prepicked_compaction = new PrepickedCompaction;
-    ca->prepicked_compaction->compaction = c.release();
-    ca->prepicked_compaction->manual_compaction_state = nullptr;
+    // 将涉及最后一层的压缩转发到底层线程池（如果存在），
+    // 使得不太可能导致写停顿的压缩可以被延迟或降级处理
+    TEST_SYNC_POINT("DBImpl::BackgroundCompaction:ForwardToBottomPriPool"); // 测试同步点
+    CompactionArg* ca = new CompactionArg; //创建 compaction 参数
+    ca->db = this; //数据库
+    ca->compaction_pri_ = Env::Priority::BOTTOM; //优先级
+    ca->prepicked_compaction = new PrepickedCompaction; //创建预选 compaction
+    ca->prepicked_compaction->compaction = c.release(); //添加 compaction
+    ca->prepicked_compaction->manual_compaction_state = nullptr; //预选 compaction 状态
     // Transfer requested token, so it doesn't need to do it again.
-    ca->prepicked_compaction->task_token = std::move(task_token);
-    ++bg_bottom_compaction_scheduled_;
+    ca->prepicked_compaction->task_token = std::move(task_token); //添加任务令牌
+    ++bg_bottom_compaction_scheduled_; //低优先级线程数++
     env_->Schedule(&DBImpl::BGWorkBottomCompaction, ca, Env::Priority::BOTTOM,
-                   this, &DBImpl::UnscheduleCompactionCallback);
+                   this, &DBImpl::UnscheduleCompactionCallback);//调度工作
   } else {
+    // Non-trivial compaction: 需要实际合并数据的完整压缩
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:BeforeCompaction",
                              c->column_family_data());
-    int output_level __attribute__((__unused__));
-    output_level = c->output_level();
+    int output_level __attribute__((__unused__));//输出级别
+    output_level = c->output_level();//获取输出级别
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:NonTrivial",
-                             &output_level);
-    std::vector<SequenceNumber> snapshot_seqs;
-    SequenceNumber earliest_write_conflict_snapshot;
-    SnapshotChecker* snapshot_checker;
+                             &output_level); // 测试同步点
+    std::vector<SequenceNumber> snapshot_seqs; //快照序列
+    SequenceNumber earliest_write_conflict_snapshot; //最早的写冲突快照
+    SnapshotChecker* snapshot_checker; //快照检查
     GetSnapshotContext(job_context, &snapshot_seqs,
-                       &earliest_write_conflict_snapshot, &snapshot_checker);
+                       &earliest_write_conflict_snapshot, &snapshot_checker); // 获取快照上下文
     assert(is_snapshot_supported_ || snapshots_.empty());
 
+    // 创建并配置压缩任务
     CompactionJob compaction_job(
         job_context->job_id, c.get(), immutable_db_options_,
         mutable_db_options_, file_options_for_compaction_, versions_.get(),
@@ -3614,99 +4277,108 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
                   : kManualCompactionCanceledFalse_,
         db_id_, db_session_id_, c->column_family_data()->GetFullHistoryTsLow(),
         c->trim_ts(), &blob_callback_, &bg_compaction_scheduled_,
-        &bg_bottom_compaction_scheduled_);
-    compaction_job.Prepare();
+        &bg_bottom_compaction_scheduled_);  // 创建压缩任务
+    compaction_job.Prepare(); // 准备
 
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
-                            compaction_job_stats, job_context->job_id);
-    mutex_.Unlock();
+                            compaction_job_stats, job_context->job_id); //通知压缩开始
+    mutex_.Unlock();//释放锁  避免阻塞其他线程
     TEST_SYNC_POINT_CALLBACK(
-        "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun", nullptr);
+        "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun", nullptr); // 测试同步点
     // Should handle error?
-    compaction_job.Run().PermitUncheckedError();
-    TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
-    mutex_.Lock();
+    compaction_job.Run().PermitUncheckedError(); //运行压缩任务
+    TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun"); // 测试同步点
+    mutex_.Lock(); //获取锁
 
-    status = compaction_job.Install(*c->mutable_cf_options());
-    io_s = compaction_job.io_status();
-    if (status.ok()) {
+    status = compaction_job.Install(*c->mutable_cf_options()); //安装超级版本
+    io_s = compaction_job.io_status(); //获取 IO 状态
+    if (status.ok()) { //压缩成功
       InstallSuperVersionAndScheduleWork(c->column_family_data(),
                                          &job_context->superversion_contexts[0],
-                                         *c->mutable_cf_options());
+                                         *c->mutable_cf_options()); //安装超级版本并调度工作
     }
-    *made_progress = true;
+    *made_progress = true; //更新进度
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:AfterCompaction",
                              c->column_family_data());
   }
 
-  if (status.ok() && !io_s.ok()) {
-    status = io_s;
+  // 处理IO状态
+  if (status.ok() && !io_s.ok()) { //IO 错误
+    status = io_s; //更新错误状态
   } else {
-    io_s.PermitUncheckedError();
+    io_s.PermitUncheckedError(); //忽略 IO 错误
   }
 
-  if (c != nullptr) {
-    c->ReleaseCompactionFiles(status);
-    *made_progress = true;
+  if (c != nullptr) { //compaction 不为空
+    c->ReleaseCompactionFiles(status); //释放文件
+    *made_progress = true; //更新进度
 
     // Need to make sure SstFileManager does its bookkeeping
     auto sfm = static_cast<SstFileManagerImpl*>(
-        immutable_db_options_.sst_file_manager.get());
-    if (sfm && sfm_reserved_compact_space) {
-      sfm->OnCompactionCompletion(c.get());
+        immutable_db_options_.sst_file_manager.get());//获取 SstFileManager
+    if (sfm && sfm_reserved_compact_space) { //存在 SstFileManager
+      sfm->OnCompactionCompletion(c.get()); //完成压缩
     }
 
     NotifyOnCompactionCompleted(c->column_family_data(), c.get(), status,
-                                compaction_job_stats, job_context->job_id);
+                                compaction_job_stats, job_context->job_id); //通知压缩完成
   }
 
+  // 处理各种Compaction结果状态
   if (status.ok() || status.IsCompactionTooLarge() ||
-      status.IsManualCompactionPaused()) {
+      status.IsManualCompactionPaused()) { //压缩成功或者压缩过大或者手动压缩暂停
     // Done
-  } else if (status.IsColumnFamilyDropped() || status.IsShutdownInProgress()) {
+  } else if (status.IsColumnFamilyDropped() || status.IsShutdownInProgress()) { //列族被删除或者关闭
     // Ignore compaction errors found during shutting down
+    // 忽略关闭期间发现的压缩错误
   } else {
+    // 压缩错误处理
     ROCKS_LOG_WARN(immutable_db_options_.info_log, "Compaction error: %s",
                    status.ToString().c_str());
-    if (!io_s.ok()) {
+    if (!io_s.ok()) { //IO 错误
       // Error while writing to MANIFEST.
       // In fact, versions_->io_status() can also be the result of renaming
       // CURRENT file. With current code, it's just difficult to tell. So just
       // be pessimistic and try write to a new MANIFEST.
       // TODO: distinguish between MANIFEST write and CURRENT renaming
+      // 写入MANIFEST时的错误。实际上，versions_->io_status()也可能是重命名CURRENT文件的结果。
+      // 用当前代码很难区分。所以采取悲观策略，尝试写入新的MANIFEST。
       auto err_reason = versions_->io_status().ok()
                             ? BackgroundErrorReason::kCompaction
-                            : BackgroundErrorReason::kManifestWrite;
-      error_handler_.SetBGError(io_s, err_reason);
+                            : BackgroundErrorReason::kManifestWrite; //错误原因
+      error_handler_.SetBGError(io_s, err_reason); //设置错误
     } else {
-      error_handler_.SetBGError(status, BackgroundErrorReason::kCompaction);
+      error_handler_.SetBGError(status, BackgroundErrorReason::kCompaction); //设置错误
     }
-    if (c != nullptr && !is_manual && !error_handler_.IsBGWorkStopped()) {
+    if (c != nullptr && !is_manual && !error_handler_.IsBGWorkStopped()) { //compaction 不为空且非手动压缩且没有停止后台工作
       // Put this cfd back in the compaction queue so we can retry after some
       // time
-      auto cfd = c->column_family_data();
+      // 将cfd放回压缩队列，以便稍后重试
+      auto cfd = c->column_family_data(); //获取列族数据
       assert(cfd != nullptr);
       // Since this compaction failed, we need to recompute the score so it
       // takes the original input files into account
+      // 由于这个压缩失败，我们需要重新计算分数，以便将原始输入文件考虑进去
       c->column_family_data()
           ->current()
           ->storage_info()
           ->ComputeCompactionScore(*(c->immutable_options()),
-                                   *(c->mutable_cf_options()));
-      if (!cfd->queued_for_compaction()) {
-        AddToCompactionQueue(cfd);
-        ++unscheduled_compactions_;
+                                   *(c->mutable_cf_options())); //重新计算压缩分数
+      if (!cfd->queued_for_compaction()) { //不在队列中
+        AddToCompactionQueue(cfd); //添加到压缩队列中
+        ++unscheduled_compactions_; //未调度压缩数加1
       }
     }
   }
   // this will unref its input_version and column_family_data
-  c.reset();
+  c.reset(); //释放compaction
 
-  if (is_manual) {
-    ManualCompactionState* m = manual_compaction;
-    if (!status.ok()) {
-      m->status = status;
-      m->done = true;
+  // 处理手动压缩的收尾工作
+  if (is_manual) { //手动压缩
+    ManualCompactionState* m = manual_compaction; //手动压缩状态
+    if (!status.ok()) { //压缩失败
+      m->status = status; //错误
+      m->done = true; //完成
     }
     // For universal compaction:
     //   Because universal compaction always happens at level 0, so one
@@ -3721,25 +4393,37 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     // Stop the compaction if manual_end points to nullptr -- this means
     // that we compacted the whole range. manual_end should always point
     // to nullptr in case of universal compaction
-    if (m->manual_end == nullptr) {
-      m->done = true;
+    // 对于Universal压缩：
+    //   因为Universal压缩总是在level 0发生，所以一次压缩会选取所有重叠的文件。
+    //   不会有文件因为大小限制而被过滤掉并留给后续压缩。
+    //   所以我们可以安全地结束当前压缩。
+    //
+    //   另外注意，如果我们不在这里停止，当前压缩会将新文件写回level 0，
+    //   这个文件会被后续压缩使用。因此手动压缩将永远无法完成。
+    //
+    // 如果manual_end指向nullptr则停止压缩 -- 这意味着我们压缩了整个范围。
+    // 对于Universal压缩，manual_end应该总是指向nullptr
+    if (m->manual_end == nullptr) { //手动压缩结束为空
+      m->done = true; //完成
     }
-    if (!m->done) {
+    if (!m->done) { //未完成
       // We only compacted part of the requested range.  Update *m
       // to the range that is left to be compacted.
       // Universal and FIFO compactions should always compact the whole range
+      // 我们只压缩了请求范围的一部分。更新*m到剩余需要压缩的范围。
+      // Universal和FIFO压缩应该总是压缩整个范围
       assert(m->cfd->ioptions()->compaction_style !=
                  kCompactionStyleUniversal ||
              m->cfd->ioptions()->num_levels > 1);
       assert(m->cfd->ioptions()->compaction_style != kCompactionStyleFIFO);
-      m->tmp_storage = *m->manual_end;
-      m->begin = &m->tmp_storage;
-      m->incomplete = true;
+      m->tmp_storage = *m->manual_end; //手动压缩结束
+      m->begin = &m->tmp_storage; //手动压缩开始
+      m->incomplete = true; //未完成
     }
-    m->in_progress = false;  // not being processed anymore
+    m->in_progress = false; //未在进度中  // not being processed anymore
   }
-  TEST_SYNC_POINT("DBImpl::BackgroundCompaction:Finish");
-  return status;
+  TEST_SYNC_POINT("DBImpl::BackgroundCompaction:Finish"); // 测试同步点
+  return status; //返回状态
 }
 
 bool DBImpl::HasPendingManualCompaction() {
@@ -3767,26 +4451,43 @@ void DBImpl::RemoveManualCompaction(DBImpl::ManualCompactionState* m) {
 }
 
 bool DBImpl::ShouldntRunManualCompaction(ManualCompactionState* m) {
+  // 如果是排他性手动压缩，必须等待所有后台压缩完成
+  // 这确保排他性压缩期间不会有任何其他压缩任务运行
   if (m->exclusive) {
     return (bg_bottom_compaction_scheduled_ > 0 ||
             bg_compaction_scheduled_ > 0);
   }
+
+  // 对于非排他性手动压缩，检查是否存在冲突的其他手动压缩
+  // 遍历手动压缩队列，检查是否需要在当前压缩之前运行其他压缩
+
   std::deque<ManualCompactionState*>::iterator it =
       manual_compaction_dequeue_.begin();
-  bool seen = false;
+  bool seen = false; // 标记是否已经遍历到当前压缩 m
+
   while (it != manual_compaction_dequeue_.end()) {
     if (m == (*it)) {
+      // 找到当前压缩，继续向后遍历
       ++it;
       seen = true;
       continue;
     } else if (MCOverlap(m, (*it)) && (!seen && !(*it)->in_progress)) {
       // Consider the other manual compaction *it, conflicts if:
-      // overlaps with m
-      // and (*it) is ahead in the queue and is not yet in progress
+      // - overlaps with m (与当前压缩重叠)
+      // - and (*it) is ahead in the queue and is not yet in progress
+      //   (在队列中位于当前压缩之前，且尚未开始执行)
+
+      // 如果满足以下条件，则认为存在冲突：
+      // 1. m 和 (*it) 重叠（通过 MCOverlap 判断）
+      // 2. (*it) 在队列中位于 m 之前（seen=false）
+      // 3. (*it) 尚未开始执行（in_progress=false）
+
+      // 这种情况下，应该先执行 (*it)，当前压缩 m 需要等待
       return true;
     }
     ++it;
   }
+  // 没有冲突，可以运行当前压缩
   return false;
 }
 
@@ -3822,12 +4523,31 @@ bool DBImpl::HasExclusiveManualCompaction() {
 }
 
 bool DBImpl::MCOverlap(ManualCompactionState* m, ManualCompactionState* m1) {
+  // 判断两个手动压缩是否存在冲突（是否重叠）
+  //
+  // 注意：从函数名 MCOverlap（Manual Compaction Overlap）来看，
+  // 原本可能包含键范围重叠的检查，但当前实现已简化为：
+  // 1. 排他性压缩与其他任何压缩都冲突
+  // 2. 同一列族的压缩被视为冲突
+  // 3. 不同列族的非排他性压缩不冲突
+
+  // 如果任一手动压缩是排他性的，则认为它们重叠（冲突）
+  // 排他性压缩要求独占整个数据库，不能与其他任何压缩同时进行
   if ((m->exclusive) || (m1->exclusive)) {
     return true;
   }
+
+  // 如果两个压缩操作的是不同的列族，则不重叠（不冲突）
+  // 不同列族的数据是独立的，可以同时压缩
   if (m->cfd != m1->cfd) {
     return false;
   }
+
+  // 对于同一列族的非排他性压缩，当前实现总是返回 false（不冲突）
+  // 这意味着同一列族的多个手动压缩可以并行执行（只要它们不是排他性的）
+  //
+  // 注意：这种实现假设了 RocksDB 的内部机制能够处理同一列族的并发压缩，
+  // 例如通过版本控制和锁机制来保证数据一致性
   return false;
 }
 
@@ -3907,51 +4627,109 @@ void DBImpl::BuildCompactionJobInfo(
 // * malloc one SuperVersion() outside of the lock -- new_superversion
 // * delete SuperVersion()s outside of the lock -- superversions_to_free
 //
-// However, if InstallSuperVersionAndScheduleWork() gets called twice with the
-// same sv_context, we can't reuse the SuperVersion() that got
-// malloced because
-// first call already used it. In that rare case, we take a hit and create a
-// new SuperVersion() inside of the mutex. We do similar thing
-// for superversion_to_free
+// 如果同一个 sv_context 两次调用 InstallSuperVersionAndScheduleWork()，我们不能复用
+// 已分配的 SuperVersion()，因为第一次调用已经使用了它。在这种罕见情况下，
+// 我们需要承担一点性能开销，在互斥锁内创建新的 SuperVersion()。
+// 对于 superversion_to_free 我们也做类似处理。
 
+/**
+ * @brief 安装新的 SuperVersion 并调度后台工作（flush/compaction）
+ *
+ * 该函数是 RocksDB 版本管理的核心入口点，用于在配置或状态变更后更新列族的 SuperVersion，
+ * 并触发必要的后台维护任务。SuperVersion 是读取操作的关键数据结构，包含了当前可用的
+ * MemTableList、ImmutableMemTableList 和 Version 信息。
+ *
+ * @param cfd 目标列族数据指针，指定要更新 SuperVersion 的列族
+ * @param sv_context SuperVersion 上下文对象，包含：
+ *                   - new_superversion: 可复用的 SuperVersion 对象指针（可为空）
+ *                   - superversions_to_free: 待释放的旧 SuperVersion 列表
+ *                   - write_stall_notifications: 写停顿通知信息（如果启用）
+ * @param mutable_cf_options 新的可变列族选项，包含 write_buffer_size、max_write_buffer_number 等配置
+ *
+ * @note 调用此函数时必须持有 mutex_（db_mutex）
+ *
+ * 设计要点：
+ * 1. SuperVersion 复用优化：通过 SuperVersionContext 预分配 SuperVersion 对象，
+ *    避免在持有互斥锁时进行内存分配（hot path 优化）
+ * 2. 内存状态跟踪：更新 max_total_in_memory_state_ 以追踪所有列族的最大内存使用量
+ * 3. 自适应触发：根据所有列族的 snapshot 情况更新 bottommost_files_mark_threshold_
+ * 4. 后台任务调度：安装新版本后自动评估是否需要 flush 或 compaction
+ *
+ * 调用场景：
+ * - Flush 完成后更新 SuperVersion（新的 immutable memtable 生成）
+ * - Compaction 完成后更新 Version
+ * - 配置变更（如 write_buffer_size 修改）
+ * - MemTable 切换时
+ * - DB 打开初始化时
+ *
+ * 性能考虑：
+ * - 使用 UNLIKELY 分支处理罕见情况（sv_context->new_superversion 为空）
+ * - 在锁外进行大部分准备工作（通过 sv_context 预分配）
+ * - 批量处理 superversion 释放（延迟到后台线程）
+ */
 void DBImpl::InstallSuperVersionAndScheduleWork(
     ColumnFamilyData* cfd, SuperVersionContext* sv_context,
     const MutableCFOptions& mutable_cf_options) {
+  // 断言：调用者必须持有数据库互斥锁
   mutex_.AssertHeld();
 
-  // Update max_total_in_memory_state_
+  // 更新 max_total_in_memory_state_：这是 DBImpl 跟踪所有列族最大内存使用量的全局变量
+  // 用于 write buffer manager 判断是否需要触发写停顿或 flush
   size_t old_memtable_size = 0;
   auto* old_sv = cfd->GetSuperVersion();
   if (old_sv) {
+    // 计算旧配置下的内存限制：单 buffer 大小 × buffer 数量
     old_memtable_size = old_sv->mutable_cf_options.write_buffer_size *
                         old_sv->mutable_cf_options.max_write_buffer_number;
   }
 
-  // this branch is unlikely to step in
+  // 创建新的 SuperVersion 对象（如果尚未创建）
+  // 这是一个性能优化：通常情况下调用者会在锁外预创建 SuperVersion 对象
+  // 只有在极少数情况下（如复用 sv_context）才会进入此分支
+  // 注意：在锁内分配内存会增加延迟，但这个分支极少执行，影响可忽略
   if (UNLIKELY(sv_context->new_superversion == nullptr)) {
     sv_context->NewSuperVersion();
   }
+
+  // 安装新的 SuperVersion
+  // 此调用会：
+  // 1. 保存当前的 SuperVersion 到 sv_context->superversions_to_free（延迟释放）
+  // 2. 将新 SuperVersion 设置为当前版本
+  // 3. 更新内部引用计数和版本号
+  // 4. 可能触发写停顿状态变更（如果内存压力变化）
   cfd->InstallSuperVersion(sv_context, mutable_cf_options);
 
-  // There may be a small data race here. The snapshot tricking bottommost
-  // compaction may already be released here. But assuming there will always be
-  // newer snapshot created and released frequently, the compaction will be
-  // triggered soon anyway.
+  // 更新 bottommost_files_mark_threshold_（底层文件标记阈值）
+  // 这个值用于在 bottommost compaction 中判断哪些 key-range 包含活跃 snapshot
+  // 只有大于此阈值的 sequence number 才需要在 SST 文件中保留
+  //
+  // 设计说明：
+  // - 这里可能存在微小的数据竞争：snapshot 相关的 bottommost compaction
+  //   可能在此时被释放。但假设会频繁创建和释放新的 snapshot，
+  //   compaction 很快就会被重新触发，因此影响很小
+  // - allow_ingest_behind 列族使用 ingest-behind 策略，不参与此计算
+  //   因为它们有独立的 snapshot 处理逻辑
   bottommost_files_mark_threshold_ = kMaxSequenceNumber;
   for (auto* my_cfd : *versions_->GetColumnFamilySet()) {
     if (!my_cfd->ioptions()->allow_ingest_behind) {
+      // 取所有列族的最小值作为全局阈值，确保任何列族的 snapshot 都不会被错误删除
       bottommost_files_mark_threshold_ = std::min(
           bottommost_files_mark_threshold_,
           my_cfd->current()->storage_info()->bottommost_files_mark_threshold());
     }
   }
 
-  // Whenever we install new SuperVersion, we might need to issue new flushes or
-  // compactions.
+  // 每次安装新的 SuperVersion 后，需要评估是否需要触发新的 flush 或 compaction
+  // 这是因为 SuperVersion 的变化可能：
+  // 1. 新增了可 flush 的 memtable（memtable 满了）
+  // 2. 版本变更产生了新的 compaction 机会（如文件重叠度变化）
+  // 3. 选项变更改变了触发条件
   SchedulePendingCompaction(cfd);
   MaybeScheduleFlushOrCompaction();
 
-  // Update max_total_in_memory_state_
+  // 更新 max_total_in_memory_state_：反映新配置下的内存限制
+  // 公式：旧内存大小 - 旧配置内存 + 新配置内存
+  // 这确保 max_total_in_memory_state_ 始终是所有列族配置的内存上限总和
   max_total_in_memory_state_ = max_total_in_memory_state_ - old_memtable_size +
                                mutable_cf_options.write_buffer_size *
                                    mutable_cf_options.max_write_buffer_number;

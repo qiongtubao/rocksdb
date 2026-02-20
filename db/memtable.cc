@@ -240,18 +240,73 @@ void MemTable::UpdateFlushState() {
   }
 }
 
+// 更新 MemTable 中最旧键的时间戳
+//
+// 功能说明：
+// 1. 此函数用于记录 MemTable 中最早插入的键的时间戳，用于 TTL（Time To Live）管理
+// 2. 时间戳只设置一次（首次插入时），后续插入不会覆盖
+// 3. 使用 CAS（Compare-And-Swap）原子操作确保多线程安全
+//
+// 调用时机：
+// - 每次 MemTable::Add() 插入新条目后都会调用
+// - 无论是否为并发插入模式
+//
+// TTL 管理说明：
+// - MemTable 可以配置 TTL（通过选项中的 ttl 参数）
+// - RocksDB 使用这个时间戳来判断 MemTable 中的数据是否过期
+// - 过期数据可以在 flush 时被过滤掉
+// - 还可以用于基于时间的 Compaction 策略
+//
+// 并发安全：
+// - 使用 compare_exchange_strong 原子操作
+// - 多个线程可能同时调用此函数，但只有第一个会成功设置时间戳
+// - 使用 relaxed 内存序，因为时间戳是独立的状态，不需要与其他操作同步
+//
+// 实现原理：
+// 1. 检查 oldest_key_time_ 是否为初始值（max）
+// 2. 如果是初始值，尝试获取当前时间戳
+// 3. 使用 CAS 原子设置 oldest_key_time_
+// 4. 如果 CAS 失败（其他线程已设置），则跳过
+//
+// 相关配置选项：
+// - ColumnFamilyOptions.ttl: 设置 TTL（秒）
+// - ImmutableDBOptions.clock: 时钟接口实现（用于获取时间）
+//
+// 注意事项：
+// - 时间戳精度取决于 clock_ 的实现（通常是系统时间，秒级或毫秒级）
+// - 即使获取时间失败，也不会影响正常功能，只是 TTL 功能可能无法正常工作
+// - 如果 MemTable 为空或所有条目都被删除，oldest_key_time_ 不会被设置
 void MemTable::UpdateOldestKeyTime() {
+  // 原子加载当前的 oldest_key_time_
+  // 使用 relaxed 内存序，因为这是独立的状态检查，不需要与其他内存操作同步
   uint64_t oldest_key_time = oldest_key_time_.load(std::memory_order_relaxed);
+  // 检查是否为初始值（std::numeric_limits<uint64_t>::max() 表示未设置）
+  // 如果是初始值，说明这是首次插入，需要设置时间戳
+  // 如果已经设置过，直接返回，不更新（保持最早插入的时间戳）
   if (oldest_key_time == std::numeric_limits<uint64_t>::max()) {
-    int64_t current_time = 0;
-    auto s = clock_->GetCurrentTime(&current_time);
+    int64_t current_time = 0;  // 用于存储获取的当前时间
+    auto s = clock_->GetCurrentTime(&current_time);  // 从时钟接口获取当前时间
+    // 如果成功获取时间，则尝试设置 oldest_key_time_
     if (s.ok()) {
-      assert(current_time >= 0);
-      // If fail, the timestamp is already set.
+      assert(current_time >= 0);  // 断言：时间应该是非负的
+      // 使用 CAS（Compare-And-Swap）原子操作设置时间戳
+      // 参数说明：
+      // - oldest_key_time: 期望值（初始值为 max）
+      // - static_cast<uint64_t>(current_time): 新值（当前时间）
+      // - success memory_order_relaxed: 成功时的内存序（无需与其他操作同步）
+      // - failure memory_order_relaxed: 失败时的内存序（读取失败后的值）
+      //
+      // CAS 语义：
+      // - 如果 oldest_key_time_ 当前值等于 oldest_key_time（max），则设置为新值并返回 true
+      // - 如果不等，说明其他线程已经修改了 oldest_key_time_，则将 oldest_key_time 更新为当前值并返回 false
+      // - If fail, the timestamp is already set.  如果 CAS 失败，说明时间戳已经被其他线程设置了
       oldest_key_time_.compare_exchange_strong(
           oldest_key_time, static_cast<uint64_t>(current_time),
           std::memory_order_relaxed, std::memory_order_relaxed);
     }
+    // 如果获取时间失败（s.ok() == false），则不设置时间戳
+    // 这可能发生在 clock_ 实现有问题或系统时间不可用的情况
+    // 在这种情况下，TTL 功能可能无法正常工作，但不会影响 MemTable 的其他功能
   }
 }
 
@@ -679,171 +734,272 @@ void MemTable::UpdateEntryChecksum(const ProtectionInfoKVOS64* kv_prot_info,
   }
 }
 
+// 向MemTable中添加一个键值对条目
+//
+// 参数说明:
+// - s: 序列号,表示此操作的全局顺序,用于实现多版本并发控制(MVCC)。
+//      序列号越大,表示版本越新。在读取时会选择符合快照条件的最大序列号版本。
+// - type: 值类型,表示此条目的操作类型。
+//         常见类型包括:
+//         - kTypeValue: 普通的Put操作,存储键值对
+//         - kTypeMerge: Merge操作,需要与后续的值合并
+//         - kTypeDeletion/kTypeSingleDeletion: 删除操作,标记键被删除
+//         - kTypeRangeDeletion: 范围删除,删除一个键范围
+//         - kTypeBlobIndex: 大值索引,指向存储在Blob文件中的大值
+//         - kTypeWideColumnEntity: 宽列实体,存储多列数据
+// - key: 用户键,不包含序列号和类型信息的原始键
+// - value: 值数据,根据type的不同可能存储不同的内容
+// - kv_prot_info: 键值保护信息指针,用于校验条目完整性,可为nullptr
+//                 当protection_bytes_per_key > 0时使用,存储checksum等信息
+// - allow_concurrent: 是否允许并发插入
+//                     false: 单线程插入,直接更新计数器
+//                     true: 多线程并发插入,使用线程安全的插入方法
+// - post_process_info: 后处理信息指针,用于并发插入场景下的批量更新
+//                      在allow_concurrent=true时必须提供,用于延迟更新统计信息
+// - hint: 插入提示指针,用于优化重复键的插入性能
+//         当allow_concurrent=true时,如果hint不为nullptr,会使用InsertKeyWithHintConcurrently
+//         hint的值由上层调用者维护,通常存储上一次插入的位置信息
+//
+// 返回值: Status
+//         - Status::OK(): 插入成功
+//         - Status::TryAgain("key+seq exists"): 插入失败,相同序列号的键已存在
+//                                            上层会重试
+//         - Status::Corruption(): 数据损坏,checksum校验失败等
+//
+// 工作原理:
+// 1. 条目编码格式:
+//    [key_size(varint32)][key数据(8字节序列号+类型+用户键)]
+//    [value_size(varint32)][value数据]
+//    [checksum(可选,长度由protection_bytes_per_key指定)]
+//
+// 2. 插入流程:
+//    a) 根据type选择table_或range_del_table_
+//    b) 从Arena分配内存并编码条目
+//    c) 计算并写入checksum(如果启用)
+//    d) 插入到SkipList中(单线程或并发)
+//    e) 更新统计信息(条目数、数据大小、删除数)
+//    f) 更新Bloom Filter(如果启用)
+//    g) 更新序列号信息(first_seqno_和earliest_seqno_)
+//    h) 如果是RangeDeletion,使缓存的range tombstone失效
+//    i) 更新oldest_key_time_和flush状态
+//
+// 3. 并发控制:
+//    - allow_concurrent=false时,使用InsertKey/InsertKeyWithHint,由调用者保证线程安全
+//    - allow_concurrent=true时,使用InsertKeyConcurrently/InsertKeyWithHintConcurrently
+//    - 统计信息在allow_concurrent=true时通过post_process_info批量更新,减少原子操作开销
+//
+// 4. Bloom Filter:
+//    - 如果prefix_extractor_存在,将前缀添加到prefix bloom filter
+//    - 如果memtable_whole_key_filtering=true,将整个键添加到bloom filter
+//    - bloom filter用于加速Get操作,避免查找肯定不存在的键
+//
+// 5. Range Deletion:
+//    - RangeDeletion类型的条目插入到range_del_table_中
+//    - 插入RangeDeletion会使cached_range_tombstone_失效,触发lazy reconstruction
+//    - 多线程插入时需要加range_del_mutex_保护
+//
+// 性能考虑:
+// - 使用Arena内存分配器,减少内存分配开销
+// - 使用insert hints优化重复键插入
+// - 并发插入时批量更新统计信息,减少原子操作
+// - Bloom filter显著减少不必要的查找
+//
+// 使用场景:
+// - 写入路径(WRITE): Put、Merge、Delete等操作都会调用此函数
+// - 恢复路径(RECOVERY): 从WAL恢复数据时调用
+// - 批量写入: WriteBatch处理时批量调用
 Status MemTable::Add(SequenceNumber s, ValueType type,
                      const Slice& key, /* user key */
                      const Slice& value,
                      const ProtectionInfoKVOS64* kv_prot_info,
                      bool allow_concurrent,
                      MemTablePostProcessInfo* post_process_info, void** hint) {
-  // Format of an entry is concatenation of:
-  //  key_size     : varint32 of internal_key.size()
-  //  key bytes    : char[internal_key.size()]
-  //  value_size   : varint32 of value.size()
-  //  value bytes  : char[value.size()]
-  //  checksum     : char[moptions_.protection_bytes_per_key]
-  uint32_t key_size = static_cast<uint32_t>(key.size());
-  uint32_t val_size = static_cast<uint32_t>(value.size());
-  uint32_t internal_key_size = key_size + 8;
+  // 条目编码格式说明:
+  //  key_size     : 内部键大小的varint32编码
+  //  key bytes    : 内部键字节数组(用户键+8字节序列号和类型)
+  //  value_size   : 值大小的varint32编码
+  //  value bytes  : 值字节数组
+  //  checksum     : 校验和字节数组(长度由protection_bytes_per_key配置决定)
+  uint32_t key_size = static_cast<uint32_t>(key.size());  // 获取用户键的大小,转为32位无符号整数
+  uint32_t val_size = static_cast<uint32_t>(value.size());  // 获取值的大小,转为32位无符号整数
+  uint32_t internal_key_size = key_size + 8;  // 计算内部键大小 = 用户键大小 + 8字节(序列号7字节+类型1字节)
+  // 计算编码后的总长度:
+  // 1. internal_key_size的varint编码长度
+  // 2. 内部键本身的大小(用户键+8字节)
+  // 3. val_size的varint编码长度
+  // 4. 值本身的大小
+  // 5. 校验和的大小
   const uint32_t encoded_len = VarintLength(internal_key_size) +
                                internal_key_size + VarintLength(val_size) +
                                val_size + moptions_.protection_bytes_per_key;
-  char* buf = nullptr;
+  char* buf = nullptr;  // 声明缓冲区指针,用于存储编码后的条目
+  // 根据条目类型选择插入的目标表:
+  // - kTypeRangeDeletion类型的条目插入到range_del_table_中
+  // - 其他类型的条目插入到常规的table_中
   std::unique_ptr<MemTableRep>& table =
       type == kTypeRangeDeletion ? range_del_table_ : table_;
+  // 从Arena内存分配器中分配所需大小的内存,返回KeyHandle和buf指针
+  // Arena提供了高效的内存分配策略,减少malloc/free开销
   KeyHandle handle = table->Allocate(encoded_len, &buf);
 
-  char* p = EncodeVarint32(buf, internal_key_size);
-  memcpy(p, key.data(), key_size);
-  Slice key_slice(p, key_size);
-  p += key_size;
-  uint64_t packed = PackSequenceAndType(s, type);
-  EncodeFixed64(p, packed);
-  p += 8;
-  p = EncodeVarint32(p, val_size);
-  memcpy(p, value.data(), val_size);
+  char* p = EncodeVarint32(buf, internal_key_size);  // 将internal_key_size编码为varint32格式,写入buf开头,返回写入位置指针
+  memcpy(p, key.data(), key_size);  // 将用户键数据拷贝到p指向的位置
+  Slice key_slice(p, key_size);  // 创建key_slice引用用户键数据,后续用于前缀提取和Bloom filter
+  p += key_size;  // 指针向后移动key_size字节,指向序列号和类型的写入位置
+  uint64_t packed = PackSequenceAndType(s, type);  // 将序列号s和类型type打包成一个64位整数(序列号占高56位,类型占低8位)
+  EncodeFixed64(p, packed);  // 将打包后的64位整数写入p指向的位置(固定8字节,小端序)
+  p += 8;  // 指针向后移动8字节,指向value_size的写入位置
+  p = EncodeVarint32(p, val_size);  // 将val_size编码为varint32格式,写入p指向的位置,返回写入位置指针
+  memcpy(p, value.data(), val_size);  // 将值数据拷贝到p指向的位置
+  // 断言验证:确保实际写入的长度(包括校验和预留空间)等于计算的encoded_len
+  // p+val_size指向值数据结束位置,减去buf得到已写入长度,再加上校验和长度应该等于encoded_len
   assert((unsigned)(p + val_size - buf + moptions_.protection_bytes_per_key) ==
          (unsigned)encoded_len);
 
   UpdateEntryChecksum(kv_prot_info, key, value, type, s,
-                      buf + encoded_len - moptions_.protection_bytes_per_key);
+                      buf + encoded_len - moptions_.protection_bytes_per_key);  // 计算校验和并写入条目末尾,校验和基于key、value、type和sequence计算
+  // 创建encoded slice,指向编码后的条目(不包含校验和部分)
+  // 这个slice用于后续的校验和验证和测试同步点
   Slice encoded(buf, encoded_len - moptions_.protection_bytes_per_key);
+  // 如果提供了kv_prot_info(键值保护信息),则需要验证编码条目的完整性
   if (kv_prot_info != nullptr) {
-    TEST_SYNC_POINT_CALLBACK("MemTable::Add:Encoded", &encoded);
-    Status status = VerifyEncodedEntry(encoded, *kv_prot_info);
-    if (!status.ok()) {
+    TEST_SYNC_POINT_CALLBACK("MemTable::Add:Encoded", &encoded);  // 测试同步点,用于单元测试注入测试逻辑
+    Status status = VerifyEncodedEntry(encoded, *kv_prot_info);  // 验证编码条目是否与kv_prot_info匹配
+    if (!status.ok()) {  // 如果验证失败,返回错误状态
       return status;
     }
   }
 
-  size_t ts_sz = GetInternalKeyComparator().user_comparator()->timestamp_size();
-  Slice key_without_ts = StripTimestampFromUserKey(key, ts_sz);
+  size_t ts_sz = GetInternalKeyComparator().user_comparator()->timestamp_size();  // 获取用户比较器配置的timestamp大小(如果不支持timestamp则为0)
+  Slice key_without_ts = StripTimestampFromUserKey(key, ts_sz);  // 从用户键中剥离timestamp部分,用于Bloom filter(因为Bloom filter不应该包含timestamp)
 
-  if (!allow_concurrent) {
-    // Extract prefix for insert with hint.
+  if (!allow_concurrent) {  // 非并发模式:单线程插入,由调用者保证线程安全
+    // Extract prefix for insert with hint.  提取前缀用于带提示的插入优化
+    // 如果配置了insert_with_hint_prefix_extractor_且key在前缀提取器的定义域内
     if (insert_with_hint_prefix_extractor_ != nullptr &&
         insert_with_hint_prefix_extractor_->InDomain(key_slice)) {
-      Slice prefix = insert_with_hint_prefix_extractor_->Transform(key_slice);
-      bool res = table->InsertKeyWithHint(handle, &insert_hints_[prefix]);
-      if (UNLIKELY(!res)) {
-        return Status::TryAgain("key+seq exists");
+      Slice prefix = insert_with_hint_prefix_extractor_->Transform(key_slice);  // 从key_slice中提取前缀
+      bool res = table->InsertKeyWithHint(handle, &insert_hints_[prefix]);  // 使用前缀hint进行插入,insert_hints_[prefix]存储了该前缀的上次插入位置,可以加速重复前缀的插入
+      if (UNLIKELY(!res)) {  // UNLIKELY宏告诉编译器这个分支很少发生,优化分支预测
+        return Status::TryAgain("key+seq exists");  // 插入失败,说明相同的key+sequence已存在,返回TryAgain状态让上层重试
       }
-    } else {
-      bool res = table->InsertKey(handle);
-      if (UNLIKELY(!res)) {
-        return Status::TryAgain("key+seq exists");
+    } else {  // 不能使用hint,使用普通的插入方法
+      bool res = table->InsertKey(handle);  // 将handle插入到table中(SkipList或其他数据结构)
+      if (UNLIKELY(!res)) {  // 插入失败(重复的key+seq)
+        return Status::TryAgain("key+seq exists");  // 返回TryAgain状态
       }
     }
 
-    // this is a bit ugly, but is the way to avoid locked instructions
-    // when incrementing an atomic
+    // this is a bit ugly, but is the way to avoid locked instructions  这种写法有点丑陋,但这是避免使用锁指令原子递增的方法
+    // when incrementing an atomic  当递增原子变量时
+    // 直接使用load+store而不是fetch_add,因为fetch_add在x86上会导致总线锁,性能较差
+    // 这里是单线程插入,所以load+store是安全的
     num_entries_.store(num_entries_.load(std::memory_order_relaxed) + 1,
-                       std::memory_order_relaxed);
+                       std::memory_order_relaxed);  // 原子递增条目计数器,使用relaxed内存序(不需要与其他线程同步)
     data_size_.store(data_size_.load(std::memory_order_relaxed) + encoded_len,
-                     std::memory_order_relaxed);
+                     std::memory_order_relaxed);  // 原子递增数据大小计数器,加上本次插入的编码长度
+    // 如果条目类型是删除类型,递增删除计数器
     if (type == kTypeDeletion || type == kTypeSingleDeletion ||
         type == kTypeDeletionWithTimestamp) {
       num_deletes_.store(num_deletes_.load(std::memory_order_relaxed) + 1,
-                         std::memory_order_relaxed);
+                         std::memory_order_relaxed);  // 原子递增删除计数器
     }
 
+    // 如果配置了bloom_filter_和prefix_extractor_,并且key_without_ts在前缀提取器的定义域内
     if (bloom_filter_ && prefix_extractor_ &&
         prefix_extractor_->InDomain(key_without_ts)) {
-      bloom_filter_->Add(prefix_extractor_->Transform(key_without_ts));
+      bloom_filter_->Add(prefix_extractor_->Transform(key_without_ts));  // 将key的前缀添加到bloom filter中,用于后续查询优化
     }
+    // 如果配置了bloom_filter_且启用了整键过滤
     if (bloom_filter_ && moptions_.memtable_whole_key_filtering) {
-      bloom_filter_->Add(key_without_ts);
+      bloom_filter_->Add(key_without_ts);  // 将整个键(不包含timestamp)添加到bloom filter中
     }
 
-    // The first sequence number inserted into the memtable
-    assert(first_seqno_ == 0 || s >= first_seqno_);
-    if (first_seqno_ == 0) {
-      first_seqno_.store(s, std::memory_order_relaxed);
+    // The first sequence number inserted into the memtable  插入到memtable中的第一个序列号
+    assert(first_seqno_ == 0 || s >= first_seqno_);  // 断言:first_seqno_为0(还没有插入)或者当前序列号s >= first_seqno_(保证序列号递增)
+    if (first_seqno_ == 0) {  // 如果这是第一次插入
+      first_seqno_.store(s, std::memory_order_relaxed);  // 设置first_seqno_为当前序列号s
 
-      if (earliest_seqno_ == kMaxSequenceNumber) {
-        earliest_seqno_.store(GetFirstSequenceNumber(),
+      if (earliest_seqno_ == kMaxSequenceNumber) {  // 如果earliest_seqno_还未设置
+        earliest_seqno_.store(GetFirstSequenceNumber(),  // 获取第一个序列号并设置到earliest_seqno_
                               std::memory_order_relaxed);
       }
-      assert(first_seqno_.load() >= earliest_seqno_.load());
+      assert(first_seqno_.load() >= earliest_seqno_.load());  // 断言:first_seqno_应该 >= earliest_seqno_
     }
-    assert(post_process_info == nullptr);
-    UpdateFlushState();
-  } else {
-    bool res = (hint == nullptr)
-                   ? table->InsertKeyConcurrently(handle)
-                   : table->InsertKeyWithHintConcurrently(handle, hint);
-    if (UNLIKELY(!res)) {
-      return Status::TryAgain("key+seq exists");
-    }
-
-    assert(post_process_info != nullptr);
-    post_process_info->num_entries++;
-    post_process_info->data_size += encoded_len;
-    if (type == kTypeDeletion) {
-      post_process_info->num_deletes++;
+    assert(post_process_info == nullptr);  // 断言:非并发模式下post_process_info应该为nullptr
+    UpdateFlushState();  // 更新flush状态,检查是否需要触发flush(当memtable大小超过write_buffer_size时)
+  } else {  // 并发模式:多线程并发插入,使用线程安全的插入方法
+    bool res = (hint == nullptr)  // 根据hint是否为nullptr选择并发插入方法
+                   ? table->InsertKeyConcurrently(handle)  // hint为null,使用普通并发插入
+                   : table->InsertKeyWithHintConcurrently(handle, hint);  // hint不为null,使用带hint的并发插入,利用hint加速重复键插入
+    if (UNLIKELY(!res)) {  // 插入失败(重复的key+seq)
+      return Status::TryAgain("key+seq exists");  // 返回TryAgain状态
     }
 
+    assert(post_process_info != nullptr);  // 断言:并发模式下post_process_info必须不为nullptr
+    post_process_info->num_entries++;  // 通过post_process_info批量递增条目计数,避免每次插入都做原子操作
+    post_process_info->data_size += encoded_len;  // 通过post_process_info批量累加数据大小
+    if (type == kTypeDeletion) {  // 如果是删除类型
+      post_process_info->num_deletes++;  // 通过post_process_info批量递增删除计数
+    }
+
+    // 并发模式下更新bloom filter,使用线程安全的AddConcurrently方法
     if (bloom_filter_ && prefix_extractor_ &&
         prefix_extractor_->InDomain(key_without_ts)) {
-      bloom_filter_->AddConcurrently(
+      bloom_filter_->AddConcurrently(  // 并发安全地添加前缀到bloom filter
           prefix_extractor_->Transform(key_without_ts));
     }
     if (bloom_filter_ && moptions_.memtable_whole_key_filtering) {
-      bloom_filter_->AddConcurrently(key_without_ts);
+      bloom_filter_->AddConcurrently(key_without_ts);  // 并发安全地添加整键到bloom filter
     }
 
-    // atomically update first_seqno_ and earliest_seqno_.
-    uint64_t cur_seq_num = first_seqno_.load(std::memory_order_relaxed);
-    while ((cur_seq_num == 0 || s < cur_seq_num) &&
-           !first_seqno_.compare_exchange_weak(cur_seq_num, s)) {
-    }
+    // atomically update first_seqno_ and earliest_seqno_.  原子地更新first_seqno_和earliest_seqno_
+    // 使用CAS(Compare-And-Swap)循环来原子更新first_seqno_,确保多线程安全
+    uint64_t cur_seq_num = first_seqno_.load(std::memory_order_relaxed);  // 加载当前的first_seqno_
+    while ((cur_seq_num == 0 || s < cur_seq_num) &&  // 如果当前值为0或s更小(是第一个或更早的序列号)
+           !first_seqno_.compare_exchange_weak(cur_seq_num, s)) {  // 尝试CAS更新:如果cur_seq_num未变则更新为s,否则重试
+    }  // CAS循环:compare_exchange_weak失败时会将cur_seq_num更新为最新值
+    // 使用CAS循环来原子更新earliest_seqno_
     uint64_t cur_earliest_seqno =
-        earliest_seqno_.load(std::memory_order_relaxed);
+        earliest_seqno_.load(std::memory_order_relaxed);  // 加载当前的earliest_seqno_
     while (
-        (cur_earliest_seqno == kMaxSequenceNumber || s < cur_earliest_seqno) &&
-        !earliest_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {
-    }
+        (cur_earliest_seqno == kMaxSequenceNumber || s < cur_earliest_seqno) &&  // 如果当前值为kMaxSequenceNumber(未初始化)或s更小
+        !earliest_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {  // 尝试CAS更新
+    }  // CAS循环更新earliest_seqno_
   }
-  if (type == kTypeRangeDeletion) {
-    auto new_cache = std::make_shared<FragmentedRangeTombstoneListCache>();
-    size_t size = cached_range_tombstone_.Size();
-    if (allow_concurrent) {
-      range_del_mutex_.lock();
+  if (type == kTypeRangeDeletion) {  // 如果是范围删除类型
+    auto new_cache = std::make_shared<FragmentedRangeTombstoneListCache>();  // 创建一个新的空缓存对象,用于使旧缓存失效
+    size_t size = cached_range_tombstone_.Size();  // 获取per-core缓存数组的大小
+    if (allow_concurrent) {  // 如果是并发插入模式
+      range_del_mutex_.lock();  // 加锁保护cached_range_tombstone_的更新,避免并发竞争
     }
+    // 遍历每个CPU核心的缓存项,使其失效
     for (size_t i = 0; i < size; ++i) {
       std::shared_ptr<FragmentedRangeTombstoneListCache>* local_cache_ref_ptr =
-          cached_range_tombstone_.AccessAtCore(i);
+          cached_range_tombstone_.AccessAtCore(i);  // 获取第i个CPU核心的缓存指针
       auto new_local_cache_ref = std::make_shared<
-          const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
-      // It is okay for some reader to load old cache during invalidation as
-      // the new sequence number is not published yet.
-      // Each core will have a shared_ptr to a shared_ptr to the cached
-      // fragmented range tombstones, so that ref count is maintianed locally
-      // per-core using the per-core shared_ptr.
-      std::atomic_store_explicit(
-          local_cache_ref_ptr,
-          std::shared_ptr<FragmentedRangeTombstoneListCache>(
-              new_local_cache_ref, new_cache.get()),
-          std::memory_order_relaxed);
+          const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);  // 创建一个新的shared_ptr包装new_cache
+      // It is okay for some reader to load old cache during invalidation as  在使缓存失效期间,某些reader加载旧缓存是可以接受的
+      // the new sequence number is not published yet.  因为新的序列号还未发布
+      // Each core will have a shared_ptr to a shared_ptr to the cached  每个CPU核心都有一个指向缓存fragmented range tombstones的shared_ptr的shared_ptr
+      // fragmented range tombstones, so that ref count is maintianed locally  因此引用计数在每个CPU核心本地维护
+      // per-core using the per-core shared_ptr.  通过per-core的shared_ptr实现
+      std::atomic_store_explicit(  // 原子地存储新的缓存指针
+          local_cache_ref_ptr,  // 目标:per-core缓存指针
+          std::shared_ptr<FragmentedRangeTombstoneListCache>(  // 创建shared_ptr,管理两个引用:
+              new_local_cache_ref,  // 1. new_local_cache_ref的引用(内层)
+              new_cache.get()),  // 2. new_cache的引用(外层)
+          std::memory_order_relaxed);  // 使用relaxed内存序,因为不需要与其他操作同步
     }
-    if (allow_concurrent) {
-      range_del_mutex_.unlock();
+    if (allow_concurrent) {  // 如果是并发插入模式
+      range_del_mutex_.unlock();  // 解锁
     }
-    is_range_del_table_empty_.store(false, std::memory_order_relaxed);
+    is_range_del_table_empty_.store(false, std::memory_order_relaxed);  // 设置range_del_table_非空标志
   }
-  UpdateOldestKeyTime();
+  UpdateOldestKeyTime();  // 更新最旧键的时间戳,用于TTL(过期时间)管理
 
-  TEST_SYNC_POINT_CALLBACK("MemTable::Add:BeforeReturn:Encoded", &encoded);
-  return Status::OK();
+  TEST_SYNC_POINT_CALLBACK("MemTable::Add:BeforeReturn:Encoded", &encoded);  // 测试同步点,在返回前注入测试逻辑
+  return Status::OK();  // 返回成功状态
 }
 
 // Callback from MemTable::Get()
