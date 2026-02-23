@@ -16,6 +16,7 @@
 #include "options/options_helper.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
+#include <iostream>
 
 namespace ROCKSDB_NAMESPACE {
 // Convenience methods
@@ -316,6 +317,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                         post_memtable_callback);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
+  //加入队列，等待分配状态 （会阻塞）
   write_thread_.JoinBatchGroup(&w);
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
     // we are a non-leader in a parallel group
@@ -336,7 +338,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       PERF_TIMER_START(write_pre_and_post_process_time);
     }
 
-    if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+    // 完成写入，并检查是否是最后一个写入者，如果是，则退出批处理组
+    if (write_thread_.CompleteParallelMemTableWriter(&w)) {//有阻塞  true为最后一个写入者
       // we're responsible for exit batch group
       // TODO(myabandeh): propagate status to write_group
       auto last_sequence = w.write_group->last_sequence;
@@ -352,6 +355,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       }
       versions_->SetLastSequence(last_sequence);
       MemTableInsertStatusCheck(w.status);
+      //唤醒其他leader 或者 follower （其他写入者也阻塞住了）
       write_thread_.ExitAsBatchGroupFollower(&w);
     }
     assert(w.state == WriteThread::STATE_COMPLETED);
@@ -376,6 +380,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // This is how a write job could be done by the other writer.
   WriteContext write_context;
   LogContext log_context(write_options.sync);
+  //写入组
   WriteThread::WriteGroup write_group;
   bool in_parallel_group = false;
   uint64_t last_sequence = kMaxSequenceNumber;
@@ -388,7 +393,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
     // PreprocessWrite does its own perf timing.
     PERF_TIMER_STOP(write_pre_and_post_process_time);
-
+    // 预处理写入 里面有限速 flush等行为 （存在有阻塞 核心！！）
     status = PreprocessWrite(write_options, &log_context, &write_context);
     if (!two_write_queues_) {
       // Assign it after ::PreprocessWrite since the sequence might advance
@@ -408,6 +413,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // 1. 生成 WriteGroup (EnterAsBatchGroupLeader)
   //    leader 会尝试打包队列中其他 writer 的 batch，形成一个大的 WriteGroup
   TEST_SYNC_POINT("DBImpl::WriteImpl:BeforeLeaderEnters");
+  //把合并的write 设置同一个write_group (并计算出大概的大小)
   last_batch_group_size_ =
       write_thread_.EnterAsBatchGroupLeader(&w, &write_group);
 
@@ -570,7 +576,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
             write_options.ignore_missing_column_families,
             0 /*recovery_log_number*/, this, parallel, seq_per_batch_,
             batch_per_txn_);
-      } else {
+      } else {//并发 ,这里唤醒其他follower工作
         write_group.last_sequence = last_sequence;
         write_thread_.LaunchParallelMemTableWriters(&write_group);
         in_parallel_group = true;
@@ -581,6 +587,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
           ColumnFamilyMemTablesImpl column_family_memtables(
               versions_->GetColumnFamilySet());
           assert(w.sequence == current_sequence);
+          //只处理自己本身的write就行
           w.status = WriteBatchInternal::InsertInto(
               &w, w.sequence, &column_family_memtables, &flush_scheduler_,
               &trim_history_scheduler_,
@@ -640,14 +647,14 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   }
 
   bool should_exit_batch_group = true;
-  if (in_parallel_group) {
+  if (in_parallel_group) {//如果是并发的话 就需要判定自己是否是最后一个了， 最后一个才有权限退出
     // CompleteParallelWorker returns true if this thread should
     // handle exit, false means somebody else did
-    should_exit_batch_group = write_thread_.CompleteParallelMemTableWriter(&w);
+    should_exit_batch_group = write_thread_.CompleteParallelMemTableWriter(&w); //有阻塞
   }
-  if (should_exit_batch_group) {
+  if (should_exit_batch_group) { //最后一个负责退出 并唤醒其他线程
     if (status.ok()) {
-      for (auto* tmp_w : write_group) {
+      for (auto* tmp_w : write_group) { //检查一下状态ok
         assert(tmp_w);
         if (tmp_w->post_memtable_callback) {
           Status tmp_s =
