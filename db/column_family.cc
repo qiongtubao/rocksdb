@@ -1647,96 +1647,423 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
   }
 }
 
+// ColumnFamilyData::ValidateOptions - 验证列族选项的合法性和兼容性
+//
+// 功能概述：
+// 此函数用于验证列族选项的合法性和与数据库选项的兼容性。
+// 在打开数据库、动态修改选项等关键操作之前调用，确保配置是有效的。
+//
+// 参数说明：
+// - db_options: 数据库级别的选项（DBOptions）
+// - cf_options: 列族级别的选项（ColumnFamilyOptions）
+//
+// 返回值：
+// - Status::OK(): 选项验证通过
+// - Status::InvalidArgument(): 参数无效（如配置冲突）
+// - Status::NotSupported(): 功能不支持（如某些组合不被允许）
+//
+// 调用时机：
+// 1. DBImpl::Open: 打开数据库时验证所有列族选项
+// 2. DBImpl::CreateColumnFamily: 创建新列族时验证选项
+// 3. ColumnFamilyData::SetOptions: 动态修改选项时验证新选项
+// 4. DBImpl::AlterOptions: 修改列族选项时验证
+//
+// 验证项：
+// 1. 压缩算法支持检查
+// 2. 并发写入支持检查
+// 3. 无序写入与 merge 操作兼容性检查
+// 4. 列族路径支持检查
+// 5. TTL 与 TableFactory 兼容性检查
+// 6. 周期性压缩与 TableFactory 兼容性检查
+// 7. Blob 垃圾回收参数检查
+// 8. FIFO 压缩与 TTL 兼容性检查
+// 9. MemTable 和 Block 保护字节长度检查
+// 10. 文件温度阈值参数检查
+//
+// 设计原则：
+// - 提前验证：在执行任何实际操作前验证选项，避免运行时错误
+// - 明确错误：返回清晰的错误消息，帮助用户快速定位问题
+// - 严格检查：拒绝任何可能导致数据损坏或性能问题的配置
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
+  // 初始化状态对象，用于跟踪验证过程中的错误
   Status s;
+
+  // ============================================================================
+  // 验证项 1：检查压缩算法是否支持
+  // ============================================================================
+  // CheckCompressionSupported 会检查：
+  // 1. 压缩算法是否被编译到 RocksDB 中（如 Snappy、Zlib、LZ4 等）
+  // 2. 压缩算法是否与当前的配置兼容
+  // 3. 压缩算法是否适用于当前的存储引擎
+  //
+  // 如果使用了不支持的压缩算法（如编译时未包含 Zstd 但配置了 Zstd），
+  // 会返回 Status::NotSupported 或 Status::InvalidArgument
   s = CheckCompressionSupported(cf_options);
+
+  // 如果之前的检查通过，检查并发写入支持
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
+    // ============================================================================
+    // 验证项 2：检查并发写入是否支持
+    // ============================================================================
+    // 当 enable_concurrent_memtable_write = true 时，需要检查：
+    // 1. MemTable Rep 是否支持并发插入
+    // 2. 是否有某些选项与并发写入不兼容
+    //
+    // CheckConcurrentWritesSupported 会检查：
+    // - SkipListFactory: 支持并发写入
+    // - HashSkipListRepFactory: 支持并发写入
+    // - 其他自定义 Factory 需要实现并发插入接口
+    //
+    // 如果使用不支持并发写入的 MemTable Factory 但启用了 allow_concurrent_memtable_write，
+    // 会返回 Status::NotSupported
     s = CheckConcurrentWritesSupported(cf_options);
   }
+
+  // ============================================================================
+  // 验证项 3：检查无序写入与 merge 操作的兼容性
+  // ============================================================================
+  // 无序写入（unordered_write）的特性：
+  // - 不保证写入的顺序
+  // - 可能提高某些场景下的性能
+  //
+  // max_successive_merges 的作用：
+  // - 控制 max_successive_merges 个连续的 merge 操作后被合并为一个 put
+  // - 减少读操作时的 merge 次数，提高读取性能
+  //
+  // 为什么不兼容：
+  // - max_successive_merges > 0 需要保持写入的顺序
+  // - unordered_write 不保证写入顺序
+  // - 两者结合可能导致数据不一致或语义错误
+  //
+  // 示例场景：
+  //   写入顺序：Merge(k, v1) -> Merge(k, v2) -> Merge(k, v3)
+  //   max_successive_merges = 2: 会在 2 个 merge 后执行合并，需要知道前 2 个操作的顺序
+  //   unordered_write: 不保证顺序，可能乱序执行，导致合并结果错误
   if (s.ok() && db_options.unordered_write &&
       cf_options.max_successive_merges != 0) {
+    // 返回无效参数错误，说明这两个选项不能同时使用
     s = Status::InvalidArgument(
         "max_successive_merges > 0 is incompatible with unordered_write");
   }
+
+  // ============================================================================
+  // 验证项 4：检查列族路径支持
+  // ============================================================================
+  // CheckCFPathsSupported 会检查：
+  // 1. cf_paths 配置是否有效（路径是否存在、可写等）
+  // 2. 多路径存储是否与当前配置兼容
+  // 3. 文件系统是否支持路径操作
+  //
+  // cf_paths 的作用：
+  // - 允许将 SST 文件存储在多个目录中
+  // - 可以利用多个磁盘提高 I/O 性能
+  // - 可以将热数据和冷数据分离存储
+  //
+  // 如果路径配置无效或不可访问，会返回 Status::InvalidArgument
   if (s.ok()) {
     s = CheckCFPathsSupported(db_options, cf_options);
   }
+
+  // 如果之前的检查有错误，立即返回错误
   if (!s.ok()) {
     return s;
   }
 
+  // ============================================================================
+  // 验证项 5：检查 TTL 与 TableFactory 的兼容性
+  // ============================================================================
+  // TTL (Time To Live) 的作用：
+  // - 自动删除超过指定时间的键值对
+  // - 适用于需要自动清理过期数据的场景（如缓存、会话数据等）
+  //
+  // kDefaultTtl 的定义：
+  // - 表示未设置 TTL 的特殊值
+  // - 通常为 0 或某个特殊值（如 std::numeric_limits<uint64_t>::max()）
+  // - cf_options.ttl == kDefaultTtl 表示没有启用 TTL
+  //
+  // 为什么 TTL 只支持 BlockBasedTable：
+  // 1. TTL 需要在 SST 文件中存储时间戳信息
+  // 2. BlockBasedTable 的设计支持存储额外的元数据（如时间戳）
+  // 3. PlainTable 的设计更简单，不支持复杂的元数据管理
+  // 4. 其他 TableFactory（如 CuckooTable）也可能不支持 TTL
+  //
+  // TTL 实现机制：
+  // - 在写入时记录时间戳
+  // - 在读取时检查时间戳，如果超过 TTL 则返回 NotFound
+  // - 在压缩时自动清理过期的键值对
+  //
+  // 错误示例：
+  //   Options options;
+  //   options.table_factory.reset(new PlainTableFactory());  // 不支持 TTL
+  //   options.ttl = 3600;  // 启用 1 小时的 TTL
+  //   DB::Open(...) 会返回 Status::NotSupported
   if (cf_options.ttl > 0 && cf_options.ttl != kDefaultTtl) {
+    // 检查 TableFactory 是否是 BlockBasedTable 的实例
+    // IsInstanceOf 通过检查 Factory 的类型名称或类型 ID 判断
     if (!cf_options.table_factory->IsInstanceOf(
             TableFactory::kBlockBasedTableName())) {
+      // 返回不支持错误，说明 TTL 只支持 BlockBasedTable
       return Status::NotSupported(
           "TTL is only supported in Block-Based Table format. ");
     }
   }
 
+  // ============================================================================
+  // 验证项 6：检查周期性压缩与 TableFactory 的兼容性
+  // ============================================================================
+  // 周期性压缩（Periodic Compaction）的作用：
+  // - 即使没有其他压缩触发条件，也会定期执行压缩
+  // - 用于确保数据不会在某个层级停留过久
+  // - 有助于保持数据的健康状态（如及时应用删除标记）
+  //
+  // periodic_compaction_seconds 的作用：
+  // - 指定周期性压缩的间隔时间（秒）
+  // - 0 表示禁用周期性压缩
+  // - 正数表示每隔 N 秒执行一次压缩
+  //
+  // kDefaultPeriodicCompSecs 的定义：
+  // - 默认值，通常为 0（禁用）或某个特殊值
+  // - cf_options.periodic_compaction_seconds == kDefaultPeriodicCompSecs
+  //   表示使用默认配置（通常禁用）
+  //
+  // 为什么只支持 BlockBasedTable：
+  // - 原因与 TTL 类似，需要支持时间戳相关的元数据管理
+  // - 周期性压缩需要知道 SST 文件的创建时间或最后压缩时间
+  // - BlockBasedTable 设计支持这类元数据的存储和查询
+  //
+  // 使用场景：
+  // - 数据需要定期更新或清理（如删除标记应用）
+  // - 数据有生命周期，需要定期迁移到更高层级
+  // - 保持数据的可读性和性能
   if (cf_options.periodic_compaction_seconds > 0 &&
       cf_options.periodic_compaction_seconds != kDefaultPeriodicCompSecs) {
+    // 检查 TableFactory 是否是 BlockBasedTable 的实例
     if (!cf_options.table_factory->IsInstanceOf(
             TableFactory::kBlockBasedTableName())) {
+      // 返回不支持错误，说明周期性压缩只支持 BlockBasedTable
       return Status::NotSupported(
           "Periodic Compaction is only supported in "
           "Block-Based Table format. ");
     }
   }
 
+  // ============================================================================
+  // 验证项 7：检查 Blob 垃圾回收参数的有效性
+  // ============================================================================
+  // Blob (Binary Large Object) 的作用：
+  // - 将较大的值（> blob_cache_size）存储在独立的 blob 文件中
+  // - 减少 SST 文件的大小，提高缓存效率
+  // - 适用于存储图片、文档等大型二进制数据
+  //
+  // Blob 垃圾回收（Blob Garbage Collection）的作用：
+  // - 清理不再使用的 blob 数据（被覆盖或删除的值）
+  // - 释放磁盘空间
+  // - 减少 blob 文件的碎片
+  //
+  // blob_garbage_collection_age_cutoff 的作用：
+  // - 范围：[0.0, 1.0]
+  // - 表示只回收年龄超过此比例的 blob 数据
+  // - 0.0: 回收所有可回收的 blob
+  // - 1.0: 不回收任何 blob（禁用）
+  // - 0.5: 只回收年龄超过中位数的 blob
+  //
+  // blob_garbage_collection_force_threshold 的作用：
+  // - 范围：[0.0, 1.0]
+  // - 表示当垃圾比例超过此值时强制回收
+  // - 0.0: 不强制回收
+  // - 1.0: 任何垃圾都强制回收
+  // - 0.3: 当垃圾比例超过 30% 时强制回收
+  //
+  // 错误示例：
+  //   cf_options.blob_garbage_collection_age_cutoff = 1.5;  // 超出范围
+  //   cf_options.blob_garbage_collection_force_threshold = -0.1;  // 超出范围
+  //   会导致返回 Status::InvalidArgument
   if (cf_options.enable_blob_garbage_collection) {
+    // 检查 blob_garbage_collection_age_cutoff 是否在有效范围 [0.0, 1.0] 内
+    // < 0.0: 无意义（负数）
+    // > 1.0: 无意义（超过 100%）
     if (cf_options.blob_garbage_collection_age_cutoff < 0.0 ||
         cf_options.blob_garbage_collection_age_cutoff > 1.0) {
+      // 返回无效参数错误，说明 age_cutoff 必须在 [0.0, 1.0] 范围内
       return Status::InvalidArgument(
           "The age cutoff for blob garbage collection should be in the range "
           "[0.0, 1.0].");
     }
+
+    // 检查 blob_garbage_collection_force_threshold 是否在有效范围 [0.0, 1.0] 内
+    // < 0.0: 无意义（负数）
+    // > 1.0: 无意义（超过 100%）
     if (cf_options.blob_garbage_collection_force_threshold < 0.0 ||
         cf_options.blob_garbage_collection_force_threshold > 1.0) {
+      // 返回无效参数错误，说明 force_threshold 必须在 [0.0, 1.0] 范围内
       return Status::InvalidArgument(
           "The garbage ratio threshold for forcing blob garbage collection "
           "should be in the range [0.0, 1.0].");
     }
   }
 
+  // ============================================================================
+  // 验证项 8：检查 FIFO 压缩与 TTL 的兼容性
+  // ============================================================================
+  // FIFO (First-In-First-Out) 压缩策略：
+  // - 最简单的压缩策略
+  // - 当文件数量超过 max_table_files 时，删除最老的文件
+  // - 不考虑数据大小、压缩比等因素
+  // - 适用于日志数据、时序数据等场景
+  //
+  // FIFO 与 TTL 的冲突：
+  // 1. FIFO 压缩删除最老的文件，不考虑 TTL
+  // 2. TTL 根据时间戳删除过期数据
+  // 3. 两者同时使用可能导致：
+  //    - FIFO 删除的文件可能包含未过期的数据（TTL 未到）
+  //    - TTL 过期的数据可能保留在较新的文件中
+  //    - 语义冲突，数据不可预测
+  //
+  // 为什么需要 max_open_files = -1：
+  // - max_open_files = -1 表示不限制打开的文件数量
+  // - FIFO 压缩需要频繁打开和关闭文件
+  // - 如果限制了打开的文件数量，可能导致性能问题
+  // - RocksDB 需要能够访问所有 SST 文件来实现 FIFO 逻辑
+  //
+  // kCompactionStyleFIFO 的定义：
+  // - 压缩风格的枚举值之一
+  // - 其他值：kCompactionStyleLevel, kCompactionStyleUniversal
+  // - FIFO 只支持单层级（num_levels = 1）
   if (cf_options.compaction_style == kCompactionStyleFIFO &&
       db_options.max_open_files != -1 && cf_options.ttl > 0) {
+    // 返回不支持错误，说明 FIFO 压缩需要 max_open_files = -1
+    // 并且不能与 TTL 同时使用
     return Status::NotSupported(
         "FIFO compaction only supported with max_open_files = -1.");
   }
 
+  // ============================================================================
+  // 验证项 9：检查 MemTable 保护字节长度的有效性
+  // ============================================================================
+  // memtable_protection_bytes_per_key 的作用：
+  // - 为 MemTable 中的每个键值对添加校验和保护信息
+  // - 范围：0, 1, 2, 4, 8
+  // - 0: 不添加保护
+  // - 1-8: 添加相应字节的保护信息（如 CRC32、XXH64 等）
+  //
+  // 为什么只支持这些值：
+  // - 0: 禁用保护（高性能）
+  // - 1: 最小保护（8 位校验）
+  // - 2: 小保护（16 位校验）
+  // - 4: 标准保护（32 位校验，如 CRC32）
+  // - 8: 强保护（64 位校验，如 XXH64）
+  // - 其他值不被支持，可能导致内存对齐问题或性能下降
+  //
+  // 保护机制：
+  // - 在写入时计算校验和
+  // - 在读取时验证校验和
+  // - 如果校验失败，返回错误（数据损坏）
+  //
+  // 性能权衡：
+  // - 保护越多，CPU 开销越大（计算校验和）
+  // - 保护越多，内存占用越大（存储校验和）
+  // - 保护越多，数据可靠性越高（检测数据损坏）
   std::vector<uint32_t> supported{0, 1, 2, 4, 8};
+  // 检查 memtable_protection_bytes_per_key 是否在支持的值列表中
+  // std::find 返回迭代器，如果找不到则返回 end()
   if (std::find(supported.begin(), supported.end(),
                 cf_options.memtable_protection_bytes_per_key) ==
       supported.end()) {
+    // 返回不支持错误，说明只支持 0, 1, 2, 4, 8
     return Status::NotSupported(
         "Memtable per key-value checksum protection only supports 0, 1, 2, 4 "
         "or 8 bytes per key.");
   }
+
+  // ============================================================================
+  // 验证项 10：检查 Block 保护字节长度的有效性
+  // ============================================================================
+  // block_protection_bytes_per_key 的作用：
+  // - 为 SST Block 中的每个键值对添加校验和保护信息
+  // - 范围：0, 1, 2, 4, 8
+  // - 0: 不添加保护
+  // - 1-8: 添加相应字节的保护信息
+  //
+  // 与 memtable_protection_bytes_per_key 的区别：
+  // - MemTable 保护：内存中的键值对（写入时）
+  // - Block 保护：SST 文件中的键值对（持久化后）
+  // - Block 保护通常比 MemTable 保护更重要（磁盘数据更易损坏）
+  //
+  // 为什么只支持这些值：
+  // - 与 MemTable 保护相同的原因
+  // - 内存对齐、性能、兼容性考虑
+  //
+  // 块级别的保护：
+  // - Block 有完整的校验和（XxHash64）
+  // - block_protection_bytes_per_key 是额外的键值对级别保护
+  // - 可以检测 Block 内部的损坏（即使 Block 校验和正确）
   if (std::find(supported.begin(), supported.end(),
                 cf_options.block_protection_bytes_per_key) == supported.end()) {
+    // 返回不支持错误，说明只支持 0, 1, 2, 4, 8
     return Status::NotSupported(
         "Block per key-value checksum protection only supports 0, 1, 2, 4 "
         "or 8 bytes per key.");
   }
 
+  // ============================================================================
+  // 验证项 11：检查文件温度阈值参数
+  // ============================================================================
+  // 文件温度（File Temperature）的作用：
+  // - 根据文件的访问频率分类（冷、温、热）
+  // - 冷数据：很少访问
+  // - 温数据：偶尔访问
+  // - 热数据：频繁访问
+  //
+  // file_temperature_age_thresholds 的作用：
+  // - 定义不同温度的年龄阈值
+  // - 用于 FIFO 压缩策略
+  // - 年龄阈值表示文件被创建后经过的时间
+  //
+  // 结构说明：
+  // - std::vector<TemperatureAgeThreshold>
+  // - 每个元素包含年龄和对应的温度
+  // - 必须按年龄升序排列
+  //
+  // 使用场景：
+  // - 将热数据保持在更快的存储介质（如 NVMe SSD）
+  // - 将冷数据迁移到更慢的存储介质（如 HDD）
+  // - 优化存储成本和性能
+  //
+  // 为什么只支持 FIFO 压缩：
+  // - FIFO 压缩策略是按文件年龄删除的
+  // - 其他压缩策略（Level、Universal）不直接基于年龄
+  //
+  // 为什么只支持单层级：
+  // - FIFO 压缩只使用单层级（Level 0）
+  // - 多层级（num_levels > 1）与文件温度机制不兼容
   if (!cf_options.compaction_options_fifo.file_temperature_age_thresholds
            .empty()) {
+    // 检查压缩风格是否为 FIFO
     if (cf_options.compaction_style != kCompactionStyleFIFO) {
+      // 返回不支持错误，说明文件温度阈值只支持 FIFO 压缩
       return Status::NotSupported(
           "Option file_temperature_age_thresholds only supports FIFO "
           "compaction.");
     } else if (cf_options.num_levels > 1) {
+      // 检查是否为单层级
+      // 返回不支持错误，说明文件温度阈值只支持单层级
       return Status::NotSupported(
           "Option file_temperature_age_thresholds is only supported when "
           "num_levels = 1.");
     } else {
+      // 获取年龄阈值数组
       const auto& ages =
           cf_options.compaction_options_fifo.file_temperature_age_thresholds;
+      // 断言确保至少有一个阈值
       assert(ages.size() >= 1);
-      // check that age is sorted
+
+      // 检查年龄阈值是否按升序排列
+      // ages[i].age >= ages[i + 1].age 表示非升序（即乱序）
+      // 升序排列是必要的，因为年龄阈值需要从低到高判断
       for (size_t i = 0; i < ages.size() - 1; ++i) {
         if (ages[i].age >= ages[i + 1].age) {
+          // 返回不支持错误，说明年龄阈值必须按升序排列
           return Status::NotSupported(
               "Option file_temperature_age_thresholds requires elements to be "
               "sorted in increasing order with respect to `age` field.");
@@ -1744,6 +2071,8 @@ Status ColumnFamilyData::ValidateOptions(
       }
     }
   }
+
+  // 所有验证通过，返回 OK 状态
   return s;
 }
 

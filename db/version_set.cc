@@ -3927,7 +3927,6 @@ void VersionStorageInfo::ComputeCompactionScore(
         total_downcompact_bytes +=
             static_cast<double>(level_total_bytes - MaxBytesForLevel(level));
       }
-      }
     }
     // 保存该层的层级号到 compaction_level_ 数组
     compaction_level_[level] = level;
@@ -6132,14 +6131,6 @@ uint64_t VersionStorageInfo::MaxNextLevelOverlappingBytes() {
     }
   }
   return result;
-}
-
-uint64_t VersionStorageInfo::MaxBytesForLevel(int level) const {
-  // Note: the result for level zero is not really used since we set
-  // the level-0 compaction threshold based on number of files.
-  assert(level >= 0);
-  assert(level < static_cast<int>(level_max_bytes_.size()));
-  return level_max_bytes_[level];
 }
 
 void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,

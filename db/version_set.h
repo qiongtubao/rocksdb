@@ -2654,6 +2654,20 @@ class VersionStorageInfo {
    */
   EpochNumberRequirement epoch_number_requirement_;
 
+ private:
+  // 以下函数在 PrepareForVersionAppend 中调用，实现内部辅助功能
+  void ComputeCompensatedSizes();
+  void UpdateNumNonEmptyLevels();
+  void UpdateFilesByCompactionPri(const ImmutableOptions& immutable_options,
+                                   const MutableCFOptions& mutable_cf_options);
+  void GenerateFileIndexer();
+  void GenerateLevelFilesBrief();
+  void GenerateLevel0NonOverlapping();
+  void GenerateBottommostFiles();
+  void GenerateFileLocationIndex();
+  void CalculateBaseBytes(const ImmutableOptions& ioptions,
+                         const MutableCFOptions& mutable_cf_options);
+
   friend class Version;
   friend class VersionSet;
 };
