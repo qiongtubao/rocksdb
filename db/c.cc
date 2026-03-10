@@ -513,23 +513,83 @@ struct rocksdb_universal_compaction_options_t {
   ROCKSDB_NAMESPACE::CompactionOptionsUniversal* rep;
 };
 
+// ============================================================================
+// SaveError - 将 C++ Status 错误信息保存到 C 风格的错误指针中
+//
+// 职责：
+//   将 RocksDB 内部的 Status 对象转换为 C API 层的 char* 错误字符串，
+//   供 C 语言调用者检查错误。
+//
+// 参数：
+//   - errptr: 指向 char* 的指针（即 char**）
+//       * 调用者传入一个 char* 变量的地址
+//       * 若 s 表示错误：*errptr 会被设置为新分配的错误字符串（由 strdup 分配）
+//       * 调用者负责在使用完后 free(*errptr)
+//   - s: RocksDB 内部操作的状态对象
+//       * s.ok() == true  → 操作成功，函数不修改 *errptr，返回 false
+//       * s.ok() == false → 操作失败，将错误描述写入 *errptr，返回 true
+//
+// 返回值：
+//   - false：s 表示成功，无错误写入
+//   - true ：s 表示失败，已将错误信息写入 *errptr
+//
+// 内存管理：
+//   - 使用 strdup() 动态分配新字符串（内部调用 malloc）
+//   - 若 *errptr 原本非 NULL，先 free() 再重新分配，避免内存泄漏
+//   - TODO(sanjay)：若 *errptr 不是由 malloc() 分配的，free() 会导致 UB
+//
+// 调用场景（在 rocksdb_get_cf 调用链中）：
+//   rocksdb_get_cf → SaveError(errptr, s)
+//     仅当 s 不是 NotFound 时调用，将真实错误（如 IO 错误、损坏等）传递给调用者
+// ============================================================================
 static bool SaveError(char** errptr, const Status& s) {
   assert(errptr != nullptr);
   if (s.ok()) {
+    // 操作成功，无需写入错误信息
     return false;
   } else if (*errptr == nullptr) {
+    // 当前没有旧错误，直接用 strdup 分配新的错误字符串
     *errptr = strdup(s.ToString().c_str());
   } else {
     // TODO(sanjay): Merge with existing error?
     // This is a bug if *errptr is not created by malloc()
+    // 已有旧错误字符串，先释放旧内存再写入新错误
+    // 注意：若 *errptr 不是由 malloc 分配的，此处 free 会产生未定义行为
     free(*errptr);
     *errptr = strdup(s.ToString().c_str());
   }
   return true;
 }
 
+// ============================================================================
+// CopyString - 将 std::string 内容深拷贝到堆上的 C 风格字节数组
+//
+// 职责：
+//   将 C++ std::string 的原始字节数据复制到一块新分配的 char* 内存中，
+//   返回给 C API 调用者。C 调用者获得数据的独立副本，与原 std::string 生命周期无关。
+//
+// 参数：
+//   - str: 待复制的 C++ 字符串（可包含任意二进制数据，包括 '\0'）
+//
+// 返回值：
+//   - 指向新分配内存的 char* 指针，长度为 str.size() 字节
+//   - 注意：返回的字节数组不以 '\0' 结尾（RocksDB value 可包含二进制数据）
+//   - 调用者必须在使用完后调用 free() 释放内存
+//
+// 内存安全：
+//   - 使用 malloc 分配 str.size() 字节（不含终止符）
+//   - 使用 memcpy 进行字节级别的精确复制，支持二进制数据
+//   - 若 str.size() == 0，malloc(0) 行为由实现定义（可能返回 nullptr 或有效指针）
+//
+// 调用场景（在 rocksdb_get_cf 调用链中）：
+//   rocksdb_get_cf → CopyString(tmp)
+//     将 db->rep->Get() 写入的 std::string tmp 复制到堆上，
+//     赋值给 result 并返回给 C 调用者
+// ============================================================================
 static char* CopyString(const std::string& str) {
+  // 分配与字符串内容等长的堆内存（不含 '\0' 终止符，RocksDB 通过 vallen 传递长度）
   char* result = reinterpret_cast<char*>(malloc(sizeof(char) * str.size()));
+  // 将字符串内容（可含二进制数据）逐字节复制到新分配的内存中
   memcpy(result, str.data(), sizeof(char) * str.size());
   return result;
 }
@@ -1571,20 +1631,75 @@ char* rocksdb_get(rocksdb_t* db, const rocksdb_readoptions_t* options,
   return result;
 }
 
+// ============================================================================
+// rocksdb_get_cf - C API：从指定列族中读取一个 key 对应的 value
+//
+// 这是 rocksdb_get_cf 调用链的入口函数（C 语言公共接口层）。
+//
+// 完整调用链：
+//   rocksdb_get_cf
+//     └─ Slice(key, keylen)                      // 构造 key 的零拷贝视图
+//     └─ db->rep->Get(options->rep,               // 调用 DBImpl::Get
+//                     column_family->rep,
+//                     Slice, &tmp)
+//           └─ DBImpl::Get(read_options, cf, key, value, timestamp=nullptr)
+//                 └─ DBImpl::GetImpl(read_options, key, get_impl_options)
+//                       ├─ FailIfCfHasTs / FailIfTsMismatchCf  // 时间戳校验
+//                       ├─ GetAndRefSuperVersion(cfd)           // 获取并引用 SuperVersion
+//                       ├─ LookupKey(key, snapshot, ts)         // 构造内部查找键
+//                       ├─ sv->mem->Get(...)                    // 查询可变 MemTable
+//                       ├─ sv->imm->Get(...)                    // 查询不可变 MemTableList
+//                       ├─ sv->current->Get(...)                // 查询 SST 文件（Version）
+//                       └─ ReturnAndCleanupSuperVersion(cfd,sv) // 归还 SuperVersion
+//     └─ CopyString(tmp)   // 将结果深拷贝到堆上返回给调用者
+//     └─ SaveError(errptr, s)  // 将非 NotFound 的错误写入 errptr
+//
+// 参数：
+//   - db           : 数据库实例句柄（内部持有 DB* rep）
+//   - options      : 读取选项（快照、read_tier、verify_checksums 等）
+//   - column_family: 列族句柄（内部持有 ColumnFamilyHandle* rep）
+//   - key          : 待查找的 key 字节数组（可含二进制数据）
+//   - keylen       : key 的字节长度
+//   - vallen       : [输出] 返回 value 的字节长度；未找到时置为 0
+//   - errptr       : [输出] 错误信息指针；成功或 NotFound 时不修改；
+//                    其他错误时写入新分配的错误字符串（调用者需 free）
+//
+// 返回值：
+//   - 成功找到  : 返回指向新分配内存的 char* 指针，长度由 *vallen 指定；
+//                 调用者必须调用 free() 释放
+//   - Key 不存在: 返回 nullptr，*vallen = 0，*errptr 不变
+//   - 其他错误  : 返回 nullptr，*vallen = 0，*errptr 被设置为错误描述字符串
+//
+// 内存所有权：
+//   - 返回的 char* 由本函数通过 malloc 分配（经由 CopyString）
+//   - 调用者负责调用 free() 释放，或使用 rocksdb_free() 封装函数
+// ============================================================================
 char* rocksdb_get_cf(rocksdb_t* db, const rocksdb_readoptions_t* options,
                      rocksdb_column_family_handle_t* column_family,
                      const char* key, size_t keylen, size_t* vallen,
                      char** errptr) {
   char* result = nullptr;
-  std::string tmp;
+  std::string tmp;  // 用于接收 DBImpl::Get 写入的 value 数据
+  // 调用核心 C++ Get 接口：
+  //   - options->rep : ReadOptions 对象（快照、校验和等控制参数）
+  //   - column_family->rep : ColumnFamilyHandle 指针，指定目标列族
+  //   - Slice(key, keylen) : 构造不拷贝数据的 key 视图（零拷贝）
+  //   - &tmp : 输出参数，Get 成功后 value 数据写入此字符串
+  // 内部会依次查询：MemTable → Immutable MemTable → SST 文件
   Status s =
       db->rep->Get(options->rep, column_family->rep, Slice(key, keylen), &tmp);
   if (s.ok()) {
+    // 查找成功：将 value 长度写入输出参数
     *vallen = tmp.size();
+    // 深拷贝 value 数据到堆上，返回给 C 调用者
+    // （tmp 是栈上局部变量，函数返回后即销毁，必须拷贝）
     result = CopyString(tmp);
   } else {
+    // 查找失败：将 value 长度置为 0
     *vallen = 0;
     if (!s.IsNotFound()) {
+      // 非"键不存在"的真实错误（如 IO 错误、数据损坏等）才写入 errptr
+      // NotFound 是正常的"未找到"语义，不视为错误，不写入 errptr
       SaveError(errptr, s);
     }
   }
@@ -1987,6 +2102,20 @@ int rocksdb_property_int_cf(rocksdb_t* db,
   }
 }
 
+// ============================================================================
+// rocksdb_property_value_cf
+// 功能: C API 入口，按列族获取字符串类型 DB 属性（如 "rocksdb.stats"）。
+// 调用链: rocksdb_property_value_cf -> DBImpl::GetProperty -> GetPropertyInfo
+//         -> InternalStats::GetStringProperty -> HandleStats -> HandleCFStats
+//         + HandleDBStats -> DumpCFStats + DumpDBStats。
+// 参数:
+//   - db: 已打开的 DB 的 C 句柄 (rocksdb_t*)
+//   - column_family: 列族句柄，指定从哪个 CF 取属性
+//   - propname: 属性名，如 "rocksdb.stats"、"rocksdb.cfstats"、"rocksdb.dbstats"
+// 返回:
+//   - 成功: 新分配的多行字符串（调用方需 rocksdb_free 释放）
+//   - 失败: nullptr（属性不存在或获取失败）
+// ============================================================================
 char* rocksdb_property_value_cf(rocksdb_t* db,
                                 rocksdb_column_family_handle_t* column_family,
                                 const char* propname) {
@@ -2115,14 +2244,18 @@ void rocksdb_compact_range_cf_opt(rocksdb_t* db,
       (limit_key ? (b = Slice(limit_key, limit_key_len), &b) : nullptr));
 }
 
+// 对默认列族执行 flush：将 memtable 刷到 SST 文件。
 void rocksdb_flush(rocksdb_t* db, const rocksdb_flushoptions_t* options,
                    char** errptr) {
+  // 调用 C++ 层 Flush，若有错误则写入 errptr
   SaveError(errptr, db->rep->Flush(options->rep));
 }
 
+// 对指定列族执行 flush：将该列族的 memtable 刷成 SST 文件。
 void rocksdb_flush_cf(rocksdb_t* db, const rocksdb_flushoptions_t* options,
                       rocksdb_column_family_handle_t* column_family,
                       char** errptr) {
+  // 调用 C++ 层按列族 Flush，若有错误则写入 errptr
   SaveError(errptr, db->rep->Flush(options->rep, column_family->rep));
 }
 

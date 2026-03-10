@@ -2222,21 +2222,67 @@ ColumnFamilyHandle* DBImpl::PersistentStatsColumnFamily() const {
   return persist_stats_cf_handle_;
 }
 
+// ============================================================================
+// DBImpl::Get (无 timestamp 重载) - 单键点查接口（C++ 公共 API 层）
+//
+// 职责：
+//   提供不带 timestamp 参数的 Get 接口，委托给带 timestamp 的重载版本，
+//   并传入 nullptr 表示不使用时间戳语义。
+//
+// 参数：
+//   - read_options  : 读取控制参数（snapshot、read_tier、verify_checksums 等）
+//   - column_family : 目标列族句柄
+//   - key           : 待查找的用户键（Slice，零拷贝视图）
+//   - value         : [输出] 查找成功后，value 数据写入此 PinnableSlice
+//                     PinnableSlice 可以 pin 住底层内存避免拷贝（零拷贝优化）
+//
+// 调用链：
+//   rocksdb_get_cf → db->rep->Get(无timestamp重载)
+//     └─ DBImpl::Get(read_options, cf, key, value, timestamp=nullptr)
+//           └─ DBImpl::GetImpl(...)
+// ============================================================================
 Status DBImpl::Get(const ReadOptions& read_options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableSlice* value) {
+  // 委托给带 timestamp 的重载，timestamp=nullptr 表示本列族不使用时间戳
   return Get(read_options, column_family, key, value, /*timestamp=*/nullptr);
 }
 
+// ============================================================================
+// DBImpl::Get (带 timestamp 重载) - 单键点查接口（含时间戳支持）
+//
+// 职责：
+//   组装 GetImplOptions 参数结构体，然后调用核心实现 GetImpl。
+//   这是从公共 API 到内部实现的"适配层"，统一了有/无时间戳的调用路径。
+//
+// 参数：
+//   - read_options  : 读取控制参数
+//   - column_family : 目标列族句柄
+//   - key           : 待查找的用户键
+//   - value         : [输出] 查找到的 value，通过 PinnableSlice 返回（支持零拷贝）
+//   - timestamp     : [输出] 若列族启用了 UDT（User-Defined Timestamp），
+//                     找到的 key 对应的时间戳写入此字符串；否则传 nullptr
+//
+// 前置条件：
+//   - value 不能为 nullptr（由 assert 保证）
+//   - 调用前先 Reset() value，清除上次查询结果
+//
+// 调用链：
+//   DBImpl::Get(无ts) → DBImpl::Get(有ts)
+//     └─ GetImpl(read_options, key, get_impl_options)
+// ============================================================================
 Status DBImpl::Get(const ReadOptions& read_options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableSlice* value, std::string* timestamp) {
   assert(value != nullptr);
+  // 重置输出参数，避免携带上次查询的残留数据
   value->Reset();
+  // 组装内部查询选项结构体，统一 GetImpl 的调用接口
   GetImplOptions get_impl_options;
-  get_impl_options.column_family = column_family;
-  get_impl_options.value = value;
-  get_impl_options.timestamp = timestamp;
+  get_impl_options.column_family = column_family;  // 目标列族
+  get_impl_options.value = value;                  // 输出：value 数据
+  get_impl_options.timestamp = timestamp;          // 输出：key 对应的时间戳（可为 nullptr）
+  // 调用核心实现
   Status s = GetImpl(read_options, key, get_impl_options);
   return s;
 }
@@ -2297,21 +2343,77 @@ bool DBImpl::ShouldReferenceSuperVersion(const MergeContext& merge_context) {
              merge_context.GetOperands().size();
 }
 
+// ============================================================================
+// DBImpl::GetImpl - 单键点查核心实现（所有 Get 路径的最终归宿）
+//
+// 职责：
+//   实现完整的 RocksDB 单键读取语义，按照 LSM-Tree 层次结构依次查询：
+//     1. 参数校验（时间戳兼容性检查）
+//     2. 获取 SuperVersion（原子快照：mem + imm + current SST version）
+//     3. 确定 sequence number（快照隔离）
+//     4. 构造 LookupKey（内部格式：user_key + sequence + type）
+//     5. 查询可变 MemTable（sv->mem）
+//     6. 查询不可变 MemTableList（sv->imm）
+//     7. 查询当前版本的 SST 文件（sv->current）
+//     8. 归还 SuperVersion 引用
+//
+// 参数：
+//   - read_options     : 读取控制参数（snapshot、read_tier、timestamp 等）
+//   - key              : 用户键（Slice，不含 sequence/type 后缀）
+//   - get_impl_options : 聚合输入/输出参数结构体，包含：
+//       * column_family   : 目标列族
+//       * value           : [输出] value 数据（PinnableSlice，支持零拷贝 pin）
+//       * columns         : [输出] wide column 数据（GetEntity 使用）
+//       * timestamp       : [输出] key 对应的时间戳（UDT 场景）
+//       * callback        : 读可见性过滤回调（事务场景使用）
+//       * is_blob_index   : [输出] 标记 value 是否为 blob 索引
+//       * merge_operands  : [输出] merge 操作数列表（GetMergeOperands 使用）
+//       * get_value       : 是否获取 value（false 时仅获取 merge operands）
+//
+// 查询优先级（LSM-Tree 结构决定）：
+//   MemTable（最新写入）> Immutable MemTable > L0 SST > L1 SST > ... > Ln SST
+//   找到第一个匹配的版本即返回（最新版本语义）
+//
+// 快照隔离：
+//   - 若 read_options.snapshot 非空，使用指定快照的 sequence number
+//   - 否则使用 GetLastPublishedSequence()（读取最新已提交数据）
+//   - SuperVersion 必须在确定 snapshot 之前获取（防止 flush 压缩数据丢失）
+//
+// SuperVersion 引用计数：
+//   - GetAndRefSuperVersion：增加引用，防止读取期间版本切换导致数据销毁
+//   - ReturnAndCleanupSuperVersion：减少引用，若引用为 0 则触发清理
+//
+// 统计计数器：
+//   - MEMTABLE_HIT  : 在 MemTable 或 ImmutableMemTable 中命中
+//   - MEMTABLE_MISS : 需要访问 SST 文件
+//   - NUMBER_KEYS_READ : 总读取 key 次数
+//   - BYTES_READ    : 读取的总字节数
+// ============================================================================
 Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
                        GetImplOptions& get_impl_options) {
+  // 必须提供至少一种输出目标（value、merge_operands 或 columns）
   assert(get_impl_options.value != nullptr ||
          get_impl_options.merge_operands != nullptr ||
          get_impl_options.columns != nullptr);
 
+  // 列族句柄不能为空
   assert(get_impl_options.column_family);
 
+  // io_activity 必须为 kUnknown，Get 路径不支持指定 IO 活动类型
   if (read_options.io_activity != Env::IOActivity::kUnknown) {
     return Status::InvalidArgument(
         "Cannot call Get with `ReadOptions::io_activity` != "
         "`Env::IOActivity::kUnknown`");
   }
 
+  // ─── 时间戳校验 ───────────────────────────────────────────────────────────
+  // UDT（User-Defined Timestamp）场景下：
+  //   - 若 read_options.timestamp 非空：检查其长度与列族配置的时间戳大小一致，
+  //     且不小于 full_history_ts_low（不允许读取已被 GC 的历史版本）
+  //   - 若 read_options.timestamp 为空：检查列族未启用时间戳特性
+  //     （启用了 UDT 的列族必须在读取时提供 timestamp）
   if (read_options.timestamp) {
+    // 有 timestamp：校验时间戳尺寸匹配且不早于 GC 下界
     const Status s = FailIfTsMismatchCf(get_impl_options.column_family,
                                         *(read_options.timestamp),
                                         /*ts_for_read=*/true);
@@ -2319,6 +2421,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
       return s;
     }
   } else {
+    // 无 timestamp：确保列族没有启用 UDT（若启用则必须提供 timestamp）
     const Status s = FailIfCfHasTs(get_impl_options.column_family);
     if (!s.ok()) {
       return s;
@@ -2327,20 +2430,30 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 
   // Clear the timestamps for returning results so that we can distinguish
   // between tombstone or key that has never been written
+  // 清空输出时间戳缓冲区，区分"写入了 tombstone"和"从未写入过"两种情况
   if (get_impl_options.timestamp) {
     get_impl_options.timestamp->clear();
   }
 
+  // 用于 UDT 场景的读回调，确保只返回 t <= read_opts.timestamp 的版本
   GetWithTimestampReadCallback read_cb(0);  // Will call Refresh
 
+  // 启动 CPU 时间计时（性能监控）
   PERF_CPU_TIMER_GUARD(get_cpu_nanos, immutable_db_options_.clock);
+  // 启动整体 Get 耗时统计
   StopWatch sw(immutable_db_options_.clock, stats_, DB_GET);
+  // 开始"获取快照"阶段的耗时统计
   PERF_TIMER_GUARD(get_snapshot_time);
 
+  // 将公共接口的 ColumnFamilyHandle* 向下转型为具体实现类型，获取内部 cfd
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
       get_impl_options.column_family);
+  // cfd（ColumnFamilyData）是列族的核心数据结构，包含 MemTable、版本信息等
   auto cfd = cfh->cfd();
 
+  // ─── Trace 记录（可选） ───────────────────────────────────────────────────
+  // 若启用了 tracer，记录此次 Get 操作（用于操作重放、分析等）
+  // 注意：此处用锁保护 tracer_，是已知的性能瓶颈，TODO 待改进
   if (tracer_) {
     // TODO: This mutex should be removed later, to improve performance when
     // tracing is enabled.
@@ -2351,6 +2464,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     }
   }
 
+  // ─── GetMergeOperands 特有初始化 ─────────────────────────────────────────
+  // 若本次调用是 GetMergeOperands（获取所有 merge 操作数），需预先 Reset 每个槽位
   if (get_impl_options.get_merge_operands_options != nullptr) {
     for (int i = 0; i < get_impl_options.get_merge_operands_options
                             ->expected_max_number_of_operands;
@@ -2359,18 +2474,29 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     }
   }
 
-  // Acquire SuperVersion
+  // ─── 获取 SuperVersion（引用计数 +1） ────────────────────────────────────
+  // SuperVersion 是一个原子快照，封装了：
+  //   - sv->mem     : 当前可写 MemTable
+  //   - sv->imm     : 不可变 MemTable 列表（等待 flush 的 MemTable）
+  //   - sv->current : 当前 SST 文件版本（Version 对象，含各 level 的文件列表）
+  // GetAndRefSuperVersion 会增加引用计数，防止读取期间 SuperVersion 被释放
+  // 重要：必须在确定 snapshot 之前获取 SuperVersion，否则可能出现以下问题：
+  //   flush 发生在获取 snapshot 之后、获取 SuperVersion 之前，
+  //   导致 snapshot 可见的数据已被压缩，既不在旧 SuperVersion 也不在新版本中
   SuperVersion* sv = GetAndRefSuperVersion(cfd);
 
   TEST_SYNC_POINT("DBImpl::GetImpl:1");
   TEST_SYNC_POINT("DBImpl::GetImpl:2");
 
+  // ─── 确定 sequence number（快照隔离） ────────────────────────────────────
   SequenceNumber snapshot;
   if (read_options.snapshot != nullptr) {
     if (get_impl_options.callback) {
       // Already calculated based on read_options.snapshot
+      // 事务场景：回调已基于 read_options.snapshot 计算了最大可见序列号
       snapshot = get_impl_options.callback->max_visible_seq();
     } else {
+      // 标准快照读：从 SnapshotImpl 对象中提取 sequence number
       snapshot =
           reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)->number_;
     }
@@ -2380,12 +2506,16 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     // data for the snapshot, so the reader would see neither data that was be
     // visible to the snapshot before compaction nor the newer data inserted
     // afterwards.
+    // 无显式快照：读取最新已发布的 sequence number
+    // 注意：SuperVersion 必须在此之前已获取（见上方注释）
     snapshot = GetLastPublishedSequence();
     if (get_impl_options.callback) {
       // The unprep_seqs are not published for write unprepared, so it could be
       // that max_visible_seq is larger. Seek to the std::max of the two.
       // However, we still want our callback to contain the actual snapshot so
       // that it can do the correct visibility filtering.
+      // WriteUnprepared 事务：未准备的序列号未发布，max_visible_seq 可能更大，
+      // 需刷新回调以确保事务内的未提交写入对自身可见
       get_impl_options.callback->Refresh(snapshot);
 
       // Internally, WriteUnpreparedTxnReadCallback::Refresh would set
@@ -2403,10 +2533,14 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   // If timestamp is used, we use read callback to ensure <key,t,s> is returned
   // only if t <= read_opts.timestamp and s <= snapshot.
   // HACK: temporarily overwrite input struct field but restore
+  // UDT 场景：安装 GetWithTimestampReadCallback，
+  // 确保返回的 <key,timestamp,seqno> 满足 t <= read_opts.timestamp 且 s <= snapshot
+  // SaveAndRestore 保证函数退出时恢复 get_impl_options.callback 原值（RAII）
   SaveAndRestore<ReadCallback*> restore_callback(&get_impl_options.callback);
   const Comparator* ucmp = get_impl_options.column_family->GetComparator();
   assert(ucmp);
   if (ucmp->timestamp_size() > 0) {
+    // 启用了 UDT：timestamp 与 callback 不兼容（不支持同时使用）
     assert(!get_impl_options
                 .callback);  // timestamp with callback is not supported
     read_cb.Refresh(snapshot);
@@ -2415,25 +2549,42 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   TEST_SYNC_POINT("DBImpl::GetImpl:3");
   TEST_SYNC_POINT("DBImpl::GetImpl:4");
 
+  // ─── 准备 merge 上下文 ────────────────────────────────────────────────────
   // Prepare to store a list of merge operations if merge occurs.
+  // 若查询过程中遇到 Merge 操作，累积所有 merge operands 到此上下文
   MergeContext merge_context;
+  // 覆盖当前 key 的最大 range tombstone sequence number（用于墓碑判断）
   SequenceNumber max_covering_tombstone_seq = 0;
 
   Status s;
   // First look in the memtable, then in the immutable memtable (if any).
   // s is both in/out. When in, s could either be OK or MergeInProgress.
   // merge_operands will contain the sequence of merges in the latter case.
+  // ─── 构造 LookupKey ────────────────────────────────────────────────────────
+  // LookupKey 将用户键封装为内部键格式：
+  //   memtable_key  = [varint32(key_size + ts_size + 8)] + [user_key] + [ts] + [seqno(7B) + type(1B)]
+  //   internal_key  = [user_key] + [ts] + [seqno(7B) + type(1B)]
+  //   user_key      = [user_key]（含 ts 若启用 UDT）
+  // snapshot 决定了查询可见的最大 sequence number（快照隔离）
   LookupKey lkey(key, snapshot, read_options.timestamp);
+  // 停止"获取快照"阶段计时，后续进入数据查找阶段
   PERF_TIMER_STOP(get_snapshot_time);
 
+  // ─── 决定是否跳过 MemTable ────────────────────────────────────────────────
+  // kPersistedTier：只读已持久化到 SST 的数据，跳过内存中未 flush 的数据
   bool skip_memtable = (read_options.read_tier == kPersistedTier &&
                         has_unpersisted_data_.load(std::memory_order_relaxed));
   bool done = false;
+  // 仅在列族启用了 UDT 时才传递 timestamp 输出指针
   std::string* timestamp =
       ucmp->timestamp_size() > 0 ? get_impl_options.timestamp : nullptr;
+
+  // ─── 第一步：查询 MemTable 层 ─────────────────────────────────────────────
   if (!skip_memtable) {
     // Get value associated with key
     if (get_impl_options.get_value) {
+      // 模式一：查找 value（普通 Get 调用路径）
+      // 先查当前可变 MemTable（sv->mem），再查不可变 MemTableList（sv->imm）
       if (sv->mem->Get(
               lkey,
               get_impl_options.value ? get_impl_options.value->GetSelf()
@@ -2442,12 +2593,16 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
               &max_covering_tombstone_seq, read_options,
               false /* immutable_memtable */, get_impl_options.callback,
               get_impl_options.is_blob_index)) {
+        // 在可变 MemTable 中找到（包括 Put/Delete/Merge 的最新版本）
         done = true;
 
         if (get_impl_options.value) {
+          // PinSelf：将 value 的内存 ownership 转移给 PinnableSlice，
+          // 避免后续 MemTable 释放时数据失效
           get_impl_options.value->PinSelf();
         }
 
+        // 统计 MemTable 命中次数
         RecordTick(stats_, MEMTABLE_HIT);
       } else if ((s.ok() || s.IsMergeInProgress()) &&
                  sv->imm->Get(lkey,
@@ -2458,6 +2613,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
                               &merge_context, &max_covering_tombstone_seq,
                               read_options, get_impl_options.callback,
                               get_impl_options.is_blob_index)) {
+        // 在不可变 MemTable 列表中找到
         done = true;
 
         if (get_impl_options.value) {
@@ -2469,6 +2625,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     } else {
       // Get Merge Operands associated with key, Merge Operands should not be
       // merged and raw values should be returned to the user.
+      // 模式二：获取所有 merge operands（GetMergeOperands 调用路径）
+      // 不进行 merge 合并，直接返回原始 operands 给用户
       if (sv->mem->Get(lkey, /*value=*/nullptr, /*columns=*/nullptr,
                        /*timestamp=*/nullptr, &s, &merge_context,
                        &max_covering_tombstone_seq, read_options,
@@ -2484,6 +2642,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         RecordTick(stats_, MEMTABLE_HIT);
       }
     }
+    // MemTable 层查找遇到不可恢复错误（非 MergeInProgress），提前返回
     if (!done && !s.ok() && !s.IsMergeInProgress()) {
       ReturnAndCleanupSuperVersion(cfd, sv);
       return s;
@@ -2492,7 +2651,15 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   TEST_SYNC_POINT("DBImpl::GetImpl:PostMemTableGet:0");
   TEST_SYNC_POINT("DBImpl::GetImpl:PostMemTableGet:1");
   PinnedIteratorsManager pinned_iters_mgr;
+
+  // ─── 第二步：查询 SST 文件层（Version::Get） ─────────────────────────────
   if (!done) {
+    // MemTable 层未命中，进入 SST 文件层查找
+    // sv->current 是当前版本（Version），包含所有 level 的 SST 文件元数据
+    // Version::Get 内部会：
+    //   1. 通过 bloom filter 快速过滤不包含目标 key 的 SST 文件
+    //   2. 按照 L0 → L1 → ... → Ln 的顺序查找（L0 文件间可能重叠，需全扫）
+    //   3. 使用二分查找定位具体 SST 文件，再通过 block cache 读取 data block
     PERF_TIMER_GUARD(get_from_output_files_time);
     sv->current->Get(
         read_options, lkey, get_impl_options.value, get_impl_options.columns,
@@ -2503,6 +2670,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         get_impl_options.get_value ? get_impl_options.callback : nullptr,
         get_impl_options.get_value ? get_impl_options.is_blob_index : nullptr,
         get_impl_options.get_value);
+    // 统计 MemTable 未命中（即访问了 SST 文件）
     RecordTick(stats_, MEMTABLE_MISS);
   }
 
@@ -4353,6 +4521,9 @@ DBOptions DBImpl::GetDBOptions() const {
 //         - 如果 need_out_of_mutex = true: 不持锁调用
 //         - 如果 need_out_of_mutex = false: 持锁调用
 //         - 调用 cfd->internal_stats()->GetStringProperty()
+//         - 对 "rocksdb.stats": GetStringProperty 内部会调用 HandleStats，
+//           进而调用 HandleCFStats（DumpCFStats）与 HandleDBStats（DumpDBStats），
+//           将列族统计与 DB 统计拼成多行字符串写入 value
 //
 //      c) DBImpl 字符串属性 (handle_string_dbimpl):
 //         - 判断是否需要持锁: need_out_of_mutex
@@ -4912,13 +5083,62 @@ bool DBImpl::GetAggregatedIntProperty(const Slice& property,
   return ret;
 }
 
+// ============================================================================
+// DBImpl::GetAndRefSuperVersion(ColumnFamilyData*) - 获取并引用 SuperVersion
+//
+// 职责：
+//   通过线程本地缓存（Thread-Local Storage）高效获取列族的当前 SuperVersion，
+//   同时增加引用计数，确保读取期间 SuperVersion 不会被释放或替换。
+//
+// SuperVersion 是什么：
+//   SuperVersion 是 RocksDB 读路径的核心数据结构，封装了某一时刻列族的完整状态：
+//     - mem     : 当前可写 MemTable（最新写入的数据）
+//     - imm     : 不可变 MemTableList（已停写、等待 flush 的 MemTable 列表）
+//     - current : 当前 SST 文件版本（Version，包含各 level 的 SST 文件元数据）
+//   通过持有 SuperVersion 引用，读操作可以在不加锁的情况下安全访问这些组件。
+//
+// 线程本地缓存机制：
+//   GetThreadLocalSuperVersion() 利用 TLS（Thread-Local Storage）缓存上次使用的
+//   SuperVersion 指针，避免每次读取都需要加锁访问全局版本。
+//   若 TLS 缓存命中且版本未过期，直接返回缓存指针（高性能路径）；
+//   否则加锁获取最新版本并更新缓存。
+//
+// 参数：
+//   - cfd : 目标列族的内部数据结构（ColumnFamilyData）
+//
+// 返回值：
+//   - 当前有效的 SuperVersion 指针，引用计数已增加
+//   - 调用者必须通过 ReturnAndCleanupSuperVersion() 归还引用
+//
+// 调用场景（在 rocksdb_get_cf 调用链中）：
+//   GetImpl → GetAndRefSuperVersion(cfd) → sv->mem->Get / sv->imm->Get / sv->current->Get
+// ============================================================================
 SuperVersion* DBImpl::GetAndRefSuperVersion(ColumnFamilyData* cfd) {
   // TODO(ljin): consider using GetReferencedSuperVersion() directly
+  // 通过线程本地缓存获取 SuperVersion，兼顾性能与正确性
   return cfd->GetThreadLocalSuperVersion(this);
 }
 
 // REQUIRED: this function should only be called on the write thread or if the
 // mutex is held.
+// ============================================================================
+// DBImpl::GetAndRefSuperVersion(uint32_t) - 按列族 ID 获取并引用 SuperVersion
+//
+// 职责：
+//   通过列族 ID 查找对应的 ColumnFamilyData，再委托给
+//   GetAndRefSuperVersion(ColumnFamilyData*) 完成实际获取。
+//
+// 使用限制：
+//   - 必须在 write thread 上调用，或在持有 mutex_ 的情况下调用
+//   - 原因：通过 column_family_id 查找 cfd 需要访问 VersionSet，非线程安全
+//
+// 参数：
+//   - column_family_id : 列族的唯一 ID（uint32_t）
+//
+// 返回值：
+//   - 找到列族时：返回 SuperVersion*（引用已增加）
+//   - 列族不存在时：返回 nullptr（列族可能已被删除）
+// ============================================================================
 SuperVersion* DBImpl::GetAndRefSuperVersion(uint32_t column_family_id) {
   auto column_family_set = versions_->GetColumnFamilySet();
   auto cfd = column_family_set->GetColumnFamily(column_family_id);
@@ -4929,28 +5149,77 @@ SuperVersion* DBImpl::GetAndRefSuperVersion(uint32_t column_family_id) {
   return GetAndRefSuperVersion(cfd);
 }
 
+// ============================================================================
+// DBImpl::CleanupSuperVersion - 减少 SuperVersion 引用计数并在必要时销毁
+//
+// 职责：
+//   对 SuperVersion 执行 Unref 操作。若引用计数降为 0，执行清理和释放：
+//     1. 加锁调用 sv->Cleanup()：释放 mem/imm/current 各自的引用
+//     2. 根据 avoid_unnecessary_blocking_io 配置决定是否延迟释放：
+//        - 立即释放：直接 delete sv
+//        - 延迟释放（defer_purge）：加入待清理队列，由后台线程统一处理，
+//          避免在关键路径上触发磁盘 IO（如释放文件句柄）
+//     3. 更新统计计数器：NUMBER_SUPERVERSION_CLEANUPS、NUMBER_SUPERVERSION_RELEASES
+//
+// 参数：
+//   - sv : 待归还引用的 SuperVersion 指针
+//
+// 调用场景（在 rocksdb_get_cf 调用链中）：
+//   ReturnAndCleanupSuperVersion → CleanupSuperVersion（当线程本地缓存已满时）
+// ============================================================================
 void DBImpl::CleanupSuperVersion(SuperVersion* sv) {
   // Release SuperVersion
+  // Unref() 减少引用计数，若降为 0 则返回 true（表示可以销毁）
   if (sv->Unref()) {
+    // 是否启用"避免不必要的阻塞 IO"优化（延迟删除文件句柄等）
     bool defer_purge = immutable_db_options().avoid_unnecessary_blocking_io;
     {
       InstrumentedMutexLock l(&mutex_);
+      // Cleanup：释放 mem/imm/current 的引用，解除与各组件的绑定
       sv->Cleanup();
       if (defer_purge) {
+        // 延迟清理：加入队列，由 SchedulePurge 安排后台任务处理
+        // 避免在读取热路径上触发文件关闭等阻塞操作
         AddSuperVersionsToFreeQueue(sv);
         SchedulePurge();
       }
     }
     if (!defer_purge) {
+      // 立即删除：在当前线程直接 delete，释放内存
       delete sv;
     }
     RecordTick(stats_, NUMBER_SUPERVERSION_CLEANUPS);
   }
+  // 无论是否触发销毁，都记录一次 release 事件（引用计数变化统计）
   RecordTick(stats_, NUMBER_SUPERVERSION_RELEASES);
 }
 
+// ============================================================================
+// DBImpl::ReturnAndCleanupSuperVersion(ColumnFamilyData*, SuperVersion*)
+//   - 归还 SuperVersion 到线程本地缓存或执行清理
+//
+// 职责：
+//   将 SuperVersion 归还给列族的线程本地缓存（TLS）。
+//   若 TLS 缓存已有更新的版本（即当前 sv 已过期），则无法归还缓存，
+//   转而调用 CleanupSuperVersion 减少引用计数并在必要时销毁。
+//
+// 工作原理：
+//   ReturnThreadLocalSuperVersion() 尝试将 sv 放回 TLS 槽位：
+//     - 若 sv 仍是最新版本且 TLS 槽位空闲：归还成功，返回 true（高性能路径，无销毁开销）
+//     - 若 sv 已过期（期间发生了版本切换）：归还失败，返回 false，需要手动 Cleanup
+//
+// 参数：
+//   - cfd : 列族内部数据结构（用于访问 TLS 缓存）
+//   - sv  : 待归还的 SuperVersion 指针
+//
+// 调用场景（在 rocksdb_get_cf 调用链中）：
+//   GetImpl 查询完成后 → ReturnAndCleanupSuperVersion(cfd, sv)
+//     ├─ 归还成功 → TLS 缓存更新，sv 留存备下次使用（无额外开销）
+//     └─ 归还失败 → CleanupSuperVersion(sv) → Unref → 可能触发销毁
+// ============================================================================
 void DBImpl::ReturnAndCleanupSuperVersion(ColumnFamilyData* cfd,
                                           SuperVersion* sv) {
+  // 尝试归还到线程本地缓存；失败则执行引用计数递减和清理
   if (!cfd->ReturnThreadLocalSuperVersion(sv)) {
     CleanupSuperVersion(sv);
   }

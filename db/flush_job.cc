@@ -167,22 +167,16 @@ void FlushJob::RecordFlushIOStats() {
       ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
   IOSTATS_RESET(bytes_written);
 }
+
+// 从 imm 中选出要 flush 的 memtables（id <= max_memtable_id_），填入 mems_，并初始化 edit_、meta_、base_。
 void FlushJob::PickMemTable() {
   db_mutex_->AssertHeld();
   assert(!pick_memtable_called);
   pick_memtable_called = true;
 
-  // Maximum "NextLogNumber" of the memtables to flush.
-  // When mempurge feature is turned off, this variable is useless
-  // because the memtables are implicitly sorted by increasing order of creation
-  // time. Therefore mems_->back()->GetNextLogNumber() is already equal to
-  // max_next_log_number. However when Mempurge is on, the memtables are no
-  // longer sorted by increasing order of creation time. Therefore this variable
-  // becomes necessary because mems_->back()->GetNextLogNumber() is no longer
-  // necessarily equal to max_next_log_number.
+  // 待刷 memtables 的最大 NextLogNumber；Mempurge 开启时 mems 不一定按创建时间排序，需要单独维护
   uint64_t max_next_log_number = 0;
 
-  // Save the contents of the earliest memtable as a new Table
   cfd_->imm()->PickMemtablesToFlush(max_memtable_id_, &mems_,
                                     &max_next_log_number);
   if (mems_.empty()) {
@@ -191,34 +185,26 @@ void FlushJob::PickMemTable() {
 
   ReportFlushInputSize(mems_);
 
-  // entries mems are (implicitly) sorted in ascending order by their created
-  // time. We will use the first memtable's `edit` to keep the meta info for
-  // this flush.
+  // 用第一个 memtable 的 edit 保存本次 flush 的元信息，并设置 log number、列族 id
   MemTable* m = mems_[0];
   edit_ = m->GetEdits();
   edit_->SetPrevLogNumber(0);
-  // SetLogNumber(log_num) indicates logs with number smaller than log_num
-  // will no longer be picked up for recovery.
   edit_->SetLogNumber(max_next_log_number);
   edit_->SetColumnFamily(cfd_->GetID());
 
-  // path 0 for level 0 file.
   meta_.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
   meta_.epoch_number = cfd_->NewEpochNumber();
 
   base_ = cfd_->current();
-  base_->Ref();  // it is likely that we do not need this reference
+  base_->Ref();
 }
 
+// 将已选中的 mems_ 写成 L0 SST 并安装到版本；满足条件时可能先走 MemPurge 再决定是否写表。
 Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
                      bool* switched_to_mempurge) {
   TEST_SYNC_POINT("FlushJob::Start");
   db_mutex_->AssertHeld();
   assert(pick_memtable_called);
-  // Mempurge threshold can be dynamically changed.
-  // For sake of consistency, mempurge_threshold is
-  // saved locally to maintain consistency in each
-  // FlushJob::Run call.
   double mempurge_threshold =
       mutable_cf_options_.experimental_mempurge_threshold;
 
@@ -229,7 +215,7 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     return Status::OK();
   }
 
-  // I/O measurement variables
+  // 若开启 IO 统计则先记录当前各项纳秒数，便于后面算本次 flush 的 IO 耗时
   PerfLevel prev_perf_level = PerfLevel::kEnableTime;
   uint64_t prev_write_nanos = 0;
   uint64_t prev_fsync_nanos = 0;
@@ -248,14 +234,13 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     prev_cpu_read_nanos = IOSTATS(cpu_read_nanos);
   }
   Status mempurge_s = Status::NotFound("No MemPurge.");
+  // 在写满触发、非原子 flush、且 MemPurgeDecider 通过时，尝试用 MemPurge 在内存中合并淘汰，避免写 SST
   if ((mempurge_threshold > 0.0) &&
       (flush_reason_ == FlushReason::kWriteBufferFull) && (!mems_.empty()) &&
       MemPurgeDecider(mempurge_threshold) && !(db_options_.atomic_flush)) {
     cfd_->SetMempurgeUsed();
     mempurge_s = MemPurge();
     if (!mempurge_s.ok()) {
-      // Mempurge is typically aborted when the output
-      // bytes cannot be contained onto a single output memtable.
       if (mempurge_s.IsAborted()) {
         ROCKS_LOG_INFO(db_options_.info_log, "Mempurge process aborted: %s\n",
                        mempurge_s.ToString().c_str());
@@ -282,7 +267,7 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     base_->Unref();
     s = Status::OK();
   } else {
-    // This will release and re-acquire the mutex.
+    // 将 mems_ 写成 L0 SST，内部会释放并重新获取 db_mutex
     s = WriteLevel0Table();
   }
 
@@ -295,10 +280,11 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
   }
 
   if (!s.ok()) {
+    // 失败时回滚本次 flush 对 imm 的标记，避免 memtables 被错误释放
     cfd_->imm()->RollbackMemtableFlush(mems_, meta_.fd.GetNumber());
   } else if (write_manifest_) {
     TEST_SYNC_POINT("FlushJob::InstallResults");
-    // Replace immutable memtable with the generated Table
+    // 用生成的 SST 替换 imm 中的对应 memtables，更新版本并写 MANIFEST；mempurge 成功时不再写 edit
     s = cfd_->imm()->TryInstallMemtableFlushResults(
         cfd_, mutable_cf_options_, mems_, prep_tracker, versions_, db_mutex_,
         meta_.fd.GetNumber(), &job_context_->memtables_to_free, db_directory_,
@@ -313,7 +299,7 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
   }
   RecordFlushIOStats();
 
-  // When measure_io_stats_ is true, the default 512 bytes is not enough.
+  // 将本次 flush 完成事件写入日志缓冲（压缩类型、各层文件数、blob 范围等）
   auto stream = event_logger_->LogToBuffer(log_buffer_, 1024);
   stream << "job" << job_context_->job_id << "event"
          << "flush_finished";

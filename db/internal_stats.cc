@@ -222,8 +222,9 @@ void PrintLevelStats(char* buf, size_t len, const std::string& name,
   PrintLevelStats(buf, len, name, level_stats);
 }
 
-// Assumes that trailing numbers represent an optional argument. This requires
-// property names to not end with numbers.
+// 将属性名与可选数字后缀分离，用于带参数的属性（如 num-files-at-level5）。
+// 约定: 属性名本身不能以数字结尾，末尾连续数字视为参数。
+// 调用者: GetPropertyInfo()、GetStringProperty() 等，用于解析 "rocksdb.xxx" 与 "rocksdb.xxx123"。
 std::pair<Slice, Slice> GetPropertyNameAndArg(const Slice& property) {
   Slice name = property, arg = property;
   size_t sfx_len = 0;
@@ -1215,6 +1216,12 @@ bool InternalStats::HandleBlobCachePinnedUsage(uint64_t* value, DBImpl* /*db*/,
 //   - InternalStats::GetIntProperty(): 处理整数属性
 //   - InternalStats::GetMapProperty(): 处理 Map 类型属性
 // ============================================================================
+// GetPropertyInfo
+// 功能: 根据属性名（如 "rocksdb.stats"）查找对应的 DBPropertyInfo，供 GetProperty
+//       选择处理函数（handle_string / handle_int / handle_map）。
+// 调用者: DBImpl::GetProperty()、GetIntProperty()、GetMapProperty()。
+// 对 "rocksdb.stats": 返回的 info->handle_string 为 InternalStats::HandleStats。
+// ============================================================================
 const DBPropertyInfo* GetPropertyInfo(const Slice& property) {
   // === 解析属性名称 ===
   // 调用 GetPropertyNameAndArg() 从完整属性名中分离属性名和参数
@@ -1265,6 +1272,12 @@ const DBPropertyInfo* GetPropertyInfo(const Slice& property) {
   return &ppt_info_iter->second;
 }
 
+// ============================================================================
+// InternalStats::GetStringProperty
+// 功能: 根据 property_info 中的 handle_string 调用对应处理函数，将属性值写入 value。
+// 调用者: DBImpl::GetProperty()（在持 mutex 或按 need_out_of_mutex 不持锁时）。
+// 对 "rocksdb.stats": 此处调用 HandleStats(value, arg)，arg 为空。
+// ============================================================================
 bool InternalStats::GetStringProperty(const DBPropertyInfo& property_info,
                                       const Slice& property,
                                       std::string* value) {
@@ -1345,6 +1358,13 @@ bool InternalStats::HandleLevelStats(std::string* value, Slice /*suffix*/) {
   return true;
 }
 
+// ============================================================================
+// InternalStats::HandleStats
+// 功能: 处理 "rocksdb.stats" 属性，将「列族统计 + DB 统计」依次追加到 value。
+// 调用者: GetStringProperty() 通过 property_info.handle_string 调用。
+// 实现: 先调用 HandleCFStats（即 DumpCFStats），再调用 HandleDBStats（即 DumpDBStats），
+//       二者输出拼成 rocksdb.stats 的完整多行字符串。
+// ============================================================================
 bool InternalStats::HandleStats(std::string* value, Slice suffix) {
   if (!HandleCFStats(value, suffix)) {
     return false;
@@ -1361,6 +1381,13 @@ bool InternalStats::HandleCFMapStats(
   return true;
 }
 
+// ============================================================================
+// InternalStats::HandleCFStats
+// 功能: 处理 "rocksdb.cfstats" 或作为 "rocksdb.stats" 的第一部分，输出当前列族的
+//       统计信息（按层/按优先级的 compaction、Blob、Flush/AddFile、写停顿、文件读延迟等）。
+// 调用者: HandleStats()（当 property 为 "rocksdb.stats" 时）。
+// 实现: 直接调用 DumpCFStats(value)。
+// ============================================================================
 bool InternalStats::HandleCFStats(std::string* value, Slice /*suffix*/) {
   DumpCFStats(value);
   return true;
@@ -1428,6 +1455,13 @@ bool InternalStats::HandleDBMapStats(
   return true;
 }
 
+// ============================================================================
+// InternalStats::HandleDBStats
+// 功能: 处理 "rocksdb.dbstats" 或作为 "rocksdb.stats" 的第二部分，输出 DB 级统计
+//       （运行时间、写/WAL/写停顿的累计与区间统计）。
+// 调用者: HandleStats()（当 property 为 "rocksdb.stats" 时，在 HandleCFStats 之后调用）。
+// 实现: 直接调用 DumpDBStats(value)。
+// ============================================================================
 bool InternalStats::HandleDBStats(std::string* value, Slice /*suffix*/) {
   DumpDBStats(value);
   return true;
@@ -1840,6 +1874,13 @@ void InternalStats::DumpDBMapStats(
   (*db_stats)["db.uptime"] = std::to_string(seconds_up);
 }
 
+// ============================================================================
+// InternalStats::DumpDBStats
+// 功能: 将 DB 级统计信息追加到 value（"rocksdb.stats" 的第二部分 / "rocksdb.dbstats"）。
+// 调用者: HandleDBStats()。
+// 输出内容: ** DB Stats **、Uptime(secs)、Cumulative/Interval writes、WAL、stall 及
+//          Write Stall (count)；会更新 db_stats_snapshot_ 供下次 Interval 计算。
+// ============================================================================
 void InternalStats::DumpDBStats(std::string* value) {
   char buf[1000];
   // DB-level stats, only available from default column family
@@ -2216,11 +2257,25 @@ void InternalStats::DumpCFStatsWriteStall(std::string* value,
   *value = str.str();
 }
 
+// ============================================================================
+// InternalStats::DumpCFStats
+// 功能: 输出当前列族的完整 CF 统计（"rocksdb.stats" 的第一部分 / "rocksdb.cfstats"）。
+// 调用者: HandleCFStats()。
+// 实现: 先调用 DumpCFStatsNoFileHistogram（按层/按优先级 compaction、Blob、Flush/AddFile、
+//       写停顿、block cache 等），再调用 DumpCFFileHistogram（各层及 Blob 的文件读延迟直方图）。
+// ============================================================================
 void InternalStats::DumpCFStats(std::string* value) {
   DumpCFStatsNoFileHistogram(/*is_periodic=*/false, value);
   DumpCFFileHistogram(value);
 }
 
+// ============================================================================
+// InternalStats::DumpCFStatsNoFileHistogram
+// 功能: 输出列族统计中「不含文件读延迟直方图」的部分（Level/Priority compaction 表、
+//       Blob、Uptime、Flush/AddFile、Cumulative/Interval compaction、Write Stall、
+//       若存在则追加 block cache 统计）。is_periodic 为 true 时会更新 cf_stats_snapshot_。
+// 调用者: DumpCFStats()、HandleCFStatsPeriodic()。
+// ============================================================================
 void InternalStats::DumpCFStatsNoFileHistogram(bool is_periodic,
                                                std::string* value) {
   char buf[2000];
@@ -2405,6 +2460,11 @@ void InternalStats::DumpCFStatsNoFileHistogram(bool is_periodic,
   }
 }
 
+// ============================================================================
+// InternalStats::DumpCFFileHistogram
+// 功能: 将各 Level 及 Blob 的文件读延迟直方图（微秒）追加到 value，作为 CF 统计的末尾部分。
+// 调用者: DumpCFStats()。
+// ============================================================================
 void InternalStats::DumpCFFileHistogram(std::string* value) {
   assert(value);
   assert(cfd_);

@@ -2264,19 +2264,29 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
   }
 }
 
+// 用于 EnterUnbatched 中等待时的自适应休眠统计上下文
 static WriteThread::AdaptationContext eu_ctx("EnterUnbatched");
+
+// 以「非批处理」方式加入写队列：当前线程独占成为 leader，不与其它写请求合并。
+// 用于需要单独跑完再让出队列的操作（如 FlushMemTable、SwitchMemtable 前的逻辑）。
+// 调用前需保证 w->batch == nullptr，这样前面的 leader 不会把本 writer 选为 follower。
 void WriteThread::EnterUnbatched(Writer* w, InstrumentedMutex* mu) {
+  // 必须传入有效 writer，且 batch 为空，表示非普通写请求、不参与批处理
   assert(w != nullptr && w->batch == nullptr);
+  // 先释放外部传入的互斥锁，避免在 LinkOne / 等待时长时间持锁阻塞其它线程
   mu->Unlock();
+  // 将本 writer 链接到 newest_writer_ 队列末尾；返回 true 表示当前没有更新的 writer，本 writer 已是队头（即成为 leader）
   bool linked_as_leader = LinkOne(w, &newest_writer_);
-  if (!linked_as_leader) {
+  if (!linked_as_leader) { //返回 true 表示当前没有更新的 writer，本 writer 已是队头（即已成为 leader）。
     TEST_SYNC_POINT("WriteThread::EnterUnbatched:Wait");
-    // Last leader will not pick us as a follower since our batch is nullptr
+    // 队列中已有更新的 writer，本 writer 暂时不是 leader；因 batch 为 nullptr，前面的 leader 不会选我们为 follower，只能等前面的人全部完成后我们才会被置为 STATE_GROUP_LEADER
     AwaitState(w, STATE_GROUP_LEADER, &eu_ctx);
   }
+  // 若开启流水线写，还需等待所有已提交的 memtable 写完成，保证与 MemTable 写的顺序一致
   if (enable_pipelined_write_) {
     WaitForMemTableWriters();
   }
+  // 重新获取外部互斥锁，与调用方持锁约定一致
   mu->Lock();
 }
 

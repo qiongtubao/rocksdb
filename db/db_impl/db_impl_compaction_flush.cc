@@ -225,10 +225,10 @@ IOStatus DBImpl::SyncClosedLogs(JobContext* job_context,
 }
 
 /**
- * @brief 将不可变 memtables 刷写到 SST 文件
+ * @brief 将不可变 memtables 刷写成 SST 文件
  *
- * 该函数是 RocksDB flush 流程的核心入口点，负责将列族的不可变 memtables
- * 转换为持久化的 SST 文件。这是保证数据持久化和内存回收的关键步骤。
+ * 该函数是 flush 流程的核心：创建 FlushJob，挑选 memtable，同步 WAL（多 CF 时），
+ * 然后 PickMemTable、NotifyOnFlushBegin、flush_job.Run() 写 L0，最后安装 SuperVersion 并通知监听器。
  *
  * @param cfd 目标列族数据指针，指定要执行 flush 的列族
  * @param mutable_cf_options 可变列族选项，包含 flush 相关配置（如压缩算法、文件大小等）
@@ -515,26 +515,33 @@ Status DBImpl::FlushMemTableToOutputFile(
   return s;
 }
 
+// 将一批后台 flush 参数对应的列族 memtable 刷成 SST 文件。
+// 若开启原子 flush，则多列族一起刷并统一提交 MANIFEST；否则仅支持单列族，直接调 FlushMemTableToOutputFile。
 Status DBImpl::FlushMemTablesToOutputFiles(
     const autovector<BGFlushArg>& bg_flush_args, bool* made_progress,
     JobContext* job_context, LogBuffer* log_buffer, Env::Priority thread_pri) {
+  // 原子 flush 模式：多列族必须全部刷完再一次性提交 MANIFEST，保证多 CF 间一致性
   if (immutable_db_options_.atomic_flush) {
     return AtomicFlushMemTablesToOutputFiles(
         bg_flush_args, made_progress, job_context, log_buffer, thread_pri);
   }
+  // 非原子模式下，BackgroundFlush 保证每次只传一个列族，这里断言以捕获错误
   assert(bg_flush_args.size() == 1);
+  // 获取当前所有快照的 sequence 列表及写冲突相关快照，供 FlushMemTableToOutputFile 中可见性判断用
   std::vector<SequenceNumber> snapshot_seqs;
   SequenceNumber earliest_write_conflict_snapshot;
   SnapshotChecker* snapshot_checker;
   GetSnapshotContext(job_context, &snapshot_seqs,
                      &earliest_write_conflict_snapshot, &snapshot_checker);
+  // 取出唯一的列族及其参数
   const auto& bg_flush_arg = bg_flush_args[0];
   ColumnFamilyData* cfd = bg_flush_arg.cfd_;
-  // intentional infrequent copy for each flush
+  // 拷贝一份当前可变列族选项，避免 flush 过程中选项被其它线程修改
   MutableCFOptions mutable_cf_options_copy = *cfd->GetLatestMutableCFOptions();
   SuperVersionContext* superversion_context =
       bg_flush_arg.superversion_context_;
   FlushReason flush_reason = bg_flush_arg.flush_reason_;
+  // 对该列族执行单次 flush：写 L0 SST、安装 SuperVersion 等
   Status s = FlushMemTableToOutputFile(
       cfd, mutable_cf_options_copy, made_progress, job_context, flush_reason,
       superversion_context, snapshot_seqs, earliest_write_conflict_snapshot,
@@ -2155,19 +2162,24 @@ Status DBImpl::FlushAllColumnFamilies(const FlushOptions& flush_options,
   return status;
 }
 
+// 对单个列族执行手动 flush。
 Status DBImpl::Flush(const FlushOptions& flush_options,
                      ColumnFamilyHandle* column_family) {
+  // 将句柄转成内部实现类型，以便取列族数据
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  // 记录开始日志
   ROCKS_LOG_INFO(immutable_db_options_.info_log, "[%s] Manual flush start.",
                  cfh->GetName().c_str());
   Status s;
+  // 若开启原子 flush，则对该 CF 做原子 flush（多 CF 一起刷）
   if (immutable_db_options_.atomic_flush) {
     s = AtomicFlushMemTables(flush_options, FlushReason::kManualFlush,
                              {cfh->cfd()});
   } else {
+    // 否则只对该列族做普通 flush
     s = FlushMemTable(cfh->cfd(), flush_options, FlushReason::kManualFlush);
   }
-
+  // 记录结束日志并返回状态
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
                  "[%s] Manual flush finished, status: %s\n",
                  cfh->GetName().c_str(), s.ToString().c_str());
@@ -2515,12 +2527,13 @@ void DBImpl::GenerateFlushRequest(const autovector<ColumnFamilyData*>& cfds,
   }
 }
 
+// 将指定列族的 memtable 刷到 L0 SST（单列族、非原子 flush 时使用）。
 Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
                              const FlushOptions& flush_options,
                              FlushReason flush_reason,
                              bool entered_write_thread) {
-  // This method should not be called if atomic_flush is true.
   assert(!immutable_db_options_.atomic_flush);
+  // 若不等待且当前写入已停止，则无法执行手动 flush，直接返回 TryAgain
   if (!flush_options.wait && write_controller_.IsStopped()) {
     std::ostringstream oss;
     oss << "Writes have been stopped, thus unable to perform manual flush. "
@@ -2528,6 +2541,7 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
     return Status::TryAgain(oss.str());
   }
   Status s;
+  // 若不允许写停顿，则先等待直到本次 flush 不会引发写停顿
   if (!flush_options.allow_write_stall) {
     bool flush_needed = true;
     s = WaitUntilFlushWouldNotStallWrites(cfd, &flush_needed);
@@ -2537,7 +2551,8 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
     }
   }
 
-  const bool needs_to_join_write_thread = !entered_write_thread;
+  // 若当前不在写线程里，则需要先加入写线程，以便后续能安全切 memtable
+  const bool needs_to_join_write_thread = !entered_write_thread; //true
   autovector<FlushRequest> flush_reqs;
   autovector<uint64_t> memtable_ids_to_wait;
   {
@@ -2547,32 +2562,30 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
     WriteThread::Writer w;
     WriteThread::Writer nonmem_w;
     if (needs_to_join_write_thread) {
+      // 以非批处理方式加入写线程，避免与其它写请求交错（自己是STATE_GROUP_LEADER）
       write_thread_.EnterUnbatched(&w, &mutex_);
       if (two_write_queues_) {
         nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
       }
     }
+    // 等待所有尚未完成的写请求结束，再切 memtable
     WaitForPendingWrites();
 
+    // 若非错误恢复重试且（当前 mem 非空或仍有可恢复状态），则切换 memtable
     if (flush_reason != FlushReason::kErrorRecoveryRetryFlush &&
         (!cfd->mem()->IsEmpty() || !cached_recoverable_state_empty_.load())) {
-      // Note that, when flush reason is kErrorRecoveryRetryFlush, during the
-      // auto retry resume, we want to avoid creating new small memtables.
-      // Therefore, SwitchMemtable will not be called. Also, since ResumeImpl
-      // will iterate through all the CFs and call FlushMemtable during auto
-      // retry resume, it is possible that in some CFs,
-      // cfd->imm()->NumNotFlushed() = 0. In this case, so no flush request will
-      // be created and scheduled, status::OK() will be returned.
       s = SwitchMemtable(cfd, &context);
     }
     const uint64_t flush_memtable_id = std::numeric_limits<uint64_t>::max();
     if (s.ok()) {
+      // 若有待刷的 imm 或 mem 非空或可恢复状态非空，则构造本 CF 的 flush 请求
       if (cfd->imm()->NumNotFlushed() != 0 || !cfd->mem()->IsEmpty() ||
           !cached_recoverable_state_empty_.load()) {
         FlushRequest req{flush_reason, {{cfd, flush_memtable_id}}};
         flush_reqs.emplace_back(std::move(req));
         memtable_ids_to_wait.emplace_back(cfd->imm()->GetLatestMemTableID());
       }
+      // 若开启持久化统计且非错误恢复重试，检查是否需要顺带 flush 统计列族
       if (immutable_db_options_.persist_stats_to_disk &&
           flush_reason != FlushReason::kErrorRecoveryRetryFlush) {
         ColumnFamilyData* cfd_stats =
@@ -2580,8 +2593,7 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
                 kPersistentStatsColumnFamilyName);
         if (cfd_stats != nullptr && cfd_stats != cfd &&
             !cfd_stats->mem()->IsEmpty()) {
-          // only force flush stats CF when it will be the only CF lagging
-          // behind after the current flush
+          // 仅当统计 CF 会是当前 flush 后唯一落后的 CF 时才强制刷统计 CF
           bool stats_cf_flush_needed = true;
           for (auto* loop_cfd : *versions_->GetColumnFamilySet()) {
             if (loop_cfd == cfd_stats || loop_cfd == cfd) {
@@ -2607,16 +2619,14 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
     }
 
     if (s.ok() && !flush_reqs.empty()) {
+      // 对每个请求对应的 CF 标记 imm 为“已请求 flush”
       for (const auto& req : flush_reqs) {
         assert(req.cfd_to_max_mem_id_to_persist.size() == 1);
         ColumnFamilyData* loop_cfd =
             req.cfd_to_max_mem_id_to_persist.begin()->first;
         loop_cfd->imm()->FlushRequested();
       }
-      // If the caller wants to wait for this flush to complete, it indicates
-      // that the caller expects the ColumnFamilyData not to be free'ed by
-      // other threads which may drop the column family concurrently.
-      // Therefore, we increase the cfd's ref count.
+      // 若调用方需要等待 flush 完成，先给相关 cfd 增加引用，防止等待期间被 drop
       if (flush_options.wait) {
         for (const auto& req : flush_reqs) {
           assert(req.cfd_to_max_mem_id_to_persist.size() == 1);
@@ -2625,9 +2635,11 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
           loop_cfd->Ref();
         }
       }
+      // 将 flush 请求入队
       for (const auto& req : flush_reqs) {
         SchedulePendingFlush(req);
       }
+      // 尝试调度后台 flush/compaction 线程
       MaybeScheduleFlushOrCompaction();
     }
 
@@ -2640,6 +2652,7 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
   }
   TEST_SYNC_POINT("DBImpl::FlushMemTable:AfterScheduleFlush");
   TEST_SYNC_POINT("DBImpl::FlushMemTable:BeforeWaitForBgFlush");
+  // 若要求等待且前面成功，则阻塞直到这些 CF 的 flush 完成
   if (s.ok() && flush_options.wait) {
     autovector<ColumnFamilyData*> cfds;
     autovector<const uint64_t*> flush_memtable_ids;
@@ -2654,6 +2667,7 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
         (flush_reason == FlushReason::kErrorRecovery ||
          flush_reason == FlushReason::kErrorRecoveryRetryFlush));
     InstrumentedMutexLock lock_guard(&mutex_);
+    // 等待结束后释放之前为 wait 增加的 cfd 引用
     for (auto* tmp_cfd : cfds) {
       tmp_cfd->UnrefAndTryDelete();
     }
@@ -2803,25 +2817,18 @@ Status DBImpl::AtomicFlushMemTables(
   return s;
 }
 
-// Calling FlushMemTable(), whether from DB::Flush() or from Backup Engine, can
-// cause write stall, for example if one memtable is being flushed already.
-// This method tries to avoid write stall (similar to CompactRange() behavior)
-// it emulates how the SuperVersion / LSM would change if flush happens, checks
-// it against various constrains and delays flush if it'd cause write stall.
-// Caller should check status and flush_needed to see if flush already happened.
+// 在手动 flush 前等待，直到再执行一次 flush 不会引发写停顿。
 Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
                                                  bool* flush_needed) {
   {
     *flush_needed = true;
     InstrumentedMutexLock l(&mutex_);
+    // 记录当前 active memtable 的 id，用于后面判断是否已被刷掉
     uint64_t orig_active_memtable_id = cfd->mem()->GetID();
     WriteStallCondition write_stall_condition = WriteStallCondition::kNormal;
     do {
       if (write_stall_condition != WriteStallCondition::kNormal) {
-        // Same error handling as user writes: Don't wait if there's a
-        // background error, even if it's a soft error. We might wait here
-        // indefinitely as the pending flushes/compactions may never finish
-        // successfully, resulting in the stall condition lasting indefinitely
+        // 若有后台错误则不再等待，直接返回错误，避免死等
         if (error_handler_.IsBGWorkStopped()) {
           return error_handler_.GetBGError();
         }
@@ -2831,6 +2838,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
                        "[%s] WaitUntilFlushWouldNotStallWrites"
                        " waiting on stall conditions to clear",
                        cfd->GetName().c_str());
+        // 在条件变量上等待，直到其它线程完成 flush/compaction 缓解停顿条件
         bg_cv_.Wait();
       }
       if (cfd->IsDropped()) {
@@ -2840,11 +2848,10 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
         return Status::ShutdownInProgress();
       }
 
+      // 若等待期间原 active memtable 已被刷掉，则无需再 flush，直接返回
       uint64_t earliest_memtable_id =
           std::min(cfd->mem()->GetID(), cfd->imm()->GetEarliestMemTableID());
       if (earliest_memtable_id > orig_active_memtable_id) {
-        // We waited so long that the memtable we were originally waiting on was
-        // flushed.
         *flush_needed = false;
         return Status::OK();
       }
@@ -2852,10 +2859,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
       const auto& mutable_cf_options = *cfd->GetLatestMutableCFOptions();
       const auto* vstorage = cfd->current()->storage_info();
 
-      // Skip stalling check if we're below auto-flush and auto-compaction
-      // triggers. If it stalled in these conditions, that'd mean the stall
-      // triggers are so low that stalling is needed for any background work. In
-      // that case we shouldn't wait since background work won't be scheduled.
+      // 若尚未达到自动 flush/compaction 的触发条件，则不再做停顿检查，直接放行
       if (cfd->imm()->NumNotFlushed() <
               cfd->ioptions()->min_write_buffer_number_to_merge &&
           vstorage->l0_delay_trigger_count() <
@@ -2863,9 +2867,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
         break;
       }
 
-      // check whether one extra immutable memtable or an extra L0 file would
-      // cause write stalling mode to be entered. It could still enter stall
-      // mode due to pending compaction bytes, but that's less common
+      // 模拟多一个 imm 或多一个 L0 文件，看是否会进入写停顿；若会则继续循环等待
       write_stall_condition = ColumnFamilyData::GetWriteStallConditionAndCause(
                                   cfd->imm()->NumNotFlushed() + 1,
                                   vstorage->l0_delay_trigger_count() + 1,
@@ -2879,47 +2881,33 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
 
 // Wait for memtables to be flushed for multiple column families.
 // let N = cfds.size()
-// for i in [0, N),
-//  1) if flush_memtable_ids[i] is not null, then the memtables with lower IDs
-//     have to be flushed for THIS column family;
-//  2) if flush_memtable_ids[i] is null, then all memtables in THIS column
-//     family have to be flushed.
-// Finish waiting when ALL column families finish flushing memtables.
-// resuming_from_bg_err indicates whether the caller is trying to resume from
-// background error or in normal processing.
+// 阻塞直到所列列族的待 flush memtable 全部被后台刷完（或 CF 被 drop/出错）。
+// flush_memtable_ids[i] 非空表示要等到该 CF 中 id<=*flush_memtable_ids[i] 的 memtable 都刷完；为空表示等该 CF 所有 memtable 刷完。
 Status DBImpl::WaitForFlushMemTables(
     const autovector<ColumnFamilyData*>& cfds,
     const autovector<const uint64_t*>& flush_memtable_ids,
     bool resuming_from_bg_err) {
   int num = static_cast<int>(cfds.size());
-  // Wait until the compaction completes
   InstrumentedMutexLock l(&mutex_);
   Status s;
-  // If the caller is trying to resume from bg error, then
-  // error_handler_.IsDBStopped() is true.
   while (resuming_from_bg_err || !error_handler_.IsDBStopped()) {
     if (shutting_down_.load(std::memory_order_acquire)) {
       s = Status::ShutdownInProgress();
       return s;
     }
-    // If an error has occurred during resumption, then no need to wait.
-    // But flush operation may fail because of this error, so need to
-    // return the status.
+    // 若恢复过程中已发生错误，不再等待，直接返回该错误
     if (!error_handler_.GetRecoveryError().ok()) {
       s = error_handler_.GetRecoveryError();
       break;
     }
-    // If BGWorkStopped, which indicate that there is a BG error and
-    // 1) soft error but requires no BG work, 2) no in auto_recovery_
+    // 若非恢复流程且后台已停止（软错误等），直接返回后台错误
     if (!resuming_from_bg_err && error_handler_.IsBGWorkStopped() &&
         error_handler_.GetBGError().severity() < Status::Severity::kHardError) {
       s = error_handler_.GetBGError();
       return s;
     }
 
-    // Number of column families that have been dropped.
     int num_dropped = 0;
-    // Number of column families that have finished flush.
     int num_finished = 0;
     for (int i = 0; i < num; ++i) {
       if (cfds[i]->IsDropped()) {
@@ -2931,19 +2919,17 @@ Status DBImpl::WaitForFlushMemTables(
         ++num_finished;
       }
     }
+    // 若仅有一个 CF 且已被 drop，返回 ColumnFamilyDropped
     if (1 == num_dropped && 1 == num) {
       s = Status::ColumnFamilyDropped();
       return s;
     }
-    // Column families involved in this flush request have either been dropped
-    // or finished flush. Then it's time to finish waiting.
+    // 所有涉及的 CF 要么已 drop 要么已刷完，则结束等待
     if (num_dropped + num_finished == num) {
       break;
     }
     bg_cv_.Wait();
   }
-  // If not resuming from bg error, and an error has caused the DB to stop,
-  // then report the bg error to caller.
   if (!resuming_from_bg_err && error_handler_.IsDBStopped()) {
     s = error_handler_.GetBGError();
   }
@@ -2999,72 +2985,42 @@ void DBImpl::EnableManualCompaction() {
   manual_compaction_paused_.fetch_sub(1, std::memory_order_release);
 }
 
+// 在持锁下检查是否有未调度的 flush/compaction，若有且未超限则向线程池提交后台任务。
 void DBImpl::MaybeScheduleFlushOrCompaction() {
-  // 断言：调用此函数时必须持有互斥锁
   mutex_.AssertHeld();
 
-  // 检查：如果数据库未成功打开，则不调度后台任务
-  // 因为压缩操作可能会与数据库打开操作产生数据竞争
   if (!opened_successfully_) {
-    // 压缩操作可能会与数据库打开产生数据竞争
     return;
   }
 
-  // 检查：如果后台工作已暂停，直接返回
   if (bg_work_paused_ > 0) {
-    // 后台工作已被暂停
     return;
   } else if (error_handler_.IsBGWorkStopped() &&
              !error_handler_.IsRecoveryInProgress()) {
-    // 检查：发生了严重错误且当前调用不是恢复序列的一部分
-    // 在此退出以避免陷入调度后台工作的无限循环
-    // 因为后台工作失败后会再次调用此函数
-    // 发生了严重错误且此调用不是恢复序列的一部分
-    // 在此处退出，避免陷入调度后台工作然后再次调用此函数的无限循环
     return;
   } else if (shutting_down_.load(std::memory_order_acquire)) {
-    // 检查：数据库正在关闭中，不再调度后台压缩任务
-    // 数据库正在被删除；不再进行后台压缩
     return;
   }
 
-  // 获取后台任务的限制（最大并发 flush 和 compaction 数量）
   auto bg_job_limits = GetBGJobLimits();
-
-  // 检查高优先级（flush）线程池是否为空（未配置）
   bool is_flush_pool_empty =
       env_->GetBackgroundThreads(Env::Priority::HIGH) == 0;
 
-  // 循环：调度高优先级（HIGH）的 flush 任务
-  // 条件：flush 线程池非空 && 有未调度的 flush && 已调度的 flush 未达到上限
+  // 在有 flush 线程池、有未调度 flush 且未超限时，循环提交 flush 任务
   while (!is_flush_pool_empty && unscheduled_flushes_ > 0 &&
          bg_flush_scheduled_ < bg_job_limits.max_flushes) {
-    // 测试同步点：在调度 flush 任务前
     TEST_SYNC_POINT_CALLBACK(
         "DBImpl::MaybeScheduleFlushOrCompaction:BeforeSchedule",
         &unscheduled_flushes_);
 
-    // 增加已调度的 flush 任务计数
     bg_flush_scheduled_++;
-
-    // 创建 flush 线程参数对象
     FlushThreadArg* fta = new FlushThreadArg;
-
-    // 设置参数中的数据库指针
     fta->db_ = this;
-
-    // 设置线程优先级为高优先级
     fta->thread_pri_ = Env::Priority::HIGH;
-
-    // 调度 flush 后台任务
-    // 参数：任务函数、任务参数、优先级、数据库实例、取消回调
     env_->Schedule(&DBImpl::BGWorkFlush, fta, Env::Priority::HIGH, this,
                    &DBImpl::UnscheduleFlushCallback);
-
-    // 减少未调度的 flush 任务计数
     --unscheduled_flushes_;
 
-    // 测试同步点：在调度 flush 任务后
     TEST_SYNC_POINT_CALLBACK(
         "DBImpl::MaybeScheduleFlushOrCompaction:AfterSchedule:0",
         &unscheduled_flushes_);
@@ -3238,19 +3194,20 @@ ColumnFamilyData* DBImpl::PickCompactionFromQueue(
   return cfd;
 }
 
+// 将一次 flush 请求加入 flush 队列，供后台线程消费。
 void DBImpl::SchedulePendingFlush(const FlushRequest& flush_req) {
   mutex_.AssertHeld();
   if (flush_req.cfd_to_max_mem_id_to_persist.empty()) {
     return;
   }
-  if (!immutable_db_options_.atomic_flush) {
-    // For the non-atomic flush case, we never schedule multiple column
-    // families in the same flush request.
+  if (!immutable_db_options_.atomic_flush) {//默认进这里
+    // 非原子 flush 时，一次请求只包含一个列族
     assert(flush_req.cfd_to_max_mem_id_to_persist.size() == 1);
     ColumnFamilyData* cfd =
         flush_req.cfd_to_max_mem_id_to_persist.begin()->first;
     assert(cfd);
 
+    // 若该 CF 尚未入队且已有待刷的 imm，则入队并增加未调度 flush 计数
     if (!cfd->queued_for_flush() && cfd->imm()->IsFlushPending()) {
       cfd->Ref();
       cfd->set_queued_for_flush(true);
@@ -3258,6 +3215,7 @@ void DBImpl::SchedulePendingFlush(const FlushRequest& flush_req) {
       flush_queue_.push_back(flush_req);
     }
   } else {
+    // 原子 flush：为涉及的所有 cfd 增加引用，然后整体入队
     for (auto& iter : flush_req.cfd_to_max_mem_id_to_persist) {
       ColumnFamilyData* cfd = iter.first;
       cfd->Ref();
@@ -3282,31 +3240,20 @@ void DBImpl::SchedulePendingPurge(std::string fname, std::string dir_to_sync,
   purge_files_.insert({{number, std::move(file_info)}});
 }
 
+// 后台 flush 线程入口：从线程池传入的 arg 取出 DB 和优先级，然后执行实际 flush。
 void DBImpl::BGWorkFlush(void* arg) {
-  // 将参数转换为 FlushThreadArg 并复制内容
-  // 使用值拷贝而不是指针，确保在删除原始参数后仍然可以访问数据
+  // 拷贝参数内容后立即删除原指针，避免线程池释放后仍被使用
   FlushThreadArg fta = *(reinterpret_cast<FlushThreadArg*>(arg));
-
-  // 删除传递进来的参数指针（已复制到 fta 中）
-  // 这是必要的，因为线程池使用 new 分配的内存传递参数
   delete reinterpret_cast<FlushThreadArg*>(arg);
 
-  // 设置 IO 统计中的线程池 ID
-  // 根据线程的实际优先级设置（HIGH 或 LOW）
-  // 用于区分不同优先级线程的 IO 操作统计
+  // 设置当前线程的 IO 统计线程池 ID（HIGH/LOW），便于按优先级统计
   IOSTATS_SET_THREAD_POOL_ID(fta.thread_pri_);
 
-  // 测试同步点：在 flush 工作开始时
-  // 用于测试和调试，可以在特定点注入延迟或检查状态
   TEST_SYNC_POINT("DBImpl::BGWorkFlush");
 
-  // 调用实际的 flush 处理函数
-  // 参数：线程优先级（从 fta.thread_pri_ 传入）
-  // 这里会将执行权转移给 BackgroundCallFlush 函数
+  // 调用真正的 flush 逻辑
   static_cast_with_check<DBImpl>(fta.db_)->BackgroundCallFlush(fta.thread_pri_);
 
-  // 测试同步点：在 flush 工作完成时
-  // 用于测试和调试，可以验证 flush 操作是否正确完成
   TEST_SYNC_POINT("DBImpl::BGWorkFlush:done");
 }
 
@@ -3458,24 +3405,7 @@ void DBImpl::UnscheduleFlushCallback(void* arg) {
   TEST_SYNC_POINT("DBImpl::UnscheduleFlushCallback");
 }
 
-/**
- * @brief 后台Flush操作的实现函数
- *
- * 该函数负责执行实际的Flush操作，将memtable中的数据刷新到磁盘：
- * 1. 检查是否应该执行Flush（错误状态、shutdown状态等）
- * 2. 从flush队列中选择需要Flush的列族
- * 3. 调用FlushMemTablesToOutputFiles执行实际的Flush
- * 4. 记录Flush原因并释放列族引用
- *
- * @param made_progress 输出参数，表示是否实际完成了Flush工作
- * @param job_context 作业上下文，包含任务状态和superversion上下文
- * @param log_buffer 日志缓冲区，用于记录Flush过程
- * @param reason 输出参数，返回Flush的原因
- * @param thread_pri 线程优先级
- * @return Status Flush操作的状态
- *
- * @note 该函数必须在持有mutex_的情况下调用
- */
+// 从 flush 队列取出一批请求，组好参数后调用 FlushMemTablesToOutputFiles 执行实际刷盘。
 Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
                                LogBuffer* log_buffer, FlushReason* reason,
                                Env::Priority thread_pri) {
@@ -3582,37 +3512,21 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
   return status; // 返回状态
 }
 
-/**
- * @brief 后台Flush调用的主函数
- *
- * 该函数是后台Flush线程的入口点，负责：
- * 1. 初始化Flush作业上下文和日志缓冲区
- * 2. 在持有互斥锁的情况下执行Flush操作
- * 3. 处理Flush过程中的错误（如环境问题）
- * 4. 清理临时文件和过期文件
- * 5. 减少调度计数并触发下一次调度
- * 6. 通知等待的线程（如DB析构函数）
- *
- * @param thread_pri 后台线程的优先级
- *
- * @note 该函数必须在持有mutex_的情况下运行大部分逻辑
- * @note bg_flush_scheduled_必须为true才能调用此函数
- * @note 调用SignalAll后不能再访问DB变量，因为DB可能被析构
- */
+// 后台 flush 线程主函数：创建作业上下文与日志缓冲，持锁执行 flush，并做错误处理与清理。
 void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
-  bool made_progress = false; // 是否实际完成了Flush工作
-  JobContext job_context(next_job_id_.fetch_add(1), true); // 创建新的作业上下文
+  bool made_progress = false;
+  JobContext job_context(next_job_id_.fetch_add(1), true);
 
-  TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallFlush:start", nullptr); // 测试同步点
+  TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallFlush:start", nullptr);
 
   LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
-                       immutable_db_options_.info_log.get()); // 初始化日志缓冲区
-  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:1"); // 测试同步点
-  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:2"); // 测试同步点
+                       immutable_db_options_.info_log.get());
+  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:1");
+  TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:Start:2");
   {
-    InstrumentedMutexLock l(&mutex_); // 获取互斥锁
-    assert(bg_flush_scheduled_); // 确保已经调度了Flush任务
-    num_running_flushes_++; // 增加正在运行的Flush计数
+    InstrumentedMutexLock l(&mutex_);
+    assert(bg_flush_scheduled_);
+    num_running_flushes_++;
 
     std::unique_ptr<std::list<uint64_t>::iterator>
         pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(

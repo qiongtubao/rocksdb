@@ -2084,7 +2084,7 @@ inline void WaitForPendingWrites() {
   TEST_SYNC_POINT("DBImpl::WaitForPendingWrites:BeforeBlock");
 
   // ============================================================================
-  // 情况 1：流水线写入模式
+  // 情况 1：流水线写入模式 （ror不经过）
   // ============================================================================
   // 如果启用了流水线写入，需要等待所有待处理的 MemTable writer 完成
   // 在流水线模式下，WAL 写入和 MemTable 写入由不同的线程处理
@@ -2110,7 +2110,7 @@ inline void WaitForPendingWrites() {
   // 1. Leader 处理当前批处理组
   // 2. 当前批处理组完成后，下一个批处理组才能开始
   // 3. 因此当新批处理组开始时，前一批处理组的写入已经完成
-  if (!immutable_db_options_.unordered_write) {
+  if (!immutable_db_options_.unordered_write) { //
     // 写入已经在下一个写入组开始前完成，无需额外等待
     return;
   }
@@ -2953,13 +2953,41 @@ static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
   if (static_cast<V>(*ptr) < minvalue) *ptr = minvalue;
 }
 
+// ============================================================================
+// DBImpl::FailIfCfHasTs - 校验列族未启用 UDT（User-Defined Timestamp）
+//
+// 职责：
+//   对于不支持时间戳的操作（如无 ts 参数的 Get、Put 等），
+//   检查目标列族是否配置了用户自定义时间戳（UDT）特性。
+//   若已配置 UDT，则这些操作不合法，返回 InvalidArgument 错误。
+//
+// 工作原理：
+//   通过列族的 Comparator 获取其配置的 timestamp_size：
+//     - timestamp_size == 0：未启用 UDT，操作合法，返回 Status::OK()
+//     - timestamp_size  > 0：已启用 UDT，调用者必须提供 timestamp，
+//                            返回 Status::InvalidArgument 阻止操作继续
+//
+// 参数：
+//   - column_family : 目标列族句柄（若为 nullptr，使用 DefaultColumnFamily）
+//
+// 返回值：
+//   - Status::OK()            : 列族未启用 UDT，操作可以继续
+//   - Status::InvalidArgument : 列族已启用 UDT，操作被拒绝
+//
+// 调用场景（在 rocksdb_get_cf 调用链中）：
+//   GetImpl（无 timestamp 时）→ FailIfCfHasTs(column_family)
+//     确保没有 timestamp 的读操作不会访问启用了 UDT 的列族
+// ============================================================================
 inline Status DBImpl::FailIfCfHasTs(
     const ColumnFamilyHandle* column_family) const {
+  // 若 column_family 为 nullptr，使用默认列族
   column_family = column_family ? column_family : DefaultColumnFamily();
   assert(column_family);
+  // 获取列族配置的比较器（Comparator 包含 timestamp_size 信息）
   const Comparator* const ucmp = column_family->GetComparator();
   assert(ucmp);
   if (ucmp->timestamp_size() > 0) {
+    // 列族配置了时间戳：不允许无 timestamp 的读写操作
     std::ostringstream oss;
     oss << "cannot call this method on column family "
         << column_family->GetName() << " that enables timestamp";
@@ -2968,6 +2996,35 @@ inline Status DBImpl::FailIfCfHasTs(
   return Status::OK();
 }
 
+// ============================================================================
+// DBImpl::FailIfTsMismatchCf - 校验时间戳与列族 UDT 配置兼容
+//
+// 职责：
+//   对于携带 timestamp 参数的操作（如带 ts 的 Get、Put 等），
+//   执行三重时间戳校验：
+//     1. 列族必须已启用 UDT（timestamp_size > 0）
+//     2. 传入的 ts 长度必须与列族配置的 timestamp_size 一致
+//     3. 读操作时（ts_for_read=true）：ts 必须 >= full_history_ts_low
+//        （不允许读取已被 GC 清理的历史版本）
+//
+// 参数：
+//   - column_family : 目标列族句柄（不能为 nullptr）
+//   - ts            : 调用者提供的时间戳 Slice
+//   - ts_for_read   : true 表示读操作（额外检查 full_history_ts_low）；
+//                     false 表示写操作（跳过下界检查）
+//
+// 返回值：
+//   - Status::OK()            : 时间戳校验通过，操作可以继续
+//   - Status::InvalidArgument : 以下情况之一：
+//       * column_family 为 nullptr
+//       * 列族未启用 UDT（timestamp_size == 0）
+//       * ts.size() != ucmp->timestamp_size()（长度不匹配）
+//       * ts_for_read=true 且 ts < full_history_ts_low（尝试读取已 GC 的版本）
+//
+// 调用场景（在 rocksdb_get_cf 调用链中）：
+//   GetImpl（有 timestamp 时）→ FailIfTsMismatchCf(cf, *ts, ts_for_read=true)
+//     校验读取时间戳的合法性，防止访问已被时间戳 GC 清理的历史数据
+// ============================================================================
 inline Status DBImpl::FailIfTsMismatchCf(ColumnFamilyHandle* column_family,
                                          const Slice& ts,
                                          bool ts_for_read) const {
@@ -2975,14 +3032,17 @@ inline Status DBImpl::FailIfTsMismatchCf(ColumnFamilyHandle* column_family,
     return Status::InvalidArgument("column family handle cannot be null");
   }
   assert(column_family);
+  // 获取列族比较器，从中读取 timestamp_size 配置
   const Comparator* const ucmp = column_family->GetComparator();
   assert(ucmp);
   if (0 == ucmp->timestamp_size()) {
+    // 列族未启用 UDT：带 timestamp 的操作不合法
     std::stringstream oss;
     oss << "cannot call this method on column family "
         << column_family->GetName() << " that does not enable timestamp";
     return Status::InvalidArgument(oss.str());
   }
+  // 校验传入时间戳的字节长度与列族配置一致
   const size_t ts_sz = ts.size();
   if (ts_sz != ucmp->timestamp_size()) {
     std::stringstream oss;
@@ -2990,12 +3050,16 @@ inline Status DBImpl::FailIfTsMismatchCf(ColumnFamilyHandle* column_family,
         << ts_sz << " given";
     return Status::InvalidArgument(oss.str());
   }
+  // 读操作特有校验：ts 不能早于 full_history_ts_low
+  // full_history_ts_low 是时间戳 GC 的下界，低于此值的历史数据可能已被清理
   if (ts_for_read) {
     auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
     auto cfd = cfh->cfd();
+    // 获取当前列族的时间戳 GC 下界
     std::string current_ts_low = cfd->GetFullHistoryTsLow();
     if (!current_ts_low.empty() &&
         ucmp->CompareTimestamp(ts, current_ts_low) < 0) {
+      // ts < full_history_ts_low：拒绝读取可能已被 GC 清理的历史版本
       std::stringstream oss;
       oss << "Read timestamp: " << ts.ToString(true)
           << " is smaller than full_history_ts_low: "
